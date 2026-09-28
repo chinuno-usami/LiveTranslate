@@ -27,6 +27,12 @@ model = "whisper-1"
 language = "auto"
 timeout_secs = 20
 request_path = "/v1/audio/transcriptions"
+# 访问令牌（可选）。留空/删掉则不发送认证头。
+# 设置后会以 Authorization: Bearer <api_key> 发送
+api_key = ""
+# 认证头名称（可选），默认 Authorization。
+# 若服务使用其他头部（如 api-key），在这里指定
+auth_header = ""
 
 [translate]
 # OpenAI 兼容 API

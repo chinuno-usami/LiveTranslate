@@ -20,6 +20,17 @@ pub struct AsrConfig {
     pub language: String,
     pub timeout_secs: u64,
     pub request_path: String,
+    /// 可选的访问令牌
+    ///
+    /// 设置后会按 `auth_header` 指定的头部发送（默认 `Authorization: Bearer <token>`）。
+    /// 留空则不发送任何认证头。
+    #[serde(default)]
+    pub api_key: Option<String>,
+    /// 认证头名称，默认 "Authorization"
+    ///
+    /// 部分服务使用不同的头部，例如 `api-key`。
+    #[serde(default)]
+    pub auth_header: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -218,6 +229,8 @@ impl Default for AppConfig {
                 language: "auto".to_string(),
                 timeout_secs: 20,
                 request_path: "/v1/audio/transcriptions".to_string(),
+                api_key: None,
+                auth_header: None,
             },
             translate: TranslateConfig {
                 base_url: "https://api.openai.com/v1".to_string(),
@@ -288,5 +301,34 @@ mod tests {
     fn explicit_missing_config_is_an_error() {
         let missing = PathBuf::from("/nonexistent/definitely/not/here.toml");
         assert!(AppConfig::resolve(Some(missing)).is_err());
+    }
+
+    #[test]
+    fn asr_api_key_is_optional_and_backward_compatible() {
+        // 旧配置文件（没有 api_key / auth_header）必须仍能解析
+        let old = r#"
+            base_url = "http://127.0.0.1:8765"
+            model = "whisper-1"
+            language = "auto"
+            timeout_secs = 20
+            request_path = "/v1/audio/transcriptions"
+        "#;
+        let cfg: AsrConfig = toml::from_str(old).unwrap();
+        assert_eq!(cfg.api_key, None);
+        assert_eq!(cfg.auth_header, None);
+
+        // 带 token 的配置
+        let with_key = r#"
+            base_url = "https://api.example.com"
+            model = "whisper-1"
+            language = "auto"
+            timeout_secs = 20
+            request_path = "/v1/audio/transcriptions"
+            api_key = "sk-test"
+            auth_header = "api-key"
+        "#;
+        let cfg: AsrConfig = toml::from_str(with_key).unwrap();
+        assert_eq!(cfg.api_key.as_deref(), Some("sk-test"));
+        assert_eq!(cfg.auth_header.as_deref(), Some("api-key"));
     }
 }

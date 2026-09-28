@@ -88,6 +88,11 @@ language = "auto"
 timeout_secs = 20
 # 请求路径
 request_path = "/v1/audio/transcriptions"
+# 访问令牌（可选）。留空则不发送认证头；
+# 设置后以 Authorization: Bearer <api_key> 发送
+api_key = ""
+# 认证头名称（可选，默认 Authorization；部分服务用 api-key）
+auth_header = ""
 
 [translate]
 # OpenAI 兼容 API 地址
