@@ -1,8 +1,21 @@
 [audio]
-# 设备名称，支持 "default", "microphone", "loopback"
+# 设备选择，支持以下几种写法（用 --list-devices 查看可用值）:
+#   "default"      默认输入设备
+#   "microphone"   第一个麦克风
+#   "loopback"     Windows 系统回环（捕获扬声器输出）
+#   "mic:0"        第 0 个麦克风
+#   "loopback:0"   第 0 个回环设备
+#   "0"            设备列表中的第 0 个
+#   "扬声器"        按设备名模糊匹配
+# 注意: 回环采集仅 Windows 支持
+#
+# 也可以直接在浮窗顶部下拉框里切换设备。
 device_name = "default"
+# 音频分片时长（秒）
 chunk_seconds = 2.0
+# 目标采样率（Whisper 推荐 16000，程序会自动重采样）
 sample_rate = 16000
+# 声道数（内部固定下混为单声道，此项目前不影响实际采集）
 channels = 1
 # 音量阈值（0.0 - 1.0），用于过滤静音片段
 silence_threshold = 0.01

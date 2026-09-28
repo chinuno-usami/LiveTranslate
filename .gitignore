@@ -1,0 +1,15 @@
+/target
+**/*.rs.bk
+Cargo.lock.orig
+
+# Tauri
+/gen
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp

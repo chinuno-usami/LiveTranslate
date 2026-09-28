@@ -72,26 +72,64 @@ impl SubtitleProcessor {
     }
 
     /// 从 current 中移除与 previous 末尾相同的前缀
+    ///
+    /// 同时支持：
+    /// - 空格分词语言（英文等）
+    /// - 无空格语言（中文、日文等）
     fn remove_prefix_overlap(previous: &str, current: &str) -> Option<String> {
+        if let Some(word_result) = Self::remove_word_overlap(previous, current) {
+            return Some(word_result);
+        }
+        Self::remove_char_overlap(previous, current)
+    }
+
+    /// 基于单词的去重（适用于英文等）
+    fn remove_word_overlap(previous: &str, current: &str) -> Option<String> {
         let prev_words: Vec<&str> = previous.split_whitespace().collect();
         let curr_words: Vec<&str> = current.split_whitespace().collect();
 
-        if prev_words.is_empty() || curr_words.is_empty() {
+        if prev_words.len() < 2 || curr_words.len() < 2 {
             return None;
         }
 
-        // 尝试匹配末尾 N 个单词
         for overlap_count in (1..=prev_words.len().min(curr_words.len())).rev() {
             let prev_end = &prev_words[prev_words.len() - overlap_count..];
             let curr_start = &curr_words[..overlap_count];
 
             if prev_end == curr_start {
-                // 找到重叠，移除
                 let remaining: Vec<&str> = curr_words[overlap_count..].to_vec();
                 if remaining.is_empty() {
                     return None;
                 }
                 return Some(remaining.join(" "));
+            }
+        }
+
+        None
+    }
+
+    /// 基于字符的去重（适用于中文、日文等无空格语言）
+    fn remove_char_overlap(previous: &str, current: &str) -> Option<String> {
+        let prev_chars: Vec<char> = previous.chars().collect();
+        let curr_chars: Vec<char> = current.chars().collect();
+
+        if prev_chars.len() < 3 || curr_chars.len() < 3 {
+            return None;
+        }
+
+        // 只匹配至少 3 个字符的重叠，避免误删
+        let max_overlap = prev_chars.len().min(curr_chars.len());
+        for overlap_count in (3..=max_overlap).rev() {
+            let prev_end = &prev_chars[prev_chars.len() - overlap_count..];
+            let curr_start = &curr_chars[..overlap_count];
+
+            if prev_end == curr_start {
+                let remaining: String = curr_chars[overlap_count..].iter().collect();
+                let trimmed = remaining.trim();
+                if trimmed.is_empty() {
+                    return None;
+                }
+                return Some(trimmed.to_string());
             }
         }
 
@@ -182,6 +220,23 @@ mod tests {
         let curr = "how are you";
         let result = SubtitleProcessor::remove_prefix_overlap(prev, curr);
         assert_eq!(result, Some("are you".to_string()));
+    }
+
+    #[test]
+    fn test_remove_prefix_overlap_cjk() {
+        let prev = "大家好今天我们来讲一个话题";
+        let curr = "来讲一个话题非常有意思";
+        let result = SubtitleProcessor::remove_prefix_overlap(prev, curr);
+        assert_eq!(result, Some("非常有意思".to_string()));
+    }
+
+    #[test]
+    fn test_remove_prefix_overlap_cjk_short() {
+        // 重叠少于 3 个字符时不应误删
+        let prev = "你好世界";
+        let curr = "世界您好";
+        let result = SubtitleProcessor::remove_prefix_overlap(prev, curr);
+        assert_eq!(result, None);
     }
 
     #[test]

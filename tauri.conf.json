@@ -14,6 +14,11 @@
     "allowlist": {
       "all": true
     },
+    "systemTray": {
+      "iconPath": "icons/icon.png",
+      "iconAsTemplate": false,
+      "menuOnLeftClick": false
+    },
     "bundle": {
       "active": false,
       "identifier": "com.chinuno.asrtranslate",

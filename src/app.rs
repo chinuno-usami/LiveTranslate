@@ -1,3 +1,4 @@
+use crate::audio::resample::LinearResampler;
 use crate::audio::{wav, AudioCapture, AudioChunker};
 use crate::asr::WhisperClient;
 use crate::config::AppConfig;
@@ -12,14 +13,11 @@ pub async fn list_devices() -> AppResult<()> {
         println!("No audio devices found");
     } else {
         println!("Available audio devices:");
-        for (i, device) in devices.iter().enumerate() {
-            let type_str = if device.is_loopback {
-                "[Loopback]"
-            } else {
-                "[Microphone]"
-            };
-            println!("  {}. {} {}", i, device.name, type_str);
+        for device in devices.iter() {
+            println!("  [{}] {} ({})", device.spec(), device.name, device.kind_label());
         }
+        println!();
+        println!("提示: 在 config/default.toml 中设置 device_name 为 [方括号] 内的值即可选择设备");
     }
     Ok(())
 }
@@ -56,8 +54,18 @@ pub async fn run_pipeline(
     )
     .await?;
 
+    let native_rate = audio_capture.native_sample_rate;
+    let target_rate = config.audio.sample_rate;
+    let mut resampler = LinearResampler::new(native_rate, target_rate);
+    tracing::info!(
+        "Resampling: {} Hz -> {} Hz (needed: {})",
+        native_rate,
+        target_rate,
+        resampler.is_needed()
+    );
+
     let mut audio_chunker = AudioChunker::new(
-        config.audio.sample_rate,
+        target_rate,
         config.audio.chunk_seconds,
         0.25,
         config.audio.silence_threshold,
@@ -78,7 +86,10 @@ pub async fn run_pipeline(
             samples = audio_capture.next_chunk() => {
                 match samples {
                     Some(samples) => {
-                        audio_chunker.push_samples(samples);
+                        // 下混已是单声道，这里做重采样到目标采样率
+                        let mut resampled = Vec::new();
+                        resampler.process(&samples, &mut resampled);
+                        audio_chunker.push_samples(resampled);
 
                         while let Some(chunk) = audio_chunker.next_chunk() {
                             if audio_chunker.is_silence(&chunk) {
@@ -88,8 +99,8 @@ pub async fn run_pipeline(
 
                             let wav_data = wav::encode_wav(
                                 &chunk,
-                                config.audio.sample_rate,
-                                config.audio.channels,
+                                target_rate,
+                                1,
                             )?;
 
                             match whisper_client.transcribe(wav_data).await {

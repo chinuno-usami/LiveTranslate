@@ -31,6 +31,19 @@ pub struct OverlayConfigPayload {
     pub click_through: bool,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct DevicePayload {
+    pub spec: String,
+    pub name: String,
+    pub kind: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DevicesPayload {
+    pub devices: Vec<DevicePayload>,
+    pub current: String,
+}
+
 impl From<&SubtitleConfig> for OverlayConfigPayload {
     fn from(value: &SubtitleConfig) -> Self {
         Self {

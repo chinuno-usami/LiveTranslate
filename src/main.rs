@@ -6,6 +6,7 @@ mod asr;
 mod config;
 mod error;
 mod subtitle;
+mod tray;
 mod translate;
 mod ui;
 
@@ -44,6 +45,8 @@ struct Args {
 }
 
 struct PipelineControl {
+    /// 流水线世代号，用于避免旧任务的清理逻辑覆盖新流水线
+    generation: u64,
     stop_tx: Option<watch::Sender<bool>>,
     runner: Option<tauri::async_runtime::JoinHandle<()>>,
     forwarder: Option<tauri::async_runtime::JoinHandle<()>>,
@@ -52,6 +55,7 @@ struct PipelineControl {
 impl PipelineControl {
     fn new() -> Self {
         Self {
+            generation: 0,
             stop_tx: None,
             runner: None,
             forwarder: None,
@@ -65,6 +69,7 @@ impl PipelineControl {
 
 struct SharedState {
     config: AppConfig,
+    current_device: Mutex<String>,
     subtitle_state: Mutex<SubtitleState>,
     pipeline: Mutex<PipelineControl>,
 }
@@ -76,8 +81,11 @@ impl SharedState {
             config.subtitle.show_source,
         );
 
+        let device = config.audio.device_name.clone();
+
         Self {
             config,
+            current_device: Mutex::new(device),
             subtitle_state: Mutex::new(subtitle_state),
             pipeline: Mutex::new(PipelineControl::new()),
         }
@@ -103,18 +111,50 @@ async fn get_status(state: State<'_, Arc<SharedState>>) -> Result<StatusPayload,
 }
 
 #[tauri::command]
-async fn list_devices_command() -> Result<Vec<String>, String> {
+async fn list_devices_command(state: State<'_, Arc<SharedState>>) -> Result<ui::DevicesPayload, String> {
     let devices = audio::capture::AudioCapture::list_devices().map_err(|e| e.to_string())?;
-    Ok(devices
-        .into_iter()
-        .map(|d| {
-            format!(
-                "{} {}",
-                d.name,
-                if d.is_loopback { "[Loopback]" } else { "[Microphone]" }
-            )
-        })
-        .collect())
+    let current = state.current_device.lock().await.clone();
+    Ok(ui::DevicesPayload {
+        devices: devices
+            .into_iter()
+            .map(|d| ui::DevicePayload {
+                spec: d.spec(),
+                kind: d.kind_label().to_string(),
+                name: d.name,
+            })
+            .collect(),
+        current,
+    })
+}
+
+#[tauri::command]
+async fn set_device(
+    app: AppHandle,
+    state: State<'_, Arc<SharedState>>,
+    spec: String,
+) -> Result<(), String> {
+    let state = state.inner().clone();
+    let was_running = {
+        let pipeline = state.pipeline.lock().await;
+        pipeline.is_running()
+    };
+
+    // 运行中先停止，切换设备后再启动
+    if was_running {
+        stop_capture_impl(app.clone(), state.clone()).await?;
+    }
+
+    {
+        let mut current = state.current_device.lock().await;
+        *current = spec.clone();
+    }
+
+    if was_running {
+        start_capture_impl(app.clone(), state.clone()).await?;
+    }
+
+    emit_status(&app, was_running, format!("设备已切换: {}", spec));
+    Ok(())
 }
 
 #[tauri::command]
@@ -156,7 +196,19 @@ async fn start_capture_impl(app: AppHandle, state: Arc<SharedState>) -> Result<(
 
     let (subtitle_tx, mut subtitle_rx): (mpsc::Sender<subtitle::Subtitle>, mpsc::Receiver<subtitle::Subtitle>) = mpsc::channel(128);
     let (stop_tx, stop_rx) = watch::channel(false);
-    let config = state.config.clone();
+
+    let mut config = state.config.clone();
+    {
+        let current_device = state.current_device.lock().await;
+        config.audio.device_name = current_device.clone();
+    }
+
+    // 分配新的世代号
+    let generation = {
+        let mut pipeline = state.pipeline.lock().await;
+        pipeline.generation = pipeline.generation.wrapping_add(1);
+        pipeline.generation
+    };
 
     let app_for_runner = app.clone();
     let runner = tauri::async_runtime::spawn(async move {
@@ -185,11 +237,14 @@ async fn start_capture_impl(app: AppHandle, state: Arc<SharedState>) -> Result<(
             let _ = app_for_forwarder.emit_all(SUBTITLE_EVENT, payload);
         }
 
-        emit_status(&app_for_forwarder, false, "字幕流已停止");
+        // 仅当仍是当前世代时才清理，避免覆盖刚启动的新流水线
         let mut pipeline = state_for_forwarder.pipeline.lock().await;
-        pipeline.stop_tx = None;
-        pipeline.runner = None;
-        pipeline.forwarder = None;
+        if pipeline.generation == generation {
+            emit_status(&app_for_forwarder, false, "字幕流已停止");
+            pipeline.stop_tx = None;
+            pipeline.runner = None;
+            pipeline.forwarder = None;
+        }
     });
 
     {
@@ -319,17 +374,21 @@ fn main() -> anyhow::Result<()> {
     let shared = Arc::new(SharedState::new(config.clone()));
 
     tauri::Builder::default()
+        .system_tray(tray::create_system_tray())
+        .on_system_tray_event(tray::handle_system_tray_event)
         .manage(shared)
         .setup(move |app| {
             let window = app.get_window("main").ok_or_else(|| anyhow::anyhow!("main window not found"))?;
             apply_window_config(&window, &config).map_err(anyhow::Error::msg)?;
             window.emit(CONFIG_EVENT, OverlayConfigPayload::from(&config.subtitle)).ok();
+            tray::register_global_shortcuts(&app.handle()).map_err(|e| anyhow::anyhow!("Failed to register shortcuts: {}", e))?;
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             get_overlay_config,
             get_status,
             list_devices_command,
+            set_device,
             start_capture,
             stop_capture,
             close_overlay,

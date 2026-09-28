@@ -6,6 +6,7 @@ const els = {
   statusText: document.getElementById('status-text'),
   emptyState: document.getElementById('empty-state'),
   subtitleLines: document.getElementById('subtitle-lines'),
+  deviceSelect: document.getElementById('device-select'),
   startBtn: document.getElementById('start-btn'),
   stopBtn: document.getElementById('stop-btn'),
   throughBtn: document.getElementById('through-btn'),
@@ -63,6 +64,34 @@ function updateClickThroughLabel() {
   els.throughBtn.textContent = `穿透: ${clickThrough ? '开' : '关'}`;
 }
 
+async function loadDevices() {
+  try {
+    const payload = await invoke('list_devices_command');
+    const devices = payload.devices || [];
+    els.deviceSelect.innerHTML = '';
+
+    if (devices.length === 0) {
+      const opt = document.createElement('option');
+      opt.value = 'default';
+      opt.textContent = '未找到音频设备';
+      els.deviceSelect.appendChild(opt);
+      return;
+    }
+
+    for (const device of devices) {
+      const opt = document.createElement('option');
+      opt.value = device.spec;
+      opt.textContent = `${device.kind} | ${device.name}`;
+      if (device.spec === payload.current) {
+        opt.selected = true;
+      }
+      els.deviceSelect.appendChild(opt);
+    }
+  } catch (error) {
+    console.error('加载设备失败', error);
+  }
+}
+
 async function bindActions() {
   els.startBtn.addEventListener('click', async () => {
     await invoke('start_capture');
@@ -76,6 +105,16 @@ async function bindActions() {
     clickThrough = !clickThrough;
     await invoke('set_click_through', { enabled: clickThrough });
     updateClickThroughLabel();
+  });
+
+  els.deviceSelect.addEventListener('change', async () => {
+    const spec = els.deviceSelect.value;
+    try {
+      await invoke('set_device', { spec });
+    } catch (error) {
+      console.error('切换设备失败', error);
+      setStatus(false, `切换设备失败: ${error}`);
+    }
   });
 
   els.closeBtn.addEventListener('click', async () => {
@@ -104,6 +143,25 @@ async function bindEvents() {
   await listen('error://message', (event) => {
     setStatus(false, String(event.payload || '出现错误'));
   });
+
+  // 系统托盘和快捷键事件
+  await listen('tray://command', (event) => {
+    const command = event.payload;
+    if (command === 'start') {
+      els.startBtn.click();
+    } else if (command === 'stop') {
+      els.stopBtn.click();
+    }
+  });
+
+  await listen('shortcut://command', (event) => {
+    const command = event.payload;
+    if (command === 'start') {
+      els.startBtn.click();
+    } else if (command === 'stop') {
+      els.stopBtn.click();
+    }
+  });
 }
 
 window.addEventListener('DOMContentLoaded', async () => {
@@ -112,6 +170,7 @@ window.addEventListener('DOMContentLoaded', async () => {
     await bindActions();
     await loadInitialConfig();
     await loadInitialStatus();
+    await loadDevices();
     await invoke('start_capture');
   } catch (error) {
     console.error(error);
