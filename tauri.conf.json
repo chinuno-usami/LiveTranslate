@@ -14,7 +14,7 @@
   "tauri": {
     "macOSPrivateApi": true,
     "allowlist": {
-      "all": true
+      "all": false
     },
     "systemTray": {
       "iconPath": "icons/icon.png",
