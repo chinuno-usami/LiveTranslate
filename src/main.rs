@@ -391,19 +391,106 @@ fn apply_window_config(window: &Window, config: &AppConfig) -> Result<(), String
     Ok(())
 }
 
-fn init_logging(level: &str) {
+fn init_logging(level: &str) -> Option<tracing_appender::non_blocking::WorkerGuard> {
+    use tracing_subscriber::prelude::*;
+
     let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(level));
-    tracing_subscriber::fmt()
-        .with_env_filter(env_filter)
+
+    // 控制台输出（从终端启动或重定向时可见）
+    let console_layer = tracing_subscriber::fmt::layer()
         .with_target(true)
-        .with_thread_ids(true)
-        .init();
+        .with_thread_ids(true);
+
+    // 文件输出：双击运行（GUI 子系统、无控制台）时唯一的可诊断手段
+    if let Ok(log_dir) = AppConfig::log_dir() {
+        if std::fs::create_dir_all(&log_dir).is_ok() {
+            let appender = tracing_appender::rolling::never(&log_dir, "livetranslate.log");
+            let (writer, guard) = tracing_appender::non_blocking(appender);
+
+            let file_layer = tracing_subscriber::fmt::layer()
+                .with_writer(writer)
+                .with_ansi(false)
+                .with_target(true);
+
+            let subscriber = tracing_subscriber::registry()
+                .with(env_filter)
+                .with(console_layer)
+                .with(file_layer);
+
+            if let Err(e) = tracing::subscriber::set_global_default(subscriber) {
+                eprintln!("failed to set tracing subscriber: {e}");
+            }
+            eprintln!(
+                "log file: {}",
+                log_dir.join("livetranslate.log").display()
+            );
+            return Some(guard);
+        }
+    }
+
+    let subscriber = tracing_subscriber::registry()
+        .with(env_filter)
+        .with(console_layer);
+    if let Err(e) = tracing::subscriber::set_global_default(subscriber) {
+        eprintln!("failed to set tracing subscriber: {e}");
+    }
+    None
 }
 
-fn main() -> anyhow::Result<()> {
-    let args = Args::parse();
-    init_logging(&args.log_level);
+/// 捕获 panic 并记录到日志；Windows 下额外弹窗提示
+fn install_panic_hook() {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        tracing::error!("PANIC: {info}");
+        default_hook(info);
 
+        #[cfg(target_os = "windows")]
+        {
+            static SHOWN: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if !SHOWN.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                show_error_dialog("LiveTranslate 崩溃", &format!("{info}"));
+            }
+        }
+    }));
+}
+
+/// Windows: 弹原生错误对话框，避免 GUI 子系统下错误被静默吞掉
+#[cfg(target_os = "windows")]
+fn show_error_dialog(title: &str, message: &str) {
+    use windows::core::{HSTRING, PCWSTR};
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONERROR, MB_OK};
+
+    let text = HSTRING::from(message);
+    let caption = HSTRING::from(title);
+    unsafe {
+        MessageBoxW(
+            HWND::default(),
+            PCWSTR(text.as_ptr()),
+            PCWSTR(caption.as_ptr()),
+            MB_OK | MB_ICONERROR,
+        );
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn show_error_dialog(_title: &str, _message: &str) {}
+
+fn main() {
+    let args = Args::parse();
+    let _log_guard = init_logging(&args.log_level);
+    install_panic_hook();
+
+    if let Err(e) = run(args) {
+        let message = format!("{e:#}");
+        tracing::error!("Fatal error: {message}");
+        show_error_dialog("LiveTranslate 启动失败", &message);
+        std::process::exit(1);
+    }
+}
+
+fn run(args: Args) -> anyhow::Result<()> {
     tracing::info!("Starting LiveTranslate Application");
 
     let (config, config_path) = match AppConfig::resolve(args.config.clone()) {
@@ -454,9 +541,17 @@ fn main() -> anyhow::Result<()> {
             }
 
             let window = app.get_window("main").ok_or_else(|| anyhow::anyhow!("main window not found"))?;
-            apply_window_config(&window, &config).map_err(anyhow::Error::msg)?;
-            window.emit(CONFIG_EVENT, OverlayConfigPayload::from(&config.subtitle)).ok();
-            tray::register_global_shortcuts(&app.handle()).map_err(|e| anyhow::anyhow!("Failed to register shortcuts: {}", e))?;
+
+            // 以下步骤均“尽力而为”，失败不应阻止应用启动
+            if let Err(e) = apply_window_config(&window, &config) {
+                tracing::warn!("Failed to apply window config: {e}");
+            }
+            if let Err(e) = window.emit(CONFIG_EVENT, OverlayConfigPayload::from(&config.subtitle)) {
+                tracing::warn!("Failed to emit config event: {e}");
+            }
+            if let Err(e) = tray::register_global_shortcuts(&app.handle()) {
+                tracing::warn!("Failed to register global shortcuts (可能被其他程序占用): {e}");
+            }
 
             // 确保窗口可见并获取焦点
             let _ = window.show();
@@ -474,7 +569,7 @@ fn main() -> anyhow::Result<()> {
             set_click_through,
         ])
         .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .map_err(|e| anyhow::anyhow!("Tauri runtime error: {e}"))?;
 
     Ok(())
 }

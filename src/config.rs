@@ -75,6 +75,17 @@ impl AppConfig {
         Ok(Self::user_config_dir()?.join("config.toml"))
     }
 
+    /// 用户级日志目录
+    ///
+    /// - macOS: `~/Library/Application Support/com.chinuno.LiveTranslate/logs`
+    /// - Windows: `%LOCALAPPDATA%\chinuno\LiveTranslate\logs`
+    /// - Linux: `~/.local/share/livetranslate/logs`
+    pub fn log_dir() -> AppResult<PathBuf> {
+        ProjectDirs::from("com", "chinuno", "LiveTranslate")
+            .map(|dirs| dirs.data_local_dir().join("logs"))
+            .ok_or_else(|| AppError::Config("Failed to determine log directory".to_string()))
+    }
+
     /// 从指定文件读取配置
     fn from_file(path: &Path) -> AppResult<Self> {
         let content = fs::read_to_string(path)?;
