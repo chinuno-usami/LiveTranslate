@@ -89,8 +89,8 @@ jobs:
             -output target/universal/release/${BIN_NAME}
           file target/universal/release/${BIN_NAME}
 
-      - name: Package (Unix)
-        if: runner.os != 'Windows'
+      - name: Package (Linux)
+        if: runner.os == 'Linux'
         shell: bash
         run: |
           set -euo pipefail
@@ -99,13 +99,7 @@ jobs:
           STAGE="dist/${NAME}"
           mkdir -p "$STAGE"
 
-          if [ "$TARGET" = "universal-apple-darwin" ]; then
-            SRC="target/universal/release/${BIN_NAME}"
-          else
-            SRC="target/${TARGET}/release/${BIN_NAME}"
-          fi
-
-          cp "$SRC" "$STAGE/"
+          cp "target/${TARGET}/release/${BIN_NAME}" "$STAGE/"
           chmod +x "$STAGE/${BIN_NAME}"
           [ -d config ] && cp -r config "$STAGE/"
           for f in README.md README_CN.md QUICKSTART.md; do
@@ -113,6 +107,17 @@ jobs:
           done
 
           tar -C dist -czf "dist/${NAME}.tar.gz" "${NAME}"
+          ls -lh dist
+
+      - name: Package (macOS .app)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash scripts/make-macos-app.sh \
+            "target/universal/release/${BIN_NAME}" \
+            dist \
+            "${{ matrix.target }}"
           ls -lh dist
 
       - name: Package (Windows)

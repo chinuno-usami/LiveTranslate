@@ -23,7 +23,10 @@ git push origin v0.1.0
    - `linux-x86_64` (Ubuntu 22.04)
    - `windows-x86_64` (Windows Server)
    - `macos-universal` (Apple Silicon + Intel 通用二进制)
-2. 打包为 `tar.gz` / `zip`
+2. 打包产物
+   - Linux → `tar.gz`
+   - Windows → `zip`
+   - macOS → **`LiveTranslate.app`**（ad-hoc 签名）+ `zip`
 3. 创建 GitHub Release 并上传全部产物
 
 ## 手动触发
@@ -45,6 +48,14 @@ cargo install cargo-xwin
 cargo xwin build --release --target x86_64-pc-windows-msvc
 ```
 
+### 本地打 macOS .app
+
+```bash
+cargo build --release
+./scripts/make-macos-app.sh target/release/livetranslate dist macos-arm64
+open dist/LiveTranslate.app
+```
+
 > **为什么需要 `custom-protocol`？**
 > Tauri 在未启用该 feature 时认为是 dev 模式（从 `devPath` 加载资源）。
 > 交叉编译场景下，`tauri-codegen` 会因为读不到 `TARGET` 而回退到 host 判定，
@@ -57,15 +68,16 @@ cargo xwin build --release --target x86_64-pc-windows-msvc
 |------|------|
 | Linux x86_64 | `livetranslate-x86_64-unknown-linux-gnu.tar.gz` |
 | Windows x86_64 | `livetranslate-x86_64-pc-windows-msvc.zip` |
-| macOS (Universal) | `livetranslate-universal-apple-darwin.tar.gz` |
+| macOS (Universal) | `LiveTranslate-universal-apple-darwin.zip`（内含 `LiveTranslate.app`） |
 
-每个压缩包内包含：
+内容：
 
-- 可执行文件（`livetranslate` / `livetranslate.exe`）
-- `config/default.toml`（配置示例）
-- `README.md` / `README_CN.md` / `QUICKSTART.md`
+- **Linux / Windows**：可执行文件 + `config/default.toml` + 文档
+- **macOS**：`LiveTranslate.app` bundle（应用图标 + `Info.plist` + 二进制）
 
 ## 使用发布产物
+
+### Linux / Windows
 
 ```bash
 # 解压
@@ -79,15 +91,31 @@ vim config/default.toml
 ./livetranslate --log-level info
 ```
 
-> Windows 双击 `livetranslate.exe` 或运行 `run.bat`（如已包含）。
+> Windows 解压后双击 `livetranslate.exe`。
+
+### macOS
+
+```bash
+# 解压
+unzip LiveTranslate-universal-apple-darwin.zip
+
+# 放到应用程序目录（可选）
+mv LiveTranslate.app /Applications/
+
+# 首次运行：从网络下载的 zip 会带 quarantine 属性，需移除
+xattr -dr com.apple.quarantine /Applications/LiveTranslate.app
+
+# 启动
+open /Applications/LiveTranslate.app
+```
+
+> 首次运行会请求**麦克风权限**，请允许；否则采集不到声音。
 
 ## 各平台依赖
 
-发布产物是**单个可执行文件**，但运行环境需要：
-
 - **Linux**：`libwebkit2gtk-4.0`、`libgtk-3`、`libasound2`、`libayatana-appindicator3`
 - **Windows**：WebView2 Runtime（Win10/11 通常已预装）
-- **macOS**：无需额外依赖
+- **macOS**：无需额外依赖；首次运行需授予**麦克风权限**
 
 ## CI（持续集成）
 
@@ -102,10 +130,11 @@ vim config/default.toml
 
 ## 注意事项
 
-- 当前 bundle 配置为 `bundle.active = false`，因此产出的是**可执行文件压缩包**，
-  而不是 `.dmg` / `.msi` / `.AppImage` 安装包。
-- 如需安装包，需先在 `tauri.conf.json` 启用 `bundle.active`，并提供完整的
-  多尺寸图标（`.ico` / `.icns` / 各尺寸 `.png`），随后可改用
-  `tauri-apps/tauri-action` 生成安装器。
-- macOS 产物是**未签名**的，首次运行可能需要在“系统设置 → 隐私与安全性”中放行，
-  或执行 `xattr -dr com.apple.quarantine livetranslate`。
+- `tauri.conf.json` 已设置 `bundle.active = true` 与 `macOSPrivateApi = true`，
+  以及完整多尺寸图标。
+- macOS 产物由 `scripts/make-macos-app.sh` 组装为 `.app` 并做 **ad-hoc 签名**
+  （`codesign --sign -`），适用于本地与 CI，不依赖 `tauri-cli`。
+- 如需 `.dmg` / `.msi` / `.AppImage` 等安装器，可在安装 `tauri-cli` 后执行
+  `cargo tauri build`（扁平结构下 CLI 会自动定位根目录的 `tauri.conf.json`）。
+- macOS `.app` 是 **未公证（not notarized）** 的，从网络下载后首次运行：
+  先 `xattr -dr com.apple.quarantine <app>`，再到“系统设置 → 隐私与安全性”放行。
