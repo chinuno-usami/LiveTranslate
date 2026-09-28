@@ -127,6 +127,33 @@ always_on_top = true
 click_through = false
 ```
 
+## 配置文件位置
+
+程序按以下**优先级**查找配置（第一个存在的被使用）：
+
+| 优先级 | 位置 | 适用场景 |
+|--------|------|----------|
+| 1 | `--config <路径>` | 显式指定（找不到会直接报错） |
+| 2 | `<可执行文件目录>/config/default.toml` | Windows 便携包（解压即用） |
+| 3 | `./config/default.toml` | 源码 / 开发模式下运行 |
+| 4 | 用户配置目录 | 打包后的 `.app` / 安装版 |
+| 5 | 内置默认值 | 都没有时（`api_key` 为占位符） |
+
+**用户配置目录**由 `directories` 推导，首次运行会自动生成一份默认配置：
+
+| 平台 | 路径 |
+|------|------|
+| macOS | `~/Library/Application Support/com.chinuno.LiveTranslate/config.toml` |
+| Windows | `%APPDATA%\chinuno\LiveTranslate\config\config.toml` |
+| Linux | `~/.config/livetranslate/config.toml` |
+
+> 托盘菜单 → **打开配置目录** 可直接在文件管理器中打开该目录。
+
+日志中会打印实际使用的配置路径，例如：
+```
+INFO livetranslate: Config file: config/default.toml
+```
+
 ## 使用
 
 ### 基本流程

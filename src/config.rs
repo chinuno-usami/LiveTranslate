@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use directories::ProjectDirs;
 use std::fs;
 use std::path::{Path, PathBuf};
 use crate::error::{AppError, AppResult};
@@ -56,55 +57,134 @@ pub struct AppConfig {
 }
 
 impl AppConfig {
-    /// 从配置文件加载
-    pub fn load(path: Option<PathBuf>) -> AppResult<Self> {
-        let config_path = if let Some(p) = path {
-            p
-        } else {
-            Self::default_config_path()?
-        };
-
-        if !config_path.exists() {
-            return Err(AppError::Config(format!(
-                "Config file not found: {}",
-                config_path.display()
-            )));
-        }
-
-        let content = fs::read_to_string(&config_path)?;
-        let config: AppConfig = toml::from_str(&content)?;
-        
-        tracing::info!("Loaded config from: {}", config_path.display());
-        Ok(config)
+    /// 用户级配置目录（跨平台）
+    ///
+    /// - macOS: `~/Library/Application Support/com.chinuno.LiveTranslate`
+    /// - Windows: `%APPDATA%\chinuno\LiveTranslate\config`
+    /// - Linux: `~/.config/livetranslate`
+    pub fn user_config_dir() -> AppResult<PathBuf> {
+        ProjectDirs::from("com", "chinuno", "LiveTranslate")
+            .map(|dirs| dirs.config_dir().to_path_buf())
+            .ok_or_else(|| {
+                AppError::Config("Failed to determine user config directory".to_string())
+            })
     }
 
-    /// 获取默认配置文件路径
-    pub fn default_config_path() -> AppResult<PathBuf> {
-        let exe_dir = std::env::current_exe()?
-            .parent()
-            .ok_or_else(|| AppError::Config("Failed to get exe directory".to_string()))?
-            .to_path_buf();
+    /// 用户级配置文件路径（打包后应用的主要配置入口）
+    pub fn user_config_path() -> AppResult<PathBuf> {
+        Ok(Self::user_config_dir()?.join("config.toml"))
+    }
 
-        // 首先尝试当前目录
-        let local_path = exe_dir.join("config").join("default.toml");
-        if local_path.exists() {
-            return Ok(local_path);
+    /// 从指定文件读取配置
+    fn from_file(path: &Path) -> AppResult<Self> {
+        let content = fs::read_to_string(path)?;
+        Ok(toml::from_str(&content)?)
+    }
+
+    /// 若目标文件不存在，则写入一份默认配置（并创建父目录）
+    ///
+    /// 返回是否实际写入了文件。
+    pub fn write_default_if_absent(path: &Path) -> AppResult<bool> {
+        if path.exists() {
+            return Ok(false);
+        }
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let content = toml::to_string_pretty(&AppConfig::default())
+            .map_err(AppError::TomlSerialize)?;
+        fs::write(path, content)?;
+        Ok(true)
+    }
+
+    /// 按优先级解析配置，返回 `(配置, 来源路径)`
+    ///
+    /// 查找顺序：
+    /// 1. `--config` 显式指定
+    /// 2. 可执行文件同级 `config/default.toml`（便携版）
+    /// 3. 当前工作目录 `config/default.toml`（开发/源码运行）
+    /// 4. 用户配置目录（首次运行自动生成默认文件）
+    /// 5. 内置默认值
+    pub fn resolve(explicit: Option<PathBuf>) -> AppResult<(Self, Option<PathBuf>)> {
+        // 1. 显式指定：找不到就直接报错，避免静默用错配置
+        if let Some(path) = explicit {
+            if !path.exists() {
+                return Err(AppError::Config(format!(
+                    "Config file not found: {}",
+                    path.display()
+                )));
+            }
+            let cfg = Self::from_file(&path)?;
+            tracing::info!("Loaded config from: {}", path.display());
+            return Ok((cfg, Some(path)));
         }
 
-        // 尝试项目根目录（开发模式）
-        let project_path = PathBuf::from("config/default.toml");
-        if project_path.exists() {
-            return Ok(project_path);
+        // 2. 可执行文件同级（Windows 便携包 / 解压即用）
+        if let Ok(exe) = std::env::current_exe() {
+            if let Some(dir) = exe.parent() {
+                let p = dir.join("config").join("default.toml");
+                if p.exists() {
+                    let cfg = Self::from_file(&p)?;
+                    tracing::info!("Loaded config from: {}", p.display());
+                    return Ok((cfg, Some(p)));
+                }
+            }
         }
 
-        // 默认返回项目路径
-        Ok(project_path)
+        // 3. 当前工作目录（开发模式）
+        let cwd_path = PathBuf::from("config/default.toml");
+        if cwd_path.exists() {
+            let cfg = Self::from_file(&cwd_path)?;
+            tracing::info!("Loaded config from: {}", cwd_path.display());
+            return Ok((cfg, Some(cwd_path)));
+        }
+
+        // 4. 用户配置目录（打包后的 .app / exe 走这里）
+        if let Ok(user_path) = Self::user_config_path() {
+            if user_path.exists() {
+                let cfg = Self::from_file(&user_path)?;
+                tracing::info!("Loaded config from: {}", user_path.display());
+                return Ok((cfg, Some(user_path)));
+            }
+
+            match Self::write_default_if_absent(&user_path) {
+                Ok(true) => {
+                    tracing::info!(
+                        "Created default config at: {} (请填入翻译 API Key)",
+                        user_path.display()
+                    );
+                    return Ok((AppConfig::default(), Some(user_path)));
+                }
+                Ok(false) => {}
+                Err(e) => {
+                    tracing::warn!(
+                        "Failed to create default config at {}: {}",
+                        user_path.display(),
+                        e
+                    );
+                }
+            }
+        }
+
+        // 5. 内置默认
+        let hint = Self::user_config_path()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| "<unknown>".to_string());
+        tracing::warn!(
+            "No config file found; using built-in defaults (translation api_key is a placeholder). \
+             Create one at: {}",
+            hint
+        );
+        Ok((AppConfig::default(), None))
     }
 
     /// 保存配置到文件
     pub fn save(&self, path: &Path) -> AppResult<()> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
         let content = toml::to_string_pretty(self)
-            .map_err(|e| AppError::TomlSerialize(e))?;
+            .map_err(AppError::TomlSerialize)?;
         fs::write(path, content)?;
         tracing::info!("Config saved to: {}", path.display());
         Ok(())
@@ -151,5 +231,51 @@ impl Default for AppConfig {
                 click_through: false,
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_config_path(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "livetranslate-test-{}-{}",
+            std::process::id(),
+            tag
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        dir.join("config.toml")
+    }
+
+    #[test]
+    fn write_default_creates_file_once() {
+        let path = temp_config_path("write-default");
+
+        // 首次应写入
+        assert!(AppConfig::write_default_if_absent(&path).unwrap());
+        assert!(path.exists());
+
+        // 已存在则不覆盖
+        assert!(!AppConfig::write_default_if_absent(&path).unwrap());
+
+        // 写出的文件必须能解析回 AppConfig
+        let cfg = AppConfig::from_file(&path).unwrap();
+        assert_eq!(cfg.translate.target_language, "zh-CN");
+        assert_eq!(cfg.audio.sample_rate, 16000);
+
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn user_config_path_is_toml_file() {
+        let path = AppConfig::user_config_path().unwrap();
+        assert_eq!(path.file_name().unwrap(), "config.toml");
+    }
+
+    #[test]
+    fn explicit_missing_config_is_an_error() {
+        let missing = PathBuf::from("/nonexistent/definitely/not/here.toml");
+        assert!(AppConfig::resolve(Some(missing)).is_err());
     }
 }

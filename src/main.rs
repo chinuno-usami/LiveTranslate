@@ -324,8 +324,7 @@ async fn stop_capture_impl(app: AppHandle, state: Arc<SharedState>) -> Result<()
     Ok(())
 }
 
-fn emit_status(app: &AppHandle, running: bool, message: impl Into<String>) {
-    let _ = app.emit_all(
+fn emit_status(app: &AppHandle, running: bool, message: impl Into<String>) {    let _ = app.emit_all(
         STATUS_EVENT,
         StatusPayload {
             running,
@@ -344,6 +343,29 @@ fn emit_subtitle_reset(app: &AppHandle) {
             text: String::new(),
         },
     );
+}
+
+/// 在系统文件管理器中打开用户配置目录
+///
+/// 同时在目录不存在时先创建它，方便用户首次直接编辑。
+pub(crate) fn open_config_dir() -> Result<(), String> {
+    let dir = AppConfig::user_config_dir().map_err(|e| e.to_string())?;
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+
+    #[cfg(target_os = "macos")]
+    let opener = "open";
+    #[cfg(target_os = "windows")]
+    let opener = "explorer";
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let opener = "xdg-open";
+
+    std::process::Command::new(opener)
+        .arg(&dir)
+        .spawn()
+        .map_err(|e| format!("Failed to open {}: {}", dir.display(), e))?;
+
+    tracing::info!("Opened config directory: {}", dir.display());
+    Ok(())
 }
 
 fn apply_window_config(window: &Window, config: &AppConfig) -> Result<(), String> {
@@ -384,14 +406,25 @@ fn main() -> anyhow::Result<()> {
 
     tracing::info!("Starting LiveTranslate Application");
 
-    let config = match AppConfig::load(args.config.clone()) {
-        Ok(cfg) => cfg,
+    let (config, config_path) = match AppConfig::resolve(args.config.clone()) {
+        Ok(resolved) => resolved,
         Err(e) => {
             tracing::error!("Failed to load config: {}", e);
-            tracing::info!("Using default configuration");
-            AppConfig::default()
+            tracing::warn!("Falling back to built-in default configuration");
+            (AppConfig::default(), None)
         }
     };
+
+    match &config_path {
+        Some(path) => tracing::info!("Config file: {}", path.display()),
+        None => {
+            let hint = AppConfig::user_config_path()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|_| "<unknown>".to_string());
+            tracing::warn!("Using built-in defaults. 建议在该位置创建配置文件: {}", hint);
+        }
+    }
+    tracing::debug!("Config: {:?}", config);
 
     if args.list_devices {
         let runtime = tokio::runtime::Runtime::new()?;

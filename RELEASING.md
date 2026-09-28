@@ -110,6 +110,11 @@ open /Applications/LiveTranslate.app
 ```
 
 > 首次运行会请求**麦克风权限**，请允许；否则采集不到声音。
+>
+> 首次运行还会在
+> `~/Library/Application Support/com.chinuno.LiveTranslate/config.toml`
+> 自动生成默认配置，填入翻译 API Key 后重启生效。
+> 也可以用托盘菜单 → **打开配置目录** 直接打开该目录。
 
 ## 各平台依赖
 
