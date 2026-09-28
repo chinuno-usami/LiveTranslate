@@ -15,6 +15,9 @@ pub struct AudioConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AsrConfig {
+    /// 识别后端："whisper"（自建/兼容服务）或 "edge"（微软 Edge 在线识别）
+    #[serde(default = "default_asr_backend")]
+    pub backend: String,
     pub base_url: String,
     pub model: String,
     pub language: String,
@@ -31,6 +34,49 @@ pub struct AsrConfig {
     /// 部分服务使用不同的头部，例如 `api-key`。
     #[serde(default)]
     pub auth_header: Option<String>,
+    /// Edge 在线识别后端配置（仅 `backend = "edge"` 时使用）
+    #[serde(default)]
+    pub edge: EdgeAsrConfig,
+}
+
+/// Edge 在线语音识别后端配置
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EdgeAsrConfig {
+    /// BCP-47 语言标签，如 `en-US` / `zh-CN`（不属于 `auto`）
+    #[serde(default = "default_edge_language")]
+    pub language: String,
+    /// 单次识别超时（秒）
+    #[serde(default = "default_edge_timeout_secs")]
+    pub timeout_secs: u64,
+    /// 以下三项是服务端可能轮换的身份参数，一般无需修改
+    #[serde(default)]
+    pub trusted_client_token: Option<String>,
+    #[serde(default)]
+    pub chromium_full_version: Option<String>,
+    #[serde(default)]
+    pub origin: Option<String>,
+}
+
+impl Default for EdgeAsrConfig {
+    fn default() -> Self {
+        Self {
+            language: default_edge_language(),
+            timeout_secs: default_edge_timeout_secs(),
+            trusted_client_token: None,
+            chromium_full_version: None,
+            origin: None,
+        }
+    }
+}
+
+fn default_asr_backend() -> String {
+    "whisper".to_string()
+}
+fn default_edge_language() -> String {
+    "en-US".to_string()
+}
+fn default_edge_timeout_secs() -> u64 {
+    15
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -318,6 +364,7 @@ impl Default for AppConfig {
                 silence_threshold: 0.01,
             },
             asr: AsrConfig {
+                backend: "whisper".to_string(),
                 base_url: "http://127.0.0.1:8765".to_string(),
                 model: "whisper-1".to_string(),
                 language: "auto".to_string(),
@@ -325,6 +372,7 @@ impl Default for AppConfig {
                 request_path: "/v1/audio/transcriptions".to_string(),
                 api_key: None,
                 auth_header: None,
+                edge: EdgeAsrConfig::default(),
             },
             translate: TranslateConfig {
                 base_url: "https://api.openai.com/v1".to_string(),

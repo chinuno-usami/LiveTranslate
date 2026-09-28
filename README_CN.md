@@ -78,6 +78,8 @@ channels = 1
 silence_threshold = 0.01
 
 [asr]
+# 识别后端: "whisper"（自建/兼容服务）或 "edge"（Edge 在线识别）
+backend = "whisper"
 # Whisper 兼容 API 地址
 base_url = "http://127.0.0.1:8765"
 # 模型名称
@@ -93,6 +95,11 @@ request_path = "/v1/audio/transcriptions"
 api_key = ""
 # 认证头名称（可选，默认 Authorization；部分服务用 api-key）
 auth_header = ""
+
+# edge 后端（仅 backend = "edge" 时生效）
+[asr.edge]
+language = "en-US"    # BCP-47 标签，不能用 auto
+timeout_secs = 15
 
 [translate]
 # OpenAI 兼容 API 地址
@@ -163,6 +170,41 @@ click_through = false
 > 按住浮窗任意空白处可拖动窗口。
 > 字号与原文开关的修改会**就地写入配置文件并保留原有注释**；
 > 窗口位置目前仅本次运行有效，重启后仍以配置中的 `position_x/position_y` 为准。
+
+## 语音识别后端
+
+通过 `[asr] backend` 切换，两个后端各自独立配置：
+
+| 后端 | 说明 | 优点 | 缺点 |
+|------|------|------|------|
+| `whisper`（默认） | 对接自建/兼容的 Whisper HTTP 服务 | 可离线、可控、隐私好 | 需自己部署并保证显存/性能 |
+| `edge` | 微软 Edge 内置语音识别的在线服务 | 无需部署、开箱即用 | 需联网、依赖服务端策略、可能限流 |
+
+```toml
+[asr]
+backend = "edge"
+
+[asr.edge]
+language = "en-US"    # BCP-47 标签，**【不能】用 auto**
+timeout_secs = 15
+```
+
+> `edge` 后端使用微软 Edge 浏览器语音识别所用的 WebSocket 服务（
+> `speech.platform.bing.com`）。握手需要一组会轮换的客户端身份参数，
+> 默认值已内置；若将来出现 401 / 握手失败，可在 `[asr.edge]` 里覆盖
+> `trusted_client_token` / `chromium_full_version` / `origin`。
+
+### 怎么选
+
+- 有本地 GPU / 想离线：用 `whisper`
+- 想快速试用、不想搭服务：用 `edge`（注意先把 `language` 改成目标语言，
+  例如英文语音用 `en-US`）
+
+启动日志会明确告诉你当前用的是哪个后端：
+
+```
+INFO livetranslate::app: ASR backend: edge (Edge ASR (en-US))
+```
 
 ## VAD 语音分段
 

@@ -42,6 +42,12 @@ pre_pad_ms = 200
 post_pad_ms = 200
 
 [asr]
+# 识别后端，可选:
+#   "whisper" - 自建/兼容的 Whisper HTTP 服务（默认）
+#   "edge"    - 微软 Edge 内置语音识别的在线服务（无需自建服务）
+backend = "whisper"
+
+# --- 以下为 whisper 后端配置 ---
 # Whisper 兼容 API 基础 URL
 base_url = "http://127.0.0.1:8765"
 model = "whisper-1"
@@ -54,6 +60,19 @@ api_key = ""
 # 认证头名称（可选），默认 Authorization。
 # 若服务使用其他头部（如 api-key），在这里指定
 auth_header = ""
+
+# --- edge 后端配置（仅 backend = "edge" 时生效）---
+[asr.edge]
+# BCP-47 语言标签（不能用 "auto"）
+# 常见值: en-US / zh-CN / ja-JP / ko-KR / en-GB ...
+language = "en-US"
+# 单次识别超时（秒）
+timeout_secs = 15
+# 以下三项是服务端可能轮换的客户端身份参数，一般无需修改；
+# 若哪天 edge 后端开始报 401/握手失败，可在此覆盖
+# trusted_client_token = ""
+# chromium_full_version = ""
+# origin = ""
 
 [translate]
 # OpenAI 兼容 API

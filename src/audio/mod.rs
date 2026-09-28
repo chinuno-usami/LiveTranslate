@@ -6,4 +6,3 @@ pub mod vad;
 pub mod wav;
 
 pub use capture::AudioCapture;
-pub use chunker::AudioChunker;

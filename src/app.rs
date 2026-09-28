@@ -1,8 +1,8 @@
 use crate::audio::chunker::AudioChunker;
 use crate::audio::resample::LinearResampler;
 use crate::audio::segmenter::SpeechSegmenter;
-use crate::audio::{wav, AudioCapture};
-use crate::asr::WhisperClient;
+use crate::audio::{AudioCapture};
+use crate::asr::AsrEngine;
 use crate::config::AppConfig;
 use crate::error::AppResult;
 use crate::subtitle::{Subtitle, SubtitleProcessor};
@@ -103,15 +103,13 @@ async fn send_notice(tx: &mpsc::Sender<PipelineEvent>, last: &mut String, msg: S
 async fn process_segment(
     chunk: &[f32],
     sample_rate: u32,
-    whisper: &WhisperClient,
+    engine: &AsrEngine,
     translator: &OpenAiClient,
     processor: &mut SubtitleProcessor,
     tx: &mpsc::Sender<PipelineEvent>,
     last_notice: &mut String,
 ) -> AppResult<bool> {
-    let wav_data = wav::encode_wav(chunk, sample_rate, 1)?;
-
-    match whisper.transcribe(wav_data).await {
+    match engine.transcribe(chunk, sample_rate).await {
         Ok(text) if !text.trim().is_empty() => {
             tracing::info!("Recognized text: {}", text);
 
@@ -153,10 +151,7 @@ async fn process_segment(
             send_notice(
                 tx,
                 last_notice,
-                format!(
-                    "ASR 失败（请确认 Whisper 服务在 {} 上运行）: {e}",
-                    whisper.config.base_url
-                ),
+                format!("ASR 失败（{} @ {}）: {e}", engine.name(), engine.endpoint()),
             )
             .await;
         }
@@ -225,7 +220,12 @@ pub async fn run_pipeline(
         )?))
     };
 
-    let whisper_client = WhisperClient::new(config.asr.clone());
+    let asr_engine = AsrEngine::from_config(&config.asr)?;
+    tracing::info!(
+        "ASR backend: {} ({})",
+        asr_engine.name(),
+        asr_engine.endpoint()
+    );
     let translate_client = OpenAiClient::new(config.translate.clone());
     let mut subtitle_processor = SubtitleProcessor::new();
 
@@ -274,7 +274,7 @@ pub async fn run_pipeline(
                     if !process_segment(
                         &chunk,
                         target_rate,
-                        &whisper_client,
+                        &asr_engine,
                         &translate_client,
                         &mut subtitle_processor,
                         &tx,

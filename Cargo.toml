@@ -35,6 +35,12 @@ toml = "0.8"
 cpal = "0.18"
 hound = "3.5"
 
+# Edge ASR (WebSocket)
+tokio-tungstenite = { version = "0.21", features = ["native-tls"] }
+futures-util = "0.3"
+sha2 = "0.10"
+uuid = { version = "1", features = ["v4"] }
+
 # Logging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
