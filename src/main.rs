@@ -391,6 +391,47 @@ fn apply_window_config(window: &Window, config: &AppConfig) -> Result<(), String
     Ok(())
 }
 
+/// 选择第一个可写的日志文件位置
+///
+/// 依次尝试：用户日志目录 -> 可执行文件同级 -> 系统临时目录。
+/// 返回 `(日志文件路径, 目录, 文件名)`。
+fn resolve_log_target() -> Option<(PathBuf, PathBuf, String)> {
+    let mut candidates: Vec<PathBuf> = Vec::new();
+
+    if let Ok(dir) = AppConfig::log_dir() {
+        candidates.push(dir.join("livetranslate.log"));
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            candidates.push(dir.join("livetranslate.log"));
+        }
+    }
+    candidates.push(std::env::temp_dir().join("livetranslate.log"));
+
+    for path in candidates {
+        let parent = match path.parent() {
+            Some(p) => p.to_path_buf(),
+            None => continue,
+        };
+        if std::fs::create_dir_all(&parent).is_err() {
+            continue;
+        }
+        if std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .is_ok()
+        {
+            let file_name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| "livetranslate.log".to_string());
+            return Some((path, parent, file_name));
+        }
+    }
+    None
+}
+
 fn init_logging(level: &str) -> Option<tracing_appender::non_blocking::WorkerGuard> {
     use tracing_subscriber::prelude::*;
 
@@ -402,30 +443,25 @@ fn init_logging(level: &str) -> Option<tracing_appender::non_blocking::WorkerGua
         .with_thread_ids(true);
 
     // 文件输出：双击运行（GUI 子系统、无控制台）时唯一的可诊断手段
-    if let Ok(log_dir) = AppConfig::log_dir() {
-        if std::fs::create_dir_all(&log_dir).is_ok() {
-            let appender = tracing_appender::rolling::never(&log_dir, "livetranslate.log");
-            let (writer, guard) = tracing_appender::non_blocking(appender);
+    if let Some((log_path, log_dir, file_name)) = resolve_log_target() {
+        let appender = tracing_appender::rolling::never(&log_dir, file_name);
+        let (writer, guard) = tracing_appender::non_blocking(appender);
 
-            let file_layer = tracing_subscriber::fmt::layer()
-                .with_writer(writer)
-                .with_ansi(false)
-                .with_target(true);
+        let file_layer = tracing_subscriber::fmt::layer()
+            .with_writer(writer)
+            .with_ansi(false)
+            .with_target(true);
 
-            let subscriber = tracing_subscriber::registry()
-                .with(env_filter)
-                .with(console_layer)
-                .with(file_layer);
+        let subscriber = tracing_subscriber::registry()
+            .with(env_filter)
+            .with(console_layer)
+            .with(file_layer);
 
-            if let Err(e) = tracing::subscriber::set_global_default(subscriber) {
-                eprintln!("failed to set tracing subscriber: {e}");
-            }
-            eprintln!(
-                "log file: {}",
-                log_dir.join("livetranslate.log").display()
-            );
-            return Some(guard);
+        if let Err(e) = tracing::subscriber::set_global_default(subscriber) {
+            eprintln!("failed to set tracing subscriber: {e}");
         }
+        eprintln!("log file: {}", log_path.display());
+        return Some(guard);
     }
 
     let subscriber = tracing_subscriber::registry()
@@ -436,6 +472,19 @@ fn init_logging(level: &str) -> Option<tracing_appender::non_blocking::WorkerGua
     }
     None
 }
+
+/// Windows: `windows_subsystem = "windows"` 不分配控制台，
+/// 但从 cmd/PowerShell 启动时，附着到父进程控制台就能直接看到日志。
+#[cfg(target_os = "windows")]
+fn attach_parent_console() {
+    use windows::Win32::System::Console::{AttachConsole, ATTACH_PARENT_PROCESS};
+    unsafe {
+        let _ = AttachConsole(ATTACH_PARENT_PROCESS);
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn attach_parent_console() {}
 
 /// 捕获 panic 并记录到日志；Windows 下额外弹窗提示
 fn install_panic_hook() {
@@ -478,9 +527,15 @@ fn show_error_dialog(title: &str, message: &str) {
 fn show_error_dialog(_title: &str, _message: &str) {}
 
 fn main() {
+    // 先附着父控制台（Windows），否则 GUI 子系统下看不到任何输出
+    attach_parent_console();
+
     let args = Args::parse();
     let _log_guard = init_logging(&args.log_level);
     install_panic_hook();
+
+    tracing::info!("==== LiveTranslate starting ====");
+    tracing::info!("version: {}", env!("CARGO_PKG_VERSION"));
 
     if let Err(e) = run(args) {
         let message = format!("{e:#}");

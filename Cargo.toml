@@ -53,6 +53,7 @@ clap = { version = "4.4", features = ["derive"] }
 windows = { version = "0.52", features = [
     "Win32_Media_Audio",
     "Win32_System_Com",
+    "Win32_System_Console",
     "Win32_Foundation",
     "Win32_System_Memory",
     "Win32_Media",
