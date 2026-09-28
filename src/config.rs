@@ -34,8 +34,7 @@ pub struct AsrConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TranslateConfig {
-    pub base_url: String,
+pub struct TranslateConfig {    pub base_url: String,
     pub api_key: String,
     pub model: String,
     pub target_language: String,
@@ -60,11 +59,89 @@ pub struct SubtitleConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VadConfig {
+    /// 是否启用 VAD 分段（关闭则回到固定时长切片）
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// VAD 帧长（毫秒），推荐 20
+    #[serde(default = "default_vad_frame_ms")]
+    pub frame_ms: u32,
+    /// 判为语音所需的、高于自适应噪声底的余量（dB）
+    #[serde(default = "default_vad_margin_db")]
+    pub margin_db: f32,
+    /// 噪声底估计所用的分位数（0.0-1.0）
+    #[serde(default = "default_vad_noise_percentile")]
+    pub noise_percentile: f32,
+    /// 语音需持续多久才确认开始（也是最短片段长度）
+    #[serde(default = "default_vad_min_speech_ms")]
+    pub min_speech_ms: u32,
+    /// 静音需持续多久才确认说完
+    #[serde(default = "default_vad_min_silence_ms")]
+    pub min_silence_ms: u32,
+    /// 单个片段最长时长，超过则强制切分（控制延迟）
+    #[serde(default = "default_vad_max_speech_ms")]
+    pub max_speech_ms: u32,
+    /// 开始前保留的音频，避免吃掉首音素
+    #[serde(default = "default_vad_pre_pad_ms")]
+    pub pre_pad_ms: u32,
+    /// 结束后保留的音频，避免吃掉尾音素
+    #[serde(default = "default_vad_post_pad_ms")]
+    pub post_pad_ms: u32,
+}
+
+impl Default for VadConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            frame_ms: 20,
+            margin_db: 8.0,
+            noise_percentile: 0.1,
+            min_speech_ms: 200,
+            min_silence_ms: 400,
+            max_speech_ms: 12_000,
+            pre_pad_ms: 200,
+            post_pad_ms: 200,
+        }
+    }
+}
+
+fn default_true() -> bool {
+    true
+}
+fn default_vad_frame_ms() -> u32 {
+    VadConfig::default().frame_ms
+}
+fn default_vad_margin_db() -> f32 {
+    VadConfig::default().margin_db
+}
+fn default_vad_noise_percentile() -> f32 {
+    VadConfig::default().noise_percentile
+}
+fn default_vad_min_speech_ms() -> u32 {
+    VadConfig::default().min_speech_ms
+}
+fn default_vad_min_silence_ms() -> u32 {
+    VadConfig::default().min_silence_ms
+}
+fn default_vad_max_speech_ms() -> u32 {
+    VadConfig::default().max_speech_ms
+}
+fn default_vad_pre_pad_ms() -> u32 {
+    VadConfig::default().pre_pad_ms
+}
+fn default_vad_post_pad_ms() -> u32 {
+    VadConfig::default().post_pad_ms
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
     pub audio: AudioConfig,
     pub asr: AsrConfig,
     pub translate: TranslateConfig,
     pub subtitle: SubtitleConfig,
+    /// VAD 分段配置（旧配置文件没有该段时使用默认值）
+    #[serde(default)]
+    pub vad: VadConfig,
 }
 
 impl AppConfig {
@@ -254,6 +331,7 @@ impl Default for AppConfig {
                 always_on_top: true,
                 click_through: false,
             },
+            vad: VadConfig::default(),
         }
     }
 }

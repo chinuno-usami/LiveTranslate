@@ -108,6 +108,19 @@ system_prompt = "You are a real-time subtitle translator. Translate naturally an
 # 超时时间（秒）
 timeout_secs = 20
 
+[vad]
+# 是否启用 VAD 分段（推荐开启）
+# 开启后按语音边界切句，而不是固定 2 秒硬切，能显著减少句子被截断
+enabled = true
+frame_ms = 20
+margin_db = 8.0          # 嘈杂环境调大（10~12），安静环境可调小（6）
+noise_percentile = 0.1
+min_speech_ms = 200      # 语音持续多久才确认开始
+min_silence_ms = 400     # 静音持续多久才确认说完
+max_speech_ms = 12000    # 单片段最长时长，超过强制切分
+pre_pad_ms = 200
+post_pad_ms = 200
+
 [subtitle]
 # 最多显示行数
 max_lines = 3
@@ -131,6 +144,44 @@ always_on_top = true
 # 点击穿透（透明窗口）
 click_through = false
 ```
+
+## VAD 语音分段
+
+默认开启（`vad.enabled = true`），用**按语音边界切句**代替固定时长硬切：
+
+```text
+静音 ──┐            ┌──────────────┐
+       │  确认开始   │   语音持续    │  确认结束
+       └────────────┘              └───────────
+         ↑ pre_pad_ms                ↑ post_pad_ms
+```
+
+- 语音需持续 `min_speech_ms` 才确认开始（过滤毛刺噪声）
+- 静音需持续 `min_silence_ms` 才确认说完（句中停顿不会被切断）
+- 超过 `max_speech_ms` 强制切分，避免延迟无限增长
+- 开始前 / 结束后各保留一段音频，避免吃掉首尾音素
+
+检测算法是**纯 Rust**的「自适应噪声底 + 迟滞」：实时估计环境噪声底，
+只有明显高于它才算语音；噪声底只在非语音段更新，避免长句把自己的阈值抬高。
+
+### 调参建议
+
+| 现象 | 调整 |
+|------|------|
+| 噪声被当成语音（乱出字幕） | 调大 `margin_db`（如 10~12） |
+| 说话声音小/听不到 | 调小 `margin_db`（如 6） |
+| 句子仍被句中停顿切断 | 调大 `min_silence_ms`（如 600~800） |
+| 延迟太大 | 调小 `max_speech_ms` |
+| 首字/尾音丢失 | 调大 `pre_pad_ms` / `post_pad_ms` |
+
+日志（`--log-level debug`）会周期性打印当前噪声底与阈值，便于对照调整：
+
+```
+DEBUG livetranslate::app: VAD 噪声底 ≈ -52.3 dBFS (speech 阈值 ≈ -44.3 dBFS)
+```
+
+> 若关闭 VAD，则回退到固定时长切片（`audio.chunk_seconds` + 重叠），
+> 效果会明显变差，仅用于对比排查。
 
 ## 配置文件位置
 

@@ -46,8 +46,8 @@ impl AudioChunker {
     }
 
     /// 添加新的音频样本
-    pub fn push_samples(&mut self, samples: Vec<f32>) {
-        self.buffer.extend_from_slice(&samples);
+    pub fn push_samples(&mut self, samples: &[f32]) {
+        self.buffer.extend_from_slice(samples);
     }
 
     /// 获取下一个分片
@@ -113,7 +113,7 @@ mod tests {
         
         // 1 秒的样本 = 16000 个样本
         let samples = vec![0.1; 16000];
-        chunker.push_samples(samples);
+        chunker.push_samples(&samples);
 
         let chunk = chunker.next_chunk();
         assert!(chunk.is_some());
