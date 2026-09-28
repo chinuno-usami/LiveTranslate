@@ -1,0 +1,176 @@
+name: Build & Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag (例如 v0.1.0)，必填'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  BIN_NAME: livetranslate
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86_64
+            os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+          - name: windows-x86_64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+          - name: macos-universal
+            os: macos-latest
+            target: universal-apple-darwin
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.0-dev \
+            libgtk-3-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libsoup2.4-dev \
+            libasound2-dev \
+            libssl-dev \
+            pkg-config \
+            build-essential \
+            file
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Add single Rust target
+        if: matrix.target != 'universal-apple-darwin'
+        run: rustup target add ${{ matrix.target }}
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build (single target)
+        if: matrix.target != 'universal-apple-darwin'
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Build (macOS universal)
+        if: matrix.target == 'universal-apple-darwin'
+        run: |
+          rustup target add aarch64-apple-darwin x86_64-apple-darwin
+          cargo build --release --target aarch64-apple-darwin
+          cargo build --release --target x86_64-apple-darwin
+          mkdir -p target/universal/release
+          lipo -create \
+            target/aarch64-apple-darwin/release/${BIN_NAME} \
+            target/x86_64-apple-darwin/release/${BIN_NAME} \
+            -output target/universal/release/${BIN_NAME}
+          file target/universal/release/${BIN_NAME}
+
+      - name: Package (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          TARGET="${{ matrix.target }}"
+          NAME="${BIN_NAME}-${TARGET}"
+          STAGE="dist/${NAME}"
+          mkdir -p "$STAGE"
+
+          if [ "$TARGET" = "universal-apple-darwin" ]; then
+            SRC="target/universal/release/${BIN_NAME}"
+          else
+            SRC="target/${TARGET}/release/${BIN_NAME}"
+          fi
+
+          cp "$SRC" "$STAGE/"
+          chmod +x "$STAGE/${BIN_NAME}"
+          [ -d config ] && cp -r config "$STAGE/"
+          for f in README.md README_CN.md QUICKSTART.md; do
+            [ -f "$f" ] && cp "$f" "$STAGE/"
+          done
+
+          tar -C dist -czf "dist/${NAME}.tar.gz" "${NAME}"
+          ls -lh dist
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $target = "${{ matrix.target }}"
+          $name = "$env:BIN_NAME-$target"
+          $stage = "dist/$name"
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          Copy-Item "target/$target/release/$env:BIN_NAME.exe" $stage
+          if (Test-Path config) { Copy-Item -Recurse config $stage }
+          foreach ($f in @('README.md','README_CN.md','QUICKSTART.md')) {
+            if (Test-Path $f) { Copy-Item $f $stage }
+          }
+          Compress-Archive -Path $stage -DestinationPath "dist/$name.zip" -Force
+          Get-ChildItem dist
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: |
+            dist/*.tar.gz
+            dist/*.zip
+          if-no-files-found: error
+
+  release:
+    name: Publish Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: List release files
+        run: ls -lhR dist
+
+      - name: Resolve release tag
+        id: tag
+        env:
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+        run: |
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${INPUT_TAG}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: LiveTranslate ${{ steps.tag.outputs.tag }}
+          files: dist/*
+          generate_release_notes: true
+          draft: false
+          fail_on_unmatched_files: true
