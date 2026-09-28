@@ -4,6 +4,7 @@
 //! - `whisper`：自建 / 兼容的 Whisper HTTP 服务（默认）
 //! - `edge`：微软 Edge 内置语音识别的在线服务
 
+pub mod cleaner;
 pub mod edge;
 pub mod whisper;
 

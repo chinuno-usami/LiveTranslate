@@ -37,6 +37,13 @@ pub struct AsrConfig {
     /// Edge 在线识别后端配置（仅 `backend = "edge"` 时使用）
     #[serde(default)]
     pub edge: EdgeAsrConfig,
+    /// 过滤音乐/噪声引起的无意义识别输出（默认开启）
+    ///
+    /// 能量型 VAD 无法区分音乐与人声，音乐片段仍会被送去识别，
+    /// 典型结果是 `[Music]`、`♪♪♪`、"感谢观看" 之类的固定幻听文本。
+    /// 开启后会丢弃这些输出，同时避免无谓的翻译请求。
+    #[serde(default = "default_true")]
+    pub filter_hallucination: bool,
 }
 
 /// Edge 在线语音识别后端配置
@@ -373,6 +380,7 @@ impl Default for AppConfig {
                 api_key: None,
                 auth_header: None,
                 edge: EdgeAsrConfig::default(),
+                filter_hallucination: true,
             },
             translate: TranslateConfig {
                 base_url: "https://api.openai.com/v1".to_string(),

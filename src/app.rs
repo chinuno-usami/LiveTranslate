@@ -109,9 +109,16 @@ async fn process_segment(
     processor: &mut SubtitleProcessor,
     tx: &mpsc::Sender<PipelineEvent>,
     last_notice: &mut String,
+    filter_hallucination: bool,
 ) -> AppResult<bool> {
     match engine.transcribe(chunk, sample_rate).await {
         Ok(text) if !text.trim().is_empty() => {
+            // 音乐/噪声引起的幻听输出直接丢弃，既不显示也不翻译
+            if filter_hallucination && !crate::asr::cleaner::is_meaningful_speech(&text) {
+                tracing::debug!("Dropped non-speech ASR output: {:?}", text);
+                return Ok(true);
+            }
+
             tracing::info!("Recognized text: {}", text);
 
             match translator.translate(&text).await {
@@ -234,6 +241,7 @@ pub async fn run_pipeline(
     let (utterance_tx, mut utterance_rx) = mpsc::channel::<Vec<f32>>(4);
     let translate_client = OpenAiClient::new(config.translate.clone());
     let worker_tx = tx.clone();
+    let filter_hallucination = config.asr.filter_hallucination;
 
     let worker = tokio::spawn(async move {
         let mut subtitle_processor = SubtitleProcessor::new();
@@ -248,6 +256,7 @@ pub async fn run_pipeline(
                 &mut subtitle_processor,
                 &worker_tx,
                 &mut last_notice,
+                filter_hallucination,
             )
             .await
             .unwrap_or(true);

@@ -60,6 +60,11 @@ api_key = ""
 # 认证头名称（可选），默认 Authorization。
 # 若服务使用其他头部（如 api-key），在这里指定
 auth_header = ""
+# 过滤音乐/噪声引起的无意义识别输出（默认开启）
+# 能量型 VAD 分不清音乐和人声，音乐片段会被送去识别，
+# 典型输出是 [Music]、♪♪♪、"感谢观看" 之类的固定幻听文本；
+# 开启后会直接丢弃，既不显示也不翻译
+filter_hallucination = true
 
 # --- edge 后端配置（仅 backend = "edge" 时生效）---
 [asr.edge]
