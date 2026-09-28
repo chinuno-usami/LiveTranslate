@@ -24,8 +24,8 @@ use ui::{
 };
 
 #[derive(Parser, Debug)]
-#[command(name = "ASR Translate")]
-#[command(about = "Real-time speech recognition and translation with subtitle overlay")]
+#[command(name = "LiveTranslate")]
+#[command(about = "实时语音识别 + 翻译 + 透明浮窗字幕")]
 struct Args {
     /// Config file path
     #[arg(short, long)]
@@ -348,7 +348,7 @@ fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     init_logging(&args.log_level);
 
-    tracing::info!("Starting ASR Translate Application");
+    tracing::info!("Starting LiveTranslate Application");
 
     let config = match AppConfig::load(args.config.clone()) {
         Ok(cfg) => cfg,

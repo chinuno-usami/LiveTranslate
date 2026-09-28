@@ -141,28 +141,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "asrtranslate"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap",
- "cpal",
- "directories",
- "hound",
- "reqwest",
- "serde",
- "serde_json",
- "tauri",
- "tauri-build",
- "thiserror 1.0.69",
- "tokio",
- "toml 0.8.23",
- "tracing",
- "tracing-subscriber",
- "windows 0.52.0",
-]
-
-[[package]]
 name = "async-broadcast"
 version = "0.7.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2420,6 +2398,28 @@ name = "litemap"
 version = "0.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "47d9d19d1d6efa0109d2f65ff4c85cddd50bd572e5a00127ab10987290bcefae"
+
+[[package]]
+name = "livetranslate"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "cpal",
+ "directories",
+ "hound",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tauri",
+ "tauri-build",
+ "thiserror 1.0.69",
+ "tokio",
+ "toml 0.8.23",
+ "tracing",
+ "tracing-subscriber",
+ "windows 0.52.0",
+]
 
 [[package]]
 name = "lock_api"

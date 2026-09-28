@@ -3,7 +3,7 @@
 ## 📁 项目文件结构
 
 ```
-asrtranslate/
+livetranslate/
 ├── Cargo.toml                      # Rust 项目配置
 ├── Cargo.lock                      # 依赖版本锁定
 ├── README.md                       # 英文 README
@@ -46,7 +46,7 @@ asrtranslate/
 │
 └── target/
     └── release/
-        └── asrtranslate           # 编译后的二进制文件
+        └── livetranslate           # 编译后的二进制文件
 ```
 
 ## 🏗️ 模块设计

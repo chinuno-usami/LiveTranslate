@@ -423,7 +423,7 @@ click_through = false
 ## 10. 目录建议
 
 ```text
-asrtranslate/
+livetranslate/
 ├─ src/
 │  ├─ main.rs
 │  ├─ app.rs

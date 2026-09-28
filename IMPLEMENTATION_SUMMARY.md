@@ -199,7 +199,7 @@ cargo build --release
 ./whisper-server -m models/ggml-base.bin -p 8765
 
 # 4. 运行
-./target/release/asrtranslate --log-level info
+./target/release/livetranslate --log-level info
 
 # 或使用脚本
 ./run.sh          # Linux/macOS
@@ -209,7 +209,7 @@ run.bat           # Windows
 ### 列出可用设备
 
 ```bash
-./target/release/asrtranslate --list-devices
+./target/release/livetranslate --list-devices
 ```
 
 ---

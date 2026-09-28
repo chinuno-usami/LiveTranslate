@@ -1,11 +1,11 @@
 [package]
-name = "asrtranslate"
+name = "livetranslate"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.70"
 
 [[bin]]
-name = "asrtranslate"
+name = "livetranslate"
 path = "src/main.rs"
 
 [dependencies]

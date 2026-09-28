@@ -3,11 +3,11 @@
 ## 1️⃣ 编译项目
 
 ```bash
-cd /path/to/asrtranslate
+cd /path/to/livetranslate
 cargo build --release
 ```
 
-✅ 输出：`target/release/asrtranslate` (4.5 MB)
+✅ 输出：`target/release/livetranslate` (4.5 MB)
 
 ## 2️⃣ 准备环境
 
@@ -74,7 +74,7 @@ font_size = 28
 在 Windows 上查看可用的麦克风和回环设备：
 
 ```bash
-./target/release/asrtranslate --list-devices
+./target/release/livetranslate --list-devices
 ```
 
 输出示例：
@@ -91,13 +91,13 @@ Available audio devices:
 ### 方式 A: 直接运行
 
 ```bash
-./target/release/asrtranslate --log-level info
+./target/release/livetranslate --log-level info
 ```
 
 如果只想看控制台输出，可使用：
 
 ```bash
-./target/release/asrtranslate --console --log-level info
+./target/release/livetranslate --console --log-level info
 ```
 
 ### 方式 B: 使用启动脚本
@@ -117,13 +117,13 @@ bash run.sh
 运行成功时，会弹出透明字幕浮窗，同时控制台输出日志：
 
 ```
-2024-09-28T11:00:00.123Z INFO asrtranslate: Starting ASR Translate Application
-2024-09-28T11:00:00.456Z INFO asrtranslate: Config loaded successfully
-2024-09-28T11:00:01.789Z INFO asrtranslate::audio::capture: Opening audio device: Device(0)
-2024-09-28T11:00:01.890Z INFO asrtranslate::audio::capture: Audio stream started
-2024-09-28T11:00:05.234Z INFO asrtranslate::asr: ASR result: Hello, everyone
-2024-09-28T11:00:06.567Z INFO asrtranslate::translate: Translated: Hello, everyone -> 大家好
-2024-09-28T11:00:06.568Z INFO asrtranslate: Subtitle: Hello, everyone => 大家好
+2024-09-28T11:00:00.123Z INFO livetranslate: Starting LiveTranslate Application
+2024-09-28T11:00:00.456Z INFO livetranslate: Config loaded successfully
+2024-09-28T11:00:01.789Z INFO livetranslate::audio::capture: Opening audio device: Device(0)
+2024-09-28T11:00:01.890Z INFO livetranslate::audio::capture: Audio stream started
+2024-09-28T11:00:05.234Z INFO livetranslate::asr: ASR result: Hello, everyone
+2024-09-28T11:00:06.567Z INFO livetranslate::translate: Translated: Hello, everyone -> 大家好
+2024-09-28T11:00:06.568Z INFO livetranslate: Subtitle: Hello, everyone => 大家好
 ```
 
 ## 🎤 测试
@@ -140,7 +140,7 @@ bash run.sh
 **解决**：
 ```bash
 # 列出设备
-./target/release/asrtranslate --list-devices
+./target/release/livetranslate --list-devices
 
 # 编辑 config/default.toml
 device_name = "microphone"  # 或 "loopback"
@@ -200,7 +200,7 @@ curl http://127.0.0.1:8765/v1/models
 **准备好开始了？ 立即运行：**
 
 ```bash
-./target/release/asrtranslate --log-level info
+./target/release/livetranslate --log-level info
 ```
 
 祝你使用愉快！🎉

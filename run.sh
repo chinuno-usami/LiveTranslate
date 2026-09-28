@@ -1,14 +1,14 @@
 #!/bin/bash
 
-# ASR Translate 快速启动脚本
+# LiveTranslate 快速启动脚本
 
 set -e
 
-BINARY="./target/release/asrtranslate"
+BINARY="./target/release/livetranslate"
 CONFIG="config/default.toml"
 
 echo "================================"
-echo "ASR Translate 快速启动"
+echo "LiveTranslate 快速启动"
 echo "================================"
 
 # 检查二进制文件

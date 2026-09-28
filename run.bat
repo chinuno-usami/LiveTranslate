@@ -1,13 +1,13 @@
 @echo off
 setlocal enabledelayedexpansion
 
-REM ASR Translate 快速启动脚本 (Windows)
+REM LiveTranslate 快速启动脚本 (Windows)
 
-set BINARY=target\release\asrtranslate.exe
+set BINARY=target\release\livetranslate.exe
 set CONFIG=config\default.toml
 
 echo ================================
-echo ASR Translate 快速启动
+echo LiveTranslate 快速启动
 echo ================================
 
 REM 检查二进制文件

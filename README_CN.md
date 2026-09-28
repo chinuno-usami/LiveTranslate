@@ -1,4 +1,4 @@
-# ASR Translate - 实时语音识别翻译字幕程序
+# LiveTranslate - 实时语音识别翻译字幕程序
 
 一个用 Rust 编写的实时语音识别与翻译系统，支持从麦克风或系统回环采集音频，调用本地 Whisper API 进行识别，并通过 OpenAI 兼容 API 进行翻译。
 
@@ -38,23 +38,23 @@
 
 ```bash
 git clone <repo>
-cd asrtranslate
+cd livetranslate
 cargo build --release
 ```
 
-编译后的二进制在 `target/release/asrtranslate`
+编译后的二进制在 `target/release/livetranslate`
 
 ### 快速测试
 
 ```bash
 # 列出可用的音频设备
-./target/release/asrtranslate --list-devices
+./target/release/livetranslate --list-devices
 
 # 使用默认设备运行（需要配置文件）
-./target/release/asrtranslate
+./target/release/livetranslate
 
 # 指定日志级别
-./target/release/asrtranslate --log-level debug
+./target/release/livetranslate --log-level debug
 ```
 
 ## 配置
@@ -143,7 +143,7 @@ click_through = false
 
 3. **运行程序**
    ```bash
-   ./target/release/asrtranslate --log-level info
+   ./target/release/livetranslate --log-level info
    ```
 
 4. **实时监控**
@@ -174,7 +174,7 @@ click_through = false
 
 ```
 USAGE:
-    asrtranslate [OPTIONS]
+    livetranslate [OPTIONS]
 
 OPTIONS:
     -c, --config <CONFIG>      指定配置文件路径
@@ -278,14 +278,14 @@ OPTIONS:
 ## 日志示例
 
 ```
-2024-09-28T10:30:45.123Z INFO asrtranslate: Starting ASR Translate Application
-2024-09-28T10:30:45.456Z INFO asrtranslate: Config loaded successfully
-2024-09-28T10:30:46.789Z INFO asrtranslate::audio::capture: Opening audio device: Device(0)
-2024-09-28T10:30:47.012Z INFO asrtranslate::audio::capture: Audio stream started
-2024-09-28T10:30:50.234Z INFO asrtranslate::asr: Sending audio to ASR: http://127.0.0.1:8765/v1/audio/transcriptions (size: 64000 bytes)
-2024-09-28T10:30:51.567Z INFO asrtranslate::asr: ASR result: Hello, everyone
-2024-09-28T10:30:52.890Z INFO asrtranslate::translate: Translated: Hello, everyone -> 大家好
-2024-09-28T10:30:52.891Z INFO asrtranslate: Subtitle: Hello, everyone => 大家好
+2024-09-28T10:30:45.123Z INFO livetranslate: Starting LiveTranslate Application
+2024-09-28T10:30:45.456Z INFO livetranslate: Config loaded successfully
+2024-09-28T10:30:46.789Z INFO livetranslate::audio::capture: Opening audio device: Device(0)
+2024-09-28T10:30:47.012Z INFO livetranslate::audio::capture: Audio stream started
+2024-09-28T10:30:50.234Z INFO livetranslate::asr: Sending audio to ASR: http://127.0.0.1:8765/v1/audio/transcriptions (size: 64000 bytes)
+2024-09-28T10:30:51.567Z INFO livetranslate::asr: ASR result: Hello, everyone
+2024-09-28T10:30:52.890Z INFO livetranslate::translate: Translated: Hello, everyone -> 大家好
+2024-09-28T10:30:52.891Z INFO livetranslate: Subtitle: Hello, everyone => 大家好
 ```
 
 ## 已知限制
