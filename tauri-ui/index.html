@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>ASR Translate Overlay</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <div id="app" class="overlay-shell" data-tauri-drag-region>
+      <div class="toolbar" data-tauri-drag-region>
+        <div class="status-group" data-tauri-drag-region>
+          <span id="status-dot" class="status-dot idle"></span>
+          <span id="status-text">未启动</span>
+        </div>
+        <div class="actions">
+          <button id="start-btn" class="ghost-btn">开始</button>
+          <button id="stop-btn" class="ghost-btn">停止</button>
+          <button id="through-btn" class="ghost-btn">穿透: 关</button>
+          <button id="close-btn" class="ghost-btn danger">关闭</button>
+        </div>
+      </div>
+
+      <div id="subtitle-panel" class="subtitle-panel">
+        <div id="empty-state" class="empty-state">等待语音输入...</div>
+        <div id="subtitle-lines" class="subtitle-lines"></div>
+      </div>
+    </div>
+
+    <script src="./app.js"></script>
+  </body>
+</html>

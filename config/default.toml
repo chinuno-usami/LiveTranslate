@@ -1,0 +1,41 @@
+[audio]
+# 设备名称，支持 "default", "microphone", "loopback"
+device_name = "default"
+chunk_seconds = 2.0
+sample_rate = 16000
+channels = 1
+# 音量阈值（0.0 - 1.0），用于过滤静音片段
+silence_threshold = 0.01
+
+[asr]
+# Whisper 兼容 API 基础 URL
+base_url = "http://127.0.0.1:8765"
+model = "whisper-1"
+language = "auto"
+timeout_secs = 20
+request_path = "/v1/audio/transcriptions"
+
+[translate]
+# OpenAI 兼容 API
+base_url = "https://api.openai.com/v1"
+api_key = "YOUR_API_KEY"
+model = "gpt-4o-mini"
+target_language = "zh-CN"
+system_prompt = "You are a real-time subtitle translator. Translate naturally and concisely without adding any explanation."
+timeout_secs = 20
+
+[subtitle]
+# 最多显示行数
+max_lines = 3
+font_size = 28
+text_color = "#FFFFFF"
+stroke_color = "#000000"
+background = "transparent"
+# 是否显示源文本
+show_source = false
+window_width = 1200
+window_height = 220
+position_x = 200
+position_y = 760
+always_on_top = true
+click_through = false
