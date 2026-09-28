@@ -7,6 +7,7 @@ use crate::config::AppConfig;
 use crate::error::AppResult;
 use crate::subtitle::{Subtitle, SubtitleProcessor};
 use crate::translate::OpenAiClient;
+use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{mpsc, watch};
 
 /// 流水线输出事件
@@ -226,12 +227,41 @@ pub async fn run_pipeline(
         asr_engine.name(),
         asr_engine.endpoint()
     );
+
+    // 把识别/翻译放到独立任务里：
+    // 网络请求可能耗时数秒，若直接在采集循环里 await，采集会被阻塞，
+    // 音频通道填满后 `try_send` 会静默丢样本——结果是片段残缺、请求延迟。
+    let (utterance_tx, mut utterance_rx) = mpsc::channel::<Vec<f32>>(4);
     let translate_client = OpenAiClient::new(config.translate.clone());
-    let mut subtitle_processor = SubtitleProcessor::new();
+    let worker_tx = tx.clone();
+
+    let worker = tokio::spawn(async move {
+        let mut subtitle_processor = SubtitleProcessor::new();
+        let mut last_notice = String::new();
+
+        while let Some(chunk) = utterance_rx.recv().await {
+            let keep_going = process_segment(
+                &chunk,
+                target_rate,
+                &asr_engine,
+                &translate_client,
+                &mut subtitle_processor,
+                &worker_tx,
+                &mut last_notice,
+            )
+            .await
+            .unwrap_or(true);
+
+            if !keep_going {
+                tracing::warn!("Subtitle receiver dropped, stopping worker");
+                break;
+            }
+        }
+    });
 
     // 周期性打印噪声底，便于用户按环境调整 vad.margin_db
     let mut pushed_chunks: u64 = 0;
-    let mut noise_floor_tick: u64 = 0;
+    let mut dropped_segments: u64 = 0;
 
     loop {
         tokio::select! {
@@ -255,13 +285,11 @@ pub async fn run_pipeline(
                 pushed_chunks += 1;
                 if pushed_chunks % 500 == 0 {
                     if let Segmenter::Vad(vad) = &mut segmenter {
-                        noise_floor_tick += 1;
                         tracing::debug!(
                             "VAD 噪声底 ≈ {:.1} dBFS (speech 阈值 ≈ {:.1} dBFS)",
                             vad.noise_floor_db(),
                             vad.noise_floor_db() + config.vad.margin_db
                         );
-                        let _ = noise_floor_tick;
                     }
                 }
 
@@ -271,23 +299,28 @@ pub async fn run_pipeline(
                         continue;
                     }
 
-                    if !process_segment(
-                        &chunk,
-                        target_rate,
-                        &asr_engine,
-                        &translate_client,
-                        &mut subtitle_processor,
-                        &tx,
-                        &mut last_notice,
-                    )
-                    .await?
-                    {
-                        return Ok(());
+                    let ms = chunk.len() as u64 * 1000 / target_rate.max(1) as u64;
+                    tracing::info!("VAD segment ready: {} ms", ms);
+
+                    match utterance_tx.try_send(chunk) {
+                        Ok(()) => {}
+                        Err(TrySendError::Full(_)) => {
+                            dropped_segments += 1;
+                            tracing::warn!(
+                                "识别速度跟不上，丢弃一个片段（累计 {} 个）",
+                                dropped_segments
+                            );
+                        }
+                        Err(TrySendError::Closed(_)) => break,
                     }
                 }
             }
         }
     }
+
+    // 采集结束：关闭发送端，等处理任务收尾
+    drop(utterance_tx);
+    let _ = worker.await;
 
     audio_capture.stop();
     tracing::info!("Audio pipeline stopped");
