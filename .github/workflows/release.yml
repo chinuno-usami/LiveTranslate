@@ -74,14 +74,14 @@ jobs:
 
       - name: Build (single target)
         if: matrix.target != 'universal-apple-darwin'
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo build --release --features custom-protocol --target ${{ matrix.target }}
 
       - name: Build (macOS universal)
         if: matrix.target == 'universal-apple-darwin'
         run: |
           rustup target add aarch64-apple-darwin x86_64-apple-darwin
-          cargo build --release --target aarch64-apple-darwin
-          cargo build --release --target x86_64-apple-darwin
+          cargo build --release --features custom-protocol --target aarch64-apple-darwin
+          cargo build --release --features custom-protocol --target x86_64-apple-darwin
           mkdir -p target/universal/release
           lipo -create \
             target/aarch64-apple-darwin/release/${BIN_NAME} \

@@ -31,6 +31,26 @@ git push origin v0.1.0
 在 GitHub 上进入 **Actions → Build & Release → Run workflow**，
 填入发布 tag（例如 `v0.1.0`）后运行。
 
+## 本地构建
+
+发布构建**必须**启用 `custom-protocol` feature（本项目已将它设为默认 feature，
+因此直接 `cargo build --release` 即可）：
+
+```bash
+# 本平台构建
+cargo build --release
+
+# 从 macOS/Linux 交叉编译到 Windows（需先安装 cargo-xwin）
+cargo install cargo-xwin
+cargo xwin build --release --target x86_64-pc-windows-msvc
+```
+
+> **为什么需要 `custom-protocol`？**
+> Tauri 在未启用该 feature 时认为是 dev 模式（从 `devPath` 加载资源）。
+> 交叉编译场景下，`tauri-codegen` 会因为读不到 `TARGET` 而回退到 host 判定，
+> 在 macOS 上就会错误生成 `tauri::embed_plist` 调用，导致 Windows 构建报
+> `could not find embed_plist in tauri`。启用该 feature 后 dev 分支被关闭，问题消失。
+
 ## 产物命名
 
 | 平台 | 产物 |

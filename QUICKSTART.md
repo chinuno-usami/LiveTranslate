@@ -7,7 +7,16 @@ cd /path/to/livetranslate
 cargo build --release
 ```
 
-✅ 输出：`target/release/livetranslate` (4.5 MB)
+✅ 输出：`target/release/livetranslate`（约 9.5 MB）
+
+从 macOS/Linux 交叉编译到 Windows：
+
+```bash
+cargo install cargo-xwin
+cargo xwin build --release --target x86_64-pc-windows-msvc
+```
+
+> 发布构建需启用 `custom-protocol` feature（已设为默认，无需手动指定）。
 
 ## 2️⃣ 准备环境
 

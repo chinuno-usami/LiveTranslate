@@ -8,6 +8,14 @@ rust-version = "1.70"
 name = "livetranslate"
 path = "src/main.rs"
 
+[features]
+# Tauri 生产构建必需的 feature：启用后资源会被嵌入二进制，
+# 不再从 devPath 加载，同时关闭 dev 专用的 plist 生成逻辑。
+# 本项目的 UI 是静态目录 (tauri-ui/)，不使用 tauri dev 服务器，
+# 因此默认开启（否则交叉编译到 Windows 会因为 host 判定而失败）。
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]
+
 [dependencies]
 # Async runtime
 tokio = { version = "1.35", features = ["full"] }
