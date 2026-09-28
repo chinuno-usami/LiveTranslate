@@ -2408,6 +2408,7 @@ dependencies = [
  "cpal",
  "directories",
  "hound",
+ "ico",
  "reqwest",
  "serde",
  "serde_json",
