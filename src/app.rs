@@ -2,7 +2,7 @@ use crate::audio::{wav, AudioCapture, AudioChunker};
 use crate::asr::WhisperClient;
 use crate::config::AppConfig;
 use crate::error::AppResult;
-use crate::subtitle::Subtitle;
+use crate::subtitle::{Subtitle, SubtitleProcessor};
 use crate::translate::OpenAiClient;
 use tokio::sync::{mpsc, watch};
 
@@ -65,6 +65,7 @@ pub async fn run_pipeline(
 
     let whisper_client = WhisperClient::new(config.asr.clone());
     let translate_client = OpenAiClient::new(config.translate.clone());
+    let mut subtitle_processor = SubtitleProcessor::new();
 
     loop {
         tokio::select! {
@@ -96,9 +97,24 @@ pub async fn run_pipeline(
                                     tracing::info!("Recognized text: {}", text);
                                     match translate_client.translate(&text).await {
                                         Ok(translated) => {
-                                            if tx.send(Subtitle::new(text, translated)).await.is_err() {
-                                                tracing::warn!("Subtitle receiver dropped, stopping pipeline");
-                                                return Ok(());
+                                            // 检查是否重复
+                                            if subtitle_processor.is_duplicate(&text, &translated) {
+                                                tracing::debug!("Duplicate subtitle detected, skipping");
+                                            } else {
+                                                // 做前缀/后缀去重
+                                                let (clean_text, clean_trans) =
+                                                    subtitle_processor.deduplicate_overlap(&text, &translated);
+
+                                                if clean_text.is_empty() {
+                                                    tracing::debug!("Subtitle is empty after overlap removal, skipping");
+                                                } else {
+                                                    subtitle_processor.record(&text, &translated);
+
+                                                    if tx.send(Subtitle::new(clean_text, clean_trans)).await.is_err() {
+                                                        tracing::warn!("Subtitle receiver dropped, stopping pipeline");
+                                                        return Ok(());
+                                                    }
+                                                }
                                             }
                                         }
                                         Err(e) => {

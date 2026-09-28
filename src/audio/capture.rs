@@ -23,6 +23,7 @@ impl AudioCapture {
     pub fn list_devices() -> AppResult<Vec<DeviceInfo>> {
         let host = cpal::default_host();
         let mut devices = Vec::new();
+        let mut idx = 0;
 
         let input_devices = host
             .input_devices()
@@ -30,14 +31,17 @@ impl AudioCapture {
 
         for device in input_devices {
             if let Ok(_config) = device.default_input_config() {
+                // 获取设备 ID 作为标识
                 let device_id = device.id();
-                let name = format!("Device {:?}", device_id);
+                let name = format!("Device[{}] {:?}", idx, device_id);
                 let is_loopback = Self::is_loopback_device(&name);
+                
                 devices.push(DeviceInfo {
                     name,
                     is_input: true,
                     is_loopback,
                 });
+                idx += 1;
             }
         }
 
@@ -47,50 +51,131 @@ impl AudioCapture {
             tracing::info!("Found {} input devices", devices.len());
             for dev in &devices {
                 let type_str = if dev.is_loopback {
-                    "loopback"
+                    "🔁 Loopback"
                 } else {
-                    "microphone"
+                    "🎤 Microphone"
                 };
-                tracing::info!("  - {} ({})", dev.name, type_str);
+                tracing::info!("  {} ({})", dev.name, type_str);
             }
         }
 
         Ok(devices)
     }
 
-    /// 检查设备是否是回环设备
+    /// 检查设备是否是回环设备 (Windows WASAPI Loopback pattern)
     fn is_loopback_device(name: &str) -> bool {
         let name_lower = name.to_lowercase();
-        name_lower.contains("stereo mix")
+        // Windows Stereo Mix / WASAPI loopback patterns
+        name_lower.contains("stereo")
             || name_lower.contains("loopback")
-            || name_lower.contains("mix")
             || name_lower.contains("what u hear")
+            || name_lower.contains("mix")
+            || name_lower.contains("virtual")
+    }
+
+    /// 根据名称或索引选择设备
+    fn select_device(device_spec: &str) -> AppResult<cpal::Device> {
+        let host = cpal::default_host();
+
+        // 特殊情况: "default"
+        if device_spec == "default" {
+            return host
+                .default_input_device()
+                .ok_or(AppError::Audio("No default input device found".to_string()));
+        }
+
+        // 尝试按索引选择
+        if let Ok(index) = device_spec.parse::<usize>() {
+            let mut idx = 0;
+            for device in host.input_devices()? {
+                if let Ok(_config) = device.default_input_config() {
+                    if idx == index {
+                        return Ok(device);
+                    }
+                    idx += 1;
+                }
+            }
+            return Err(AppError::Audio(format!(
+                "Device index out of range: {}",
+                index
+            )));
+        }
+
+        // 特殊情况: "microphone" - 选择第一个非 loopback 设备
+        if device_spec == "microphone" {
+            for device in host.input_devices()? {
+                if let Ok(_config) = device.default_input_config() {
+                    let device_id_str = format!("{:?}", device.id());
+                    let is_loop = Self::is_loopback_device(&device_id_str);
+                    if !is_loop {
+                        return Ok(device);
+                    }
+                }
+            }
+            return Err(AppError::Audio("No microphone device found".to_string()));
+        }
+
+        // 特殊情况: "loopback" - 选择第一个 loopback 设备
+        if device_spec == "loopback" {
+            for device in host.input_devices()? {
+                if let Ok(_config) = device.default_input_config() {
+                    let device_id_str = format!("{:?}", device.id());
+                    let is_loop = Self::is_loopback_device(&device_id_str);
+                    if is_loop {
+                        return Ok(device);
+                    }
+                }
+            }
+            return Err(AppError::Audio("No loopback device found".to_string()));
+        }
+
+        // 默认返回第一个输入设备
+        tracing::warn!(
+            "Device '{}' not found, using default",
+            device_spec
+        );
+        host.default_input_device()
+            .ok_or(AppError::Audio("No default input device found".to_string()))
     }
 
     /// 创建音频采集流
     pub async fn new(
-        _device_name: &str,
+        device_name: &str,
         sample_rate: u32,
         channels: u16,
     ) -> AppResult<Self> {
-        let host = cpal::default_host();
+        // 选择设备
+        let device = Self::select_device(device_name)?;
+        let device_id_str = format!("{:?}", device.id());
 
-        // 使用默认输入设备
-        let device = host
-            .default_input_device()
-            .ok_or(AppError::Audio("No default input device found".to_string()))?;
+        tracing::info!("Opening audio device: {}", device_id_str);
 
-        let device_name = format!("{:?}", device.id());
-        tracing::info!("Opening audio device: {}", device_name);
-
-        // 配置采样率和声道
-        let config = StreamConfig {
-            channels,
-            sample_rate: sample_rate.into(),
-            buffer_size: cpal::BufferSize::Default,
+        // 尝试使用指定的配置，失败则使用设备默认配置
+        let config = match device.default_input_config() {
+            Ok(supported) => {
+                let desired_config = StreamConfig {
+                    channels: channels.min(supported.channels()),
+                    sample_rate: sample_rate.into(),
+                    buffer_size: cpal::BufferSize::Default,
+                };
+                tracing::info!(
+                    "Desired config: channels={}, sample_rate={}",
+                    channels, sample_rate
+                );
+                desired_config
+            }
+            Err(e) => {
+                return Err(AppError::CpalBuildStream(format!(
+                    "Failed to get default config: {}",
+                    e
+                )))
+            }
         };
 
-        tracing::info!("Audio config: channels={}, sample_rate={}", channels, sample_rate);
+        tracing::info!(
+            "Audio config: channels={}",
+            config.channels
+        );
 
         // 创建通道用于传输音频数据
         let (tx, rx) = mpsc::channel(128);
@@ -104,7 +189,7 @@ impl AudioCapture {
         let stream = match device.default_input_config() {
             Ok(supported_config) => {
                 let sample_format = supported_config.sample_format();
-                
+
                 match sample_format {
                     cpal::SampleFormat::F32 => {
                         let data_fn = move |data: &[f32], _: &cpal::InputCallbackInfo| {
@@ -112,20 +197,22 @@ impl AudioCapture {
                             let _ = tx.try_send(samples);
                         };
                         device
-                            .build_input_stream(config, data_fn, err_fn, None)
-                            .map_err(|e| AppError::CpalBuildStream(format!("Failed to build F32 stream: {}", e)))?
+                            .build_input_stream(config.clone(), data_fn, err_fn, None)
+                            .map_err(|e| {
+                                AppError::CpalBuildStream(format!("Failed to build F32 stream: {}", e))
+                            })?
                     }
                     cpal::SampleFormat::I16 => {
                         let data_fn = move |data: &[i16], _: &cpal::InputCallbackInfo| {
-                            let samples: Vec<f32> = data
-                                .iter()
-                                .map(|&s| s as f32 / 32768.0)
-                                .collect();
+                            let samples: Vec<f32> =
+                                data.iter().map(|&s| s as f32 / 32768.0).collect();
                             let _ = tx.try_send(samples);
                         };
                         device
-                            .build_input_stream(config, data_fn, err_fn, None)
-                            .map_err(|e| AppError::CpalBuildStream(format!("Failed to build I16 stream: {}", e)))?
+                            .build_input_stream(config.clone(), data_fn, err_fn, None)
+                            .map_err(|e| {
+                                AppError::CpalBuildStream(format!("Failed to build I16 stream: {}", e))
+                            })?
                     }
                     cpal::SampleFormat::U16 => {
                         let data_fn = move |data: &[u16], _: &cpal::InputCallbackInfo| {
@@ -136,8 +223,10 @@ impl AudioCapture {
                             let _ = tx.try_send(samples);
                         };
                         device
-                            .build_input_stream(config, data_fn, err_fn, None)
-                            .map_err(|e| AppError::CpalBuildStream(format!("Failed to build U16 stream: {}", e)))?
+                            .build_input_stream(config.clone(), data_fn, err_fn, None)
+                            .map_err(|e| {
+                                AppError::CpalBuildStream(format!("Failed to build U16 stream: {}", e))
+                            })?
                     }
                     _ => {
                         return Err(AppError::Audio(
@@ -158,7 +247,7 @@ impl AudioCapture {
             .play()
             .map_err(|e| AppError::CpalPlayStream(format!("Failed to play stream: {}", e)))?;
 
-        tracing::info!("Audio stream started");
+        tracing::info!("Audio stream started successfully");
 
         Ok(Self {
             _stream: stream,
@@ -178,6 +267,7 @@ impl AudioCapture {
     }
 
     /// 是否正在运行
+    #[allow(dead_code)]
     pub fn is_running(&self) -> bool {
         self.is_running.load(Ordering::SeqCst)
     }

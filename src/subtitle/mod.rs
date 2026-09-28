@@ -1,5 +1,9 @@
 use std::collections::VecDeque;
 
+pub mod processor;
+
+pub use processor::SubtitleProcessor;
+
 #[derive(Debug, Clone)]
 pub struct Subtitle {
     pub source: String,

@@ -48,4 +48,10 @@ pub enum AppError {
     Unknown(String),
 }
 
+impl From<cpal::Error> for AppError {
+    fn from(err: cpal::Error) -> Self {
+        AppError::CpalDevices(format!("CPAL error: {}", err))
+    }
+}
+
 pub type AppResult<T> = Result<T, AppError>;

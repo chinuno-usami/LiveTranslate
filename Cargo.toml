@@ -56,4 +56,3 @@ tauri-build = { version = "1.5" }
 [profile.release]
 opt-level = 3
 lto = true
-trim-paths = "all"
