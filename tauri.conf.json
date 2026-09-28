@@ -7,6 +7,7 @@
   "build": {
     "beforeBuildCommand": "",
     "beforeDevCommand": "",
+    "withGlobalTauri": true,
     "devPath": "tauri-ui",
     "distDir": "tauri-ui"
   },

@@ -1,5 +1,8 @@
-const { invoke } = window.__TAURI__.tauri;
-const { listen } = window.__TAURI__.event;
+// Tauri 全局 API
+// 注意: 需要 tauri.conf.json 中的 build.withGlobalTauri = true 才会注入 window.__TAURI__
+const tauriApi = window.__TAURI__ || {};
+const invoke = tauriApi.invoke || (tauriApi.tauri && tauriApi.tauri.invoke);
+const listen = tauriApi.event && tauriApi.event.listen;
 
 const els = {
   statusDot: document.getElementById('status-dot'),
@@ -64,6 +67,19 @@ function updateClickThroughLabel() {
   els.throughBtn.textContent = `穿透: ${clickThrough ? '开' : '关'}`;
 }
 
+/// 在面板上直接显示致命错误，避免“界面正常但点不动”的静默失败
+function fatal(message) {
+  console.error(message);
+  if (els.subtitleLines && els.emptyState) {
+    els.emptyState.style.display = 'block';
+    els.emptyState.textContent = message;
+    els.subtitleLines.style.display = 'none';
+  }
+  if (els.statusText) {
+    els.statusText.textContent = '初始化失败';
+  }
+}
+
 async function loadDevices() {
   try {
     const payload = await invoke('list_devices_command');
@@ -123,6 +139,11 @@ async function bindActions() {
 }
 
 async function bindEvents() {
+  if (typeof listen !== 'function') {
+    console.warn('Tauri event.listen 不可用，跳过事件订阅');
+    return;
+  }
+
   await listen('subtitle://update', (event) => {
     renderLines(event.payload.lines || []);
   });
@@ -165,15 +186,39 @@ async function bindEvents() {
 }
 
 window.addEventListener('DOMContentLoaded', async () => {
+  if (typeof invoke !== 'function') {
+    fatal(
+      '未检测到 Tauri API (window.__TAURI__)。' +
+        '请确认 tauri.conf.json 中 build.withGlobalTauri = true。'
+    );
+    return;
+  }
+
+  // 动作绑定与事件订阅互相独立，任何一个失败都不影响另一个
+  try {
+    await bindActions();
+  } catch (error) {
+    console.error('bindActions 失败', error);
+  }
+
   try {
     await bindEvents();
-    await bindActions();
-    await loadInitialConfig();
-    await loadInitialStatus();
-    await loadDevices();
+  } catch (error) {
+    console.error('bindEvents 失败', error);
+  }
+
+  for (const step of [loadInitialConfig, loadInitialStatus, loadDevices]) {
+    try {
+      await step();
+    } catch (error) {
+      console.error(`${step.name} 失败`, error);
+    }
+  }
+
+  try {
     await invoke('start_capture');
   } catch (error) {
-    console.error(error);
-    setStatus(false, `启动失败: ${error}`);
+    console.error('start_capture 失败', error);
+    setStatus(false, `启动采集失败: ${error}`);
   }
 });
