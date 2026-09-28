@@ -13,14 +13,15 @@ mod ui;
 use clap::Parser;
 use config::AppConfig;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use subtitle::SubtitleState;
 use tauri::{AppHandle, LogicalPosition, LogicalSize, Manager, State, Window};
 use tokio::sync::{mpsc, watch, Mutex};
 use tracing_subscriber::EnvFilter;
 use ui::{
-    OverlayConfigPayload, StatusPayload, SubtitlePayload, CONFIG_EVENT, ERROR_EVENT, STATUS_EVENT,
-    SUBTITLE_EVENT,
+    OverlayConfigPayload, StatusPayload, SubtitlePayload, CLICK_THROUGH_EVENT, CONFIG_EVENT,
+    ERROR_EVENT, STATUS_EVENT, SUBTITLE_EVENT,
 };
 
 #[derive(Parser, Debug)]
@@ -67,11 +68,13 @@ impl PipelineControl {
     }
 }
 
-struct SharedState {
+pub(crate) struct SharedState {
     config: AppConfig,
     current_device: Mutex<String>,
     subtitle_state: Mutex<SubtitleState>,
     pipeline: Mutex<PipelineControl>,
+    /// 当前窗口是否处于点击穿透（托盘/快捷键需要读写它）
+    pub(crate) click_through: AtomicBool,
 }
 
 impl SharedState {
@@ -82,14 +85,41 @@ impl SharedState {
         );
 
         let device = config.audio.device_name.clone();
+        let click_through = config.subtitle.click_through;
 
         Self {
             config,
             current_device: Mutex::new(device),
             subtitle_state: Mutex::new(subtitle_state),
             pipeline: Mutex::new(PipelineControl::new()),
+            click_through: AtomicBool::new(click_through),
         }
     }
+}
+
+/// 切换窗口点击穿透，并同步到前端与托盘
+///
+/// 点击穿透开启后窗口不再接收鼠标事件，因此托盘菜单与全局快捷键
+/// 是关闭穿透的唯一入口。
+pub(crate) fn toggle_click_through(app: &AppHandle) {
+    let state = app.state::<Arc<SharedState>>();
+    let new_value = !state.click_through.load(Ordering::SeqCst);
+    apply_click_through(app, new_value);
+}
+
+/// 设置窗口点击穿透为指定值
+pub(crate) fn apply_click_through(app: &AppHandle, enabled: bool) {
+    let state = app.state::<Arc<SharedState>>();
+    state.click_through.store(enabled, Ordering::SeqCst);
+
+    if let Some(window) = app.get_window("main") {
+        if let Err(e) = window.set_ignore_cursor_events(enabled) {
+            tracing::warn!("Failed to set ignore cursor events: {}", e);
+        }
+    }
+
+    let _ = app.emit_all(CLICK_THROUGH_EVENT, enabled);
+    tracing::info!("Click-through set to: {}", enabled);
 }
 
 #[tauri::command]
@@ -173,10 +203,14 @@ fn close_overlay(window: Window) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn set_click_through(window: Window, enabled: bool) -> Result<(), String> {
-    window
-        .set_ignore_cursor_events(enabled)
-        .map_err(|e| e.to_string())
+async fn set_click_through(
+    app: AppHandle,
+    state: State<'_, Arc<SharedState>>,
+    enabled: bool,
+) -> Result<(), String> {
+    state.click_through.store(enabled, Ordering::SeqCst);
+    apply_click_through(&app, enabled);
+    Ok(())
 }
 
 async fn start_capture_impl(app: AppHandle, state: Arc<SharedState>) -> Result<(), String> {

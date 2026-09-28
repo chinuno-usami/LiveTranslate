@@ -161,6 +161,12 @@ async function bindEvents() {
     updateClickThroughLabel();
   });
 
+  // 托盘 / 快捷键切换点击穿透时同步按钮文案
+  await listen('click-through://update', (event) => {
+    clickThrough = Boolean(event.payload);
+    updateClickThroughLabel();
+  });
+
   await listen('error://message', (event) => {
     setStatus(false, String(event.payload || '出现错误'));
   });

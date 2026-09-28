@@ -5,6 +5,7 @@ pub const SUBTITLE_EVENT: &str = "subtitle://update";
 pub const STATUS_EVENT: &str = "status://update";
 pub const CONFIG_EVENT: &str = "config://subtitle";
 pub const ERROR_EVENT: &str = "error://message";
+pub const CLICK_THROUGH_EVENT: &str = "click-through://update";
 
 #[derive(Debug, Clone, Serialize)]
 pub struct SubtitlePayload {

@@ -7,12 +7,15 @@ pub fn create_system_tray() -> SystemTray {
     let show = CustomMenuItem::new("show".to_string(), "显示");
     let start = CustomMenuItem::new("start".to_string(), "开始");
     let stop = CustomMenuItem::new("stop".to_string(), "停止");
+    let through = CustomMenuItem::new("through".to_string(), "切换点击穿透");
     let quit = CustomMenuItem::new("quit".to_string(), "退出");
 
     let tray_menu = SystemTrayMenu::new()
         .add_item(show)
         .add_item(start)
         .add_item(stop)
+        .add_native_item(SystemTrayMenuItem::Separator)
+        .add_item(through)
         .add_native_item(SystemTrayMenuItem::Separator)
         .add_item(quit);
 
@@ -34,6 +37,10 @@ pub fn handle_system_tray_event(app: &AppHandle, event: SystemTrayEvent) {
                 if let Some(window) = app.get_window("main") {
                     let _ = window.emit("tray://command", "stop");
                 }
+            }
+            "through" => {
+                // 关闭点击穿透的唯一可靠入口：穿透开启后窗口不再接收鼠标事件
+                crate::toggle_click_through(app);
             }
             "quit" => {
                 app.exit(0);
@@ -84,6 +91,12 @@ pub fn register_global_shortcuts(app: &AppHandle) -> tauri::Result<()> {
         if let Some(window) = app_handle.get_window("main") {
             let _ = window.emit("shortcut://command", "stop");
         }
+    })?;
+
+    // 切换点击穿透（穿透开启后这是关闭它的快捷键）
+    let app_handle = app.clone();
+    manager.register("CmdOrCtrl+Alt+T", move || {
+        crate::toggle_click_through(&app_handle);
     })?;
 
     let app_handle = app.clone();
