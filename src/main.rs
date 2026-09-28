@@ -13,7 +13,7 @@ mod ui;
 use clap::Parser;
 use config::AppConfig;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use subtitle::SubtitleState;
 use tauri::{AppHandle, LogicalPosition, LogicalSize, Manager, State, Window};
@@ -70,15 +70,21 @@ impl PipelineControl {
 
 pub(crate) struct SharedState {
     config: AppConfig,
+    /// 配置文件路径（用于把 UI 上的修改写回）
+    config_path: Option<PathBuf>,
     current_device: Mutex<String>,
     subtitle_state: Mutex<SubtitleState>,
     pipeline: Mutex<PipelineControl>,
     /// 当前窗口是否处于点击穿透（托盘/快捷键需要读写它）
     pub(crate) click_through: AtomicBool,
+    /// 当前字号（面板滑块可调）
+    font_size: AtomicU32,
+    /// 是否显示原文
+    show_source: AtomicBool,
 }
 
 impl SharedState {
-    fn new(config: AppConfig) -> Self {
+    fn new(config: AppConfig, config_path: Option<PathBuf>) -> Self {
         let subtitle_state = SubtitleState::new(
             config.subtitle.max_lines,
             config.subtitle.show_source,
@@ -86,13 +92,18 @@ impl SharedState {
 
         let device = config.audio.device_name.clone();
         let click_through = config.subtitle.click_through;
+        let font_size = config.subtitle.font_size;
+        let show_source = config.subtitle.show_source;
 
         Self {
             config,
+            config_path,
             current_device: Mutex::new(device),
             subtitle_state: Mutex::new(subtitle_state),
             pipeline: Mutex::new(PipelineControl::new()),
             click_through: AtomicBool::new(click_through),
+            font_size: AtomicU32::new(font_size),
+            show_source: AtomicBool::new(show_source),
         }
     }
 }
@@ -120,6 +131,66 @@ pub(crate) fn apply_click_through(app: &AppHandle, enabled: bool) {
 
     let _ = app.emit_all(CLICK_THROUGH_EVENT, enabled);
     tracing::info!("Click-through set to: {}", enabled);
+}
+
+/// 把 UI 上的修改写回配置文件（保留注释）
+fn persist_setting(config_path: Option<&PathBuf>, section: &str, key: &str, value: &str) {
+    let Some(path) = config_path else {
+        tracing::debug!("No config file to persist {section}.{key}");
+        return;
+    };
+    match AppConfig::update_value_in_file(path, section, key, value) {
+        Ok(()) => tracing::info!("Persisted [{section}] {key} = {value}"),
+        Err(e) => tracing::warn!("Failed to persist [{section}] {key}: {e}"),
+    }
+}
+
+/// 调整字幕字号（面板滑块）
+#[tauri::command]
+async fn set_font_size(
+    state: State<'_, Arc<SharedState>>,
+    size: u32,
+) -> Result<(), String> {
+    let size = size.clamp(10, 120);
+    state.font_size.store(size, Ordering::SeqCst);
+    persist_setting(
+        state.config_path.as_ref(),
+        "subtitle",
+        "font_size",
+        &size.to_string(),
+    );
+    Ok(())
+}
+
+/// 切换是否显示原文，并立即重绘当前字幕
+#[tauri::command]
+async fn set_show_source(
+    app: AppHandle,
+    state: State<'_, Arc<SharedState>>,
+    enabled: bool,
+) -> Result<(), String> {
+    state.show_source.store(enabled, Ordering::SeqCst);
+
+    {
+        let mut subtitle_state = state.subtitle_state.lock().await;
+        subtitle_state.set_show_source(enabled);
+
+        let payload = SubtitlePayload {
+            source: String::new(),
+            translated: String::new(),
+            lines: subtitle_state.get_all(),
+            text: subtitle_state.get_text(),
+        };
+        let _ = app.emit_all(SUBTITLE_EVENT, payload);
+    }
+
+    persist_setting(
+        state.config_path.as_ref(),
+        "subtitle",
+        "show_source",
+        &enabled.to_string(),
+    );
+    Ok(())
 }
 
 #[tauri::command]
@@ -601,7 +672,7 @@ fn run(args: Args) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let shared = Arc::new(SharedState::new(config.clone()));
+    let shared = Arc::new(SharedState::new(config.clone(), config_path.clone()));
 
     tauri::Builder::default()
         .system_tray(tray::create_system_tray())
@@ -636,6 +707,8 @@ fn run(args: Args) -> anyhow::Result<()> {
         })
         .invoke_handler(tauri::generate_handler![
             get_overlay_config,
+            set_font_size,
+            set_show_source,
             get_status,
             list_devices_command,
             set_device,

@@ -10,13 +10,41 @@ const els = {
   emptyState: document.getElementById('empty-state'),
   subtitleLines: document.getElementById('subtitle-lines'),
   deviceSelect: document.getElementById('device-select'),
+  fontSlider: document.getElementById('font-slider'),
+  fontSizeValue: document.getElementById('font-size-value'),
+  sourceToggle: document.getElementById('source-toggle'),
+  helpBtn: document.getElementById('help-btn'),
+  helpModal: document.getElementById('help-modal'),
+  helpClose: document.getElementById('help-close'),
   startBtn: document.getElementById('start-btn'),
   stopBtn: document.getElementById('stop-btn'),
   throughBtn: document.getElementById('through-btn'),
   closeBtn: document.getElementById('close-btn'),
 };
 
+const MIN_FONT = 12;
+const MAX_FONT = 72;
+
 let clickThrough = false;
+
+/// 应用字号（同步 CSS 变量、滑块、数值显示）
+function applyFontSize(px) {
+  const size = Math.min(MAX_FONT, Math.max(MIN_FONT, Math.round(px)));
+  document.documentElement.style.setProperty('--font-size', `${size}px`);
+  if (els.fontSizeValue) {
+    els.fontSizeValue.textContent = String(size);
+  }
+  if (els.fontSlider && Number(els.fontSlider.value) !== size) {
+    els.fontSlider.value = String(size);
+  }
+}
+
+/// 应用"显示原文"开关
+function applyShowSource(enabled) {
+  if (els.sourceToggle) {
+    els.sourceToggle.checked = Boolean(enabled);
+  }
+}
 
 function setStatus(running, message) {
   els.statusText.textContent = message;
@@ -51,7 +79,8 @@ function escapeHtml(text) {
 
 async function loadInitialConfig() {
   const config = await invoke('get_overlay_config');
-  document.documentElement.style.setProperty('--font-size', `${config.font_size}px`);
+  applyFontSize(Number(config.font_size) || 28);
+  applyShowSource(config.show_source);
   document.documentElement.style.setProperty('--text-color', config.text_color);
   document.documentElement.style.setProperty('--stroke-color', config.stroke_color);
   clickThrough = Boolean(config.click_through);
@@ -82,7 +111,7 @@ async function bindDrag() {
       return;
     }
     // 点在交互控件上时不拖动
-    if (event.target.closest('button, select, input, textarea, a')) {
+    if (event.target.closest('button, select, input, textarea, a, label')) {
       return;
     }
     event.preventDefault();
@@ -161,6 +190,48 @@ async function bindActions() {
   els.closeBtn.addEventListener('click', async () => {
     await invoke('close_overlay');
   });
+
+  // 字号滑块：拖动时实时预览，松手后持久化到配置文件
+  els.fontSlider.addEventListener('input', () => {
+    applyFontSize(Number(els.fontSlider.value));
+  });
+  els.fontSlider.addEventListener('change', async () => {
+    const size = Number(els.fontSlider.value);
+    try {
+      await invoke('set_font_size', { size });
+    } catch (error) {
+      console.error('保存字号失败', error);
+    }
+  });
+
+  // 显示原文开关
+  els.sourceToggle.addEventListener('change', async () => {
+    const enabled = els.sourceToggle.checked;
+    try {
+      await invoke('set_show_source', { enabled });
+    } catch (error) {
+      console.error('切换原文失败', error);
+      setStatus(false, `切换原文失败: ${error}`);
+    }
+  });
+
+  // 快捷键说明弹窗
+  els.helpBtn.addEventListener('click', () => {
+    els.helpModal.classList.remove('hidden');
+  });
+  els.helpClose.addEventListener('click', () => {
+    els.helpModal.classList.add('hidden');
+  });
+  els.helpModal.addEventListener('click', (event) => {
+    if (event.target === els.helpModal) {
+      els.helpModal.classList.add('hidden');
+    }
+  });
+  document.addEventListener('keydown', (event) => {
+    if (event.key === 'Escape') {
+      els.helpModal.classList.add('hidden');
+    }
+  });
 }
 
 async function bindEvents() {
@@ -179,7 +250,8 @@ async function bindEvents() {
 
   await listen('config://subtitle', (event) => {
     const config = event.payload;
-    document.documentElement.style.setProperty('--font-size', `${config.font_size}px`);
+    applyFontSize(Number(config.font_size) || 28);
+    applyShowSource(config.show_source);
     document.documentElement.style.setProperty('--text-color', config.text_color);
     document.documentElement.style.setProperty('--stroke-color', config.stroke_color);
     clickThrough = Boolean(config.click_through);

@@ -288,6 +288,23 @@ impl AppConfig {
         tracing::info!("Config saved to: {}", path.display());
         Ok(())
     }
+
+    /// 就地修改配置文件里的单个键值（**保留注释与原有排版**）
+    ///
+    /// 不直接重写整个文件，因为那会丢失用户在配置里写的注释。
+    pub fn update_value_in_file(
+        path: &Path,
+        section: &str,
+        key: &str,
+        value: &str,
+    ) -> AppResult<()> {
+        let original = fs::read_to_string(path).unwrap_or_default();
+        let updated = patch_toml(&original, section, key, value);
+        if updated != original {
+            fs::write(path, updated)?;
+        }
+        Ok(())
+    }
 }
 
 impl Default for AppConfig {
@@ -325,7 +342,7 @@ impl Default for AppConfig {
                 background: "transparent".to_string(),
                 show_source: false,
                 window_width: 1200,
-                window_height: 220,
+                window_height: 260,
                 position_x: 200,
                 position_y: 760,
                 always_on_top: true,
@@ -336,10 +353,74 @@ impl Default for AppConfig {
     }
 }
 
+/// 在 TOML 文本中就地修改 `[section]` 下的 `key = value`
+///
+/// 保留其余内容（包括注释与空行）。
+/// - 找到 section 且找到 key：替换该行
+/// - 找到 section 但没找到 key：插入到 section 末尾
+/// - 整个 section 不存在：在文件末尾追加
+fn patch_toml(content: &str, section: &str, key: &str, value: &str) -> String {
+    let section_header = format!("[{section}]");
+    let mut lines: Vec<String> = content.lines().map(|s| s.to_string()).collect();
+
+    let mut section_start: Option<usize> = None;
+    let mut section_end = lines.len();
+
+    for (i, line) in lines.iter().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            if trimmed == section_header {
+                section_start = Some(i);
+            } else if section_start.is_some() {
+                section_end = i;
+                break;
+            }
+        }
+    }
+
+    let trailing_newline = content.ends_with('\n');
+    let join = |lines: Vec<String>| {
+        let mut s = lines.join("\n");
+        if trailing_newline {
+            s.push('\n');
+        }
+        s
+    };
+
+    if let Some(start) = section_start {
+        for (i, line) in lines.iter().enumerate().take(section_end).skip(start + 1) {
+            let indent_len = line.len() - line.trim_start().len();
+            let trimmed = line.trim_start();
+            let matches_key = trimmed
+                .strip_prefix(key)
+                .map(|rest| rest.trim_start().starts_with('='))
+                .unwrap_or(false);
+
+            if matches_key {
+                let indent = &line[..indent_len];
+                lines[i] = format!("{indent}{key} = {value}");
+                return join(lines);
+            }
+        }
+
+        lines.insert(section_end, format!("{key} = {value}"));
+        return join(lines);
+    }
+
+    let mut out = content.to_string();
+    if !out.is_empty() && !out.ends_with('\n') {
+        out.push('\n');
+    }
+    if !out.is_empty() {
+        out.push('\n');
+    }
+    out.push_str(&format!("[{section}]\n{key} = {value}\n"));
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
     fn temp_config_path(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
             "livetranslate-test-{}-{}",
@@ -373,6 +454,42 @@ mod tests {
     fn user_config_path_is_toml_file() {
         let path = AppConfig::user_config_path().unwrap();
         assert_eq!(path.file_name().unwrap(), "config.toml");
+    }
+
+    #[test]
+    fn patch_toml_replaces_existing_key_and_keeps_comments() {
+        let src = "# 顶部注释\n\n[subtitle]\n# 字号注释\nfont_size = 28\nmax_lines = 3\n";
+        let out = patch_toml(src, "subtitle", "font_size", "40");
+        assert!(out.contains("# 顶部注释"), "注释应保留");
+        assert!(out.contains("# 字号注释"), "行内注释应保留");
+        assert!(out.contains("font_size = 40"), "值应被替换");
+        assert!(out.contains("max_lines = 3"), "其他键不应变动");
+        assert!(!out.contains("font_size = 28"));
+    }
+
+    #[test]
+    fn patch_toml_inserts_missing_key_inside_section() {
+        let src = "[subtitle]\nfont_size = 28\n\n[other]\nkey = 1\n";
+        let out = patch_toml(src, "subtitle", "show_source", "true");
+        let subtitle_part = out.split("[other]").next().unwrap();
+        assert!(subtitle_part.contains("show_source = true"), "应插入到 subtitle 段内");
+        assert!(out.contains("[other]\nkey = 1"), "其他段不应受影响");
+    }
+
+    #[test]
+    fn patch_toml_appends_missing_section() {
+        let out = patch_toml("[audio]\nchunk_seconds = 2.0\n", "vad", "enabled", "true");
+        assert!(out.contains("[vad]"));
+        assert!(out.contains("enabled = true"));
+        assert!(out.contains("[audio]"));
+    }
+
+    #[test]
+    fn patch_toml_does_not_confuse_prefix_keys() {
+        let src = "[subtitle]\nfont_size_extra = 1\n";
+        let out = patch_toml(src, "subtitle", "font_size", "40");
+        assert!(out.contains("font_size_extra = 1"), "不应误改前缀相同的键");
+        assert!(out.contains("font_size = 40"));
     }
 
     #[test]

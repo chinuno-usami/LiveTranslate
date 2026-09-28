@@ -74,7 +74,7 @@ background = "transparent"
 # 是否显示源文本
 show_source = false
 window_width = 1200
-window_height = 220
+window_height = 260
 position_x = 200
 position_y = 760
 always_on_top = true

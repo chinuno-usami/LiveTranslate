@@ -14,10 +14,26 @@
           <span id="status-text">未启动</span>
           <select id="device-select" class="device-select" title="选择音频输入设备"></select>
         </div>
+
+        <div class="controls">
+          <label class="ctrl" title="字幕文字大小">
+            <span class="ctrl-label">字号</span>
+            <input id="font-slider" class="slider" type="range" min="12" max="72" step="1" value="28" />
+            <span id="font-size-value" class="ctrl-value">28</span>
+          </label>
+
+          <label class="ctrl switch" title="是否在译文上方显示原文">
+            <input id="source-toggle" type="checkbox" />
+            <span class="switch-track"><span class="switch-thumb"></span></span>
+            <span class="ctrl-label">原文</span>
+          </label>
+        </div>
+
         <div class="actions">
           <button id="start-btn" class="ghost-btn">开始</button>
           <button id="stop-btn" class="ghost-btn">停止</button>
           <button id="through-btn" class="ghost-btn">穿透: 关</button>
+          <button id="help-btn" class="ghost-btn" title="查看快捷键">快捷键</button>
           <button id="close-btn" class="ghost-btn danger">关闭</button>
         </div>
       </div>
@@ -25,6 +41,29 @@
       <div id="subtitle-panel" class="subtitle-panel">
         <div id="empty-state" class="empty-state">等待语音输入...</div>
         <div id="subtitle-lines" class="subtitle-lines"></div>
+      </div>
+    </div>
+
+    <!-- 快捷键说明弹窗 -->
+    <div id="help-modal" class="modal hidden">
+      <div class="modal-card">
+        <div class="modal-header">
+          <span>快捷键</span>
+          <button id="help-close" class="ghost-btn">关闭</button>
+        </div>
+        <table class="shortcut-table">
+          <tbody>
+            <tr><td><kbd>Ctrl</kbd>/<kbd>Cmd</kbd> + <kbd>Alt</kbd> + <kbd>S</kbd></td><td>显示 / 聚焦浮窗</td></tr>
+            <tr><td><kbd>Ctrl</kbd>/<kbd>Cmd</kbd> + <kbd>Alt</kbd> + <kbd>R</kbd></td><td>开始采集</td></tr>
+            <tr><td><kbd>Ctrl</kbd>/<kbd>Cmd</kbd> + <kbd>Alt</kbd> + <kbd>E</kbd></td><td>停止采集</td></tr>
+            <tr><td><kbd>Ctrl</kbd>/<kbd>Cmd</kbd> + <kbd>Alt</kbd> + <kbd>T</kbd></td><td>切换点击穿透</td></tr>
+            <tr><td><kbd>Ctrl</kbd>/<kbd>Cmd</kbd> + <kbd>Alt</kbd> + <kbd>Q</kbd></td><td>退出程序</td></tr>
+          </tbody>
+        </table>
+        <div class="modal-note">
+          托盘菜单也可完成上述操作。开启点击穿透后浮窗不再接收鼠标事件，
+          请用托盘菜单或 <kbd>Ctrl</kbd>/<kbd>Cmd</kbd> + <kbd>Alt</kbd> + <kbd>T</kbd> 关闭穿透。
+        </div>
       </div>
     </div>
 
