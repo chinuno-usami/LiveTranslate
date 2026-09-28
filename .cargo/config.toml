@@ -1,0 +1,15 @@
+# 交叉编译 / 发布相关配置
+
+# Windows: 静态链接 C 运行时 (CRT)
+#
+# 不加这一项时，exe 会动态依赖 VCRUNTIME140.dll / api-ms-win-crt-*.dll，
+# 目标机器若未安装 VC++ Redistributable，进程会在加载阶段直接失败。
+# 由于 release 构建使用 windows_subsystem = "windows"（GUI 子系统、无控制台），
+# 这种失败往往表现为"双击一闪而过 / 毫无反应且无任何日志"。
+#
+# 静态链接后 exe 自包含，不再需要 VC++ 运行时。
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[target.aarch64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
