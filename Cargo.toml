@@ -21,7 +21,7 @@ custom-protocol = ["tauri/custom-protocol"]
 tokio = { version = "1.35", features = ["full"] }
 
 # Desktop overlay
-tauri = { version = "1.6", features = ["api-all", "system-tray", "global-shortcut"] }
+tauri = { version = "1.6", features = ["api-all", "system-tray", "global-shortcut", "macos-private-api"] }
 
 # HTTP client
 reqwest = { version = "0.11", features = ["json", "stream", "multipart"] }

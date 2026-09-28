@@ -11,6 +11,7 @@
     "distDir": "tauri-ui"
   },
   "tauri": {
+    "macOSPrivateApi": true,
     "allowlist": {
       "all": true
     },

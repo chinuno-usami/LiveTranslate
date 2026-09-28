@@ -378,10 +378,22 @@ fn main() -> anyhow::Result<()> {
         .on_system_tray_event(tray::handle_system_tray_event)
         .manage(shared)
         .setup(move |app| {
+            // macOS: 未打包为 .app 直接运行二进制时，应用不会被自动“激活”，
+            // 会导致窗口收不到鼠标/键盘事件（并伴随 IMKCFRunLoopWakeUpReliable 报错）。
+            // 显式设为 Regular 激活策略，让它作为前台应用运行。
+            #[cfg(target_os = "macos")]
+            {
+                app.set_activation_policy(tauri::ActivationPolicy::Regular);
+            }
+
             let window = app.get_window("main").ok_or_else(|| anyhow::anyhow!("main window not found"))?;
             apply_window_config(&window, &config).map_err(anyhow::Error::msg)?;
             window.emit(CONFIG_EVENT, OverlayConfigPayload::from(&config.subtitle)).ok();
             tray::register_global_shortcuts(&app.handle()).map_err(|e| anyhow::anyhow!("Failed to register shortcuts: {}", e))?;
+
+            // 确保窗口可见并获取焦点
+            let _ = window.show();
+            let _ = window.set_focus();
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
