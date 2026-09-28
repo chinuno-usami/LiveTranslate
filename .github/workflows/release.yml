@@ -102,7 +102,7 @@ jobs:
           cp "target/${TARGET}/release/${BIN_NAME}" "$STAGE/"
           chmod +x "$STAGE/${BIN_NAME}"
           [ -d config ] && cp -r config "$STAGE/"
-          for f in README.md README_CN.md QUICKSTART.md; do
+          for f in README.md QUICKSTART.md; do
             [ -f "$f" ] && cp "$f" "$STAGE/"
           done
 
@@ -130,7 +130,7 @@ jobs:
           New-Item -ItemType Directory -Force -Path $stage | Out-Null
           Copy-Item "target/$target/release/$env:BIN_NAME.exe" $stage
           if (Test-Path config) { Copy-Item -Recurse config $stage }
-          foreach ($f in @('README.md','README_CN.md','QUICKSTART.md')) {
+          foreach ($f in @('README.md','QUICKSTART.md')) {
             if (Test-Path $f) { Copy-Item $f $stage }
           }
           Compress-Archive -Path $stage -DestinationPath "dist/$name.zip" -Force

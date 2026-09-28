@@ -183,7 +183,7 @@ curl http://127.0.0.1:8765/v1/models
 ## 📚 详细文档
 
 - **PLAN.md** - 完整技术方案
-- **README_CN.md** - 详细用户指南
+- **README.md** - 详细用户指南
 - **docs/ARCHITECTURE.md** - 系统架构
 - **IMPLEMENTATION_SUMMARY.md** - 实现总结
 

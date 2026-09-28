@@ -7,7 +7,7 @@ livetranslate/
 ├── Cargo.toml                      # Rust 项目配置
 ├── Cargo.lock                      # 依赖版本锁定
 ├── README.md                       # 英文 README
-├── README_CN.md                    # 中文 README
+├── README.md                       # 用户指南
 ├── PLAN.md                         # 完整的技术方案文档
 │
 ├── config/
@@ -378,7 +378,7 @@ windows        - Win32 API（可选）
 ## 📖 参考文档
 
 - [PLAN.md](../PLAN.md) - 完整的技术方案
-- [README_CN.md](../README_CN.md) - 中文用户指南
+- [README.md](../README.md) - 用户指南
 - [cpal 文档](https://docs.rs/cpal/)
 - [Whisper API](https://platform.openai.com/docs/guides/speech-to-text)
 - [OpenAI Chat API](https://platform.openai.com/docs/api-reference/chat)

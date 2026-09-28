@@ -80,7 +80,7 @@ Binary size: 4.5 MB
 - 自动生成默认配置
 
 ✅ **文档**
-- README_CN.md: 中文用户指南
+- README.md: 用户指南
 - docs/ARCHITECTURE.md: 详细架构文档
 - PLAN.md: 技术方案文档
 - 代码内注释
@@ -263,7 +263,7 @@ docs/
 
 .github/
 ├── README.md            # 英文说明
-├── README_CN.md         # 中文说明
+├── README.md            # 用户指南
 ├── PLAN.md              # 技术方案
 └── IMPLEMENTATION_SUMMARY.md (本文件)
 

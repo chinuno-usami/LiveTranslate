@@ -5,6 +5,7 @@ const invoke = tauriApi.invoke || (tauriApi.tauri && tauriApi.tauri.invoke);
 const listen = tauriApi.event && tauriApi.event.listen;
 
 const els = {
+  toolbar: document.getElementById('toolbar'),
   statusDot: document.getElementById('status-dot'),
   statusText: document.getElementById('status-text'),
   emptyState: document.getElementById('empty-state'),
@@ -85,6 +86,7 @@ async function loadInitialConfig() {
   document.documentElement.style.setProperty('--stroke-color', config.stroke_color);
   clickThrough = Boolean(config.click_through);
   updateClickThroughLabel();
+  applyClickThroughToToolbar();
 }
 
 async function loadInitialStatus() {
@@ -94,6 +96,56 @@ async function loadInitialStatus() {
 
 function updateClickThroughLabel() {
   els.throughBtn.textContent = `穿透: ${clickThrough ? '开' : '关'}`;
+}
+
+/// 工具栏显隐
+///
+/// 鼠标移出窗口时收起，只保留字幕内容；移入时重新展开。
+function setToolbarVisible(visible) {
+  if (!els.toolbar) {
+    return;
+  }
+  els.toolbar.classList.toggle('collapsed', !visible);
+}
+
+function isHelpOpen() {
+  return els.helpModal && !els.helpModal.classList.contains('hidden');
+}
+
+/// 应用点击穿透对工具栏的影响
+///
+/// 穿透开启时窗口收不到鼠标事件，无法靠悬停唤出，因此直接保持收起。
+function applyClickThroughToToolbar() {
+  setToolbarVisible(!clickThrough);
+}
+
+function bindToolbarAutoHide() {
+  const root = document.documentElement;
+
+  const hide = () => {
+    if (clickThrough || isHelpOpen()) {
+      return;
+    }
+    setToolbarVisible(false);
+  };
+
+  const show = () => {
+    if (clickThrough || isHelpOpen()) {
+      return;
+    }
+    setToolbarVisible(true);
+  };
+
+  root.addEventListener('mouseleave', hide);
+  root.addEventListener('mouseenter', show);
+
+  // 部分 WebView 下文档根节点的 mouseleave 不稳，这里用 mouseout 兜底：
+  // relatedTarget 为空表示指针真的离开了窗口
+  document.addEventListener('mouseout', (event) => {
+    if (!event.relatedTarget && !event.toElement) {
+      hide();
+    }
+  });
 }
 
 /// 拖动窗口
@@ -175,6 +227,7 @@ async function bindActions() {
     clickThrough = !clickThrough;
     await invoke('set_click_through', { enabled: clickThrough });
     updateClickThroughLabel();
+    applyClickThroughToToolbar();
   });
 
   els.deviceSelect.addEventListener('change', async () => {
@@ -221,15 +274,18 @@ async function bindActions() {
   });
   els.helpClose.addEventListener('click', () => {
     els.helpModal.classList.add('hidden');
+    applyClickThroughToToolbar();
   });
   els.helpModal.addEventListener('click', (event) => {
     if (event.target === els.helpModal) {
       els.helpModal.classList.add('hidden');
+      applyClickThroughToToolbar();
     }
   });
   document.addEventListener('keydown', (event) => {
     if (event.key === 'Escape') {
       els.helpModal.classList.add('hidden');
+      applyClickThroughToToolbar();
     }
   });
 }
@@ -256,12 +312,14 @@ async function bindEvents() {
     document.documentElement.style.setProperty('--stroke-color', config.stroke_color);
     clickThrough = Boolean(config.click_through);
     updateClickThroughLabel();
+    applyClickThroughToToolbar();
   });
 
-  // 托盘 / 快捷键切换点击穿透时同步按钮文案
+  // 托盘 / 快捷键切换点击穿透时同步按钮文案与工具栏
   await listen('click-through://update', (event) => {
     clickThrough = Boolean(event.payload);
     updateClickThroughLabel();
+    applyClickThroughToToolbar();
   });
 
   // 后端提示（配置缺失 / ASR / 翻译失败等），直接显示在状态区
@@ -317,6 +375,12 @@ window.addEventListener('DOMContentLoaded', async () => {
     await bindDrag();
   } catch (error) {
     console.error('bindDrag 失败', error);
+  }
+
+  try {
+    bindToolbarAutoHide();
+  } catch (error) {
+    console.error('bindToolbarAutoHide 失败', error);
   }
 
   try {
