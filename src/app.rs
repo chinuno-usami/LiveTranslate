@@ -7,6 +7,15 @@ use crate::subtitle::{Subtitle, SubtitleProcessor};
 use crate::translate::OpenAiClient;
 use tokio::sync::{mpsc, watch};
 
+/// 流水线输出事件
+#[derive(Debug, Clone)]
+pub enum PipelineEvent {
+    /// 一条可显示的字幕
+    Subtitle(Subtitle),
+    /// 供 UI 展示的提示/错误信息（用于避免"界面一片空白但不说原因"）
+    Notice(String),
+}
+
 pub async fn list_devices() -> AppResult<()> {
     let devices = AudioCapture::list_devices()?;
     if devices.is_empty() {
@@ -33,19 +42,46 @@ pub async fn start_console(config: AppConfig) -> AppResult<()> {
     });
 
     tracing::info!("Console pipeline running. Press Ctrl+C to stop.");
-    while let Some(subtitle) = rx.recv().await {
-        tracing::info!("Subtitle: {} => {}", subtitle.source, subtitle.translated);
+    while let Some(event) = rx.recv().await {
+        match event {
+            PipelineEvent::Subtitle(s) => {
+                tracing::info!("Subtitle: {} => {}", s.source, s.translated)
+            }
+            PipelineEvent::Notice(n) => tracing::warn!("Notice: {}", n),
+        }
     }
 
     Ok(())
 }
 
+/// 去重地发送 Notice，避免同一个错误每 2 秒刷屏
+async fn send_notice(tx: &mpsc::Sender<PipelineEvent>, last: &mut String, msg: String) {
+    if *last == msg {
+        return;
+    }
+    *last = msg.clone();
+    let _ = tx.send(PipelineEvent::Notice(msg)).await;
+}
+
 pub async fn run_pipeline(
     config: AppConfig,
-    tx: mpsc::Sender<Subtitle>,
+    tx: mpsc::Sender<PipelineEvent>,
     mut stop_rx: watch::Receiver<bool>,
 ) -> AppResult<()> {
     tracing::info!("Starting audio pipeline");
+
+    let mut last_notice = String::new();
+
+    // 配置健全性检查：这些是最常见的"看着在跑但其实没结果"的原因
+    let api_key = config.translate.api_key.trim();
+    if api_key.is_empty() || api_key == "YOUR_API_KEY" {
+        send_notice(
+            &tx,
+            &mut last_notice,
+            "翻译 API Key 未配置：请在配置文件里设置 translate.api_key".to_string(),
+        )
+        .await;
+    }
 
     let mut audio_capture = AudioCapture::new(
         &config.audio.device_name,
@@ -97,15 +133,12 @@ pub async fn run_pipeline(
                                 continue;
                             }
 
-                            let wav_data = wav::encode_wav(
-                                &chunk,
-                                target_rate,
-                                1,
-                            )?;
+                            let wav_data = wav::encode_wav(&chunk, target_rate, 1)?;
 
                             match whisper_client.transcribe(wav_data).await {
                                 Ok(text) if !text.is_empty() => {
                                     tracing::info!("Recognized text: {}", text);
+
                                     match translate_client.translate(&text).await {
                                         Ok(translated) => {
                                             // 检查是否重复
@@ -121,7 +154,14 @@ pub async fn run_pipeline(
                                                 } else {
                                                     subtitle_processor.record(&text, &translated);
 
-                                                    if tx.send(Subtitle::new(clean_text, clean_trans)).await.is_err() {
+                                                    if tx
+                                                        .send(PipelineEvent::Subtitle(Subtitle::new(
+                                                            clean_text,
+                                                            clean_trans,
+                                                        )))
+                                                        .await
+                                                        .is_err()
+                                                    {
                                                         tracing::warn!("Subtitle receiver dropped, stopping pipeline");
                                                         return Ok(());
                                                     }
@@ -130,6 +170,12 @@ pub async fn run_pipeline(
                                         }
                                         Err(e) => {
                                             tracing::error!("Translation failed: {}", e);
+                                            send_notice(
+                                                &tx,
+                                                &mut last_notice,
+                                                format!("翻译失败: {e}"),
+                                            )
+                                            .await;
                                         }
                                     }
                                 }
@@ -138,6 +184,13 @@ pub async fn run_pipeline(
                                 }
                                 Err(e) => {
                                     tracing::error!("ASR failed: {}", e);
+                                    send_notice(
+                                        &tx,
+                                        &mut last_notice,
+                                        format!("ASR 失败（请确认 Whisper 服务在 {} 上运行）: {e}",
+                                            config.asr.base_url),
+                                    )
+                                    .await;
                                 }
                             }
                         }

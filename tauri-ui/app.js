@@ -67,6 +67,31 @@ function updateClickThroughLabel() {
   els.throughBtn.textContent = `穿透: ${clickThrough ? '开' : '关'}`;
 }
 
+/// 拖动窗口
+///
+/// 不用 data-tauri-drag-region：它走 Tauri 的 Window 模块（受 allowlist 门控），
+/// 且双击会触发最大化，不适合浮窗。这里改为调用自定义命令。
+async function bindDrag() {
+  if (typeof invoke !== 'function') {
+    return;
+  }
+
+  const shell = document.getElementById('app');
+  shell.addEventListener('mousedown', (event) => {
+    if (event.button !== 0) {
+      return;
+    }
+    // 点在交互控件上时不拖动
+    if (event.target.closest('button, select, input, textarea, a')) {
+      return;
+    }
+    event.preventDefault();
+    invoke('start_dragging').catch((error) => {
+      console.error('start_dragging 失败', error);
+    });
+  });
+}
+
 /// 在面板上直接显示致命错误，避免“界面正常但点不动”的静默失败
 function fatal(message) {
   console.error(message);
@@ -167,6 +192,15 @@ async function bindEvents() {
     updateClickThroughLabel();
   });
 
+  // 后端提示（配置缺失 / ASR / 翻译失败等），直接显示在状态区
+  await listen('notice://message', (event) => {
+    const message = String(event.payload || '');
+    if (message) {
+      els.statusText.textContent = message;
+      els.statusText.title = message;
+    }
+  });
+
   await listen('error://message', (event) => {
     setStatus(false, String(event.payload || '出现错误'));
   });
@@ -205,6 +239,12 @@ window.addEventListener('DOMContentLoaded', async () => {
     await bindActions();
   } catch (error) {
     console.error('bindActions 失败', error);
+  }
+
+  try {
+    await bindDrag();
+  } catch (error) {
+    console.error('bindDrag 失败', error);
   }
 
   try {

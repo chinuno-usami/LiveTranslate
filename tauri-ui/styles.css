@@ -52,6 +52,13 @@ body {
   font-size: 13px;
 }
 
+#status-text {
+  max-width: 520px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
 .status-dot {
   width: 10px;
   height: 10px;

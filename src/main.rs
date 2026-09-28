@@ -21,7 +21,7 @@ use tokio::sync::{mpsc, watch, Mutex};
 use tracing_subscriber::EnvFilter;
 use ui::{
     OverlayConfigPayload, StatusPayload, SubtitlePayload, CLICK_THROUGH_EVENT, CONFIG_EVENT,
-    ERROR_EVENT, STATUS_EVENT, SUBTITLE_EVENT,
+    ERROR_EVENT, NOTICE_EVENT, STATUS_EVENT, SUBTITLE_EVENT,
 };
 
 #[derive(Parser, Debug)]
@@ -202,6 +202,16 @@ fn close_overlay(window: Window) -> Result<(), String> {
     window.close().map_err(|e| e.to_string())
 }
 
+/// 开始拖动窗口
+///
+/// 用自己的命令而不是 `data-tauri-drag-region`，因为后者走 Window 模块，
+/// 受 allowlist / cargo feature 门控；而且它在双击时会触发最大化，
+/// 不适合本项目的浮窗场景。
+#[tauri::command]
+fn start_dragging(window: Window) -> Result<(), String> {
+    window.start_dragging().map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 async fn set_click_through(
     app: AppHandle,
@@ -228,7 +238,10 @@ async fn start_capture_impl(app: AppHandle, state: Arc<SharedState>) -> Result<(
     }
     emit_subtitle_reset(&app);
 
-    let (subtitle_tx, mut subtitle_rx): (mpsc::Sender<subtitle::Subtitle>, mpsc::Receiver<subtitle::Subtitle>) = mpsc::channel(128);
+    let (event_tx, mut event_rx): (
+        mpsc::Sender<app::PipelineEvent>,
+        mpsc::Receiver<app::PipelineEvent>,
+    ) = mpsc::channel(128);
     let (stop_tx, stop_rx) = watch::channel(false);
 
     let mut config = state.config.clone();
@@ -246,7 +259,7 @@ async fn start_capture_impl(app: AppHandle, state: Arc<SharedState>) -> Result<(
 
     let app_for_runner = app.clone();
     let runner = tauri::async_runtime::spawn(async move {
-        if let Err(e) = app::run_pipeline(config, subtitle_tx, stop_rx).await {
+        if let Err(e) = app::run_pipeline(config, event_tx, stop_rx).await {
             tracing::error!("Audio processing error: {}", e);
             let _ = app_for_runner.emit_all(ERROR_EVENT, e.to_string());
             emit_status(&app_for_runner, false, format!("运行失败: {}", e));
@@ -256,19 +269,27 @@ async fn start_capture_impl(app: AppHandle, state: Arc<SharedState>) -> Result<(
     let app_for_forwarder = app.clone();
     let state_for_forwarder = state.clone();
     let forwarder = tauri::async_runtime::spawn(async move {
-        while let Some(subtitle) = subtitle_rx.recv().await {
-            let payload = {
-                let mut subtitle_state = state_for_forwarder.subtitle_state.lock().await;
-                subtitle_state.push(subtitle.clone());
-                SubtitlePayload {
-                    source: subtitle.source.clone(),
-                    translated: subtitle.translated.clone(),
-                    lines: subtitle_state.get_all(),
-                    text: subtitle_state.get_text(),
-                }
-            };
+        while let Some(event) = event_rx.recv().await {
+            match event {
+                app::PipelineEvent::Subtitle(subtitle) => {
+                    let payload = {
+                        let mut subtitle_state = state_for_forwarder.subtitle_state.lock().await;
+                        subtitle_state.push(subtitle.clone());
+                        SubtitlePayload {
+                            source: subtitle.source.clone(),
+                            translated: subtitle.translated.clone(),
+                            lines: subtitle_state.get_all(),
+                            text: subtitle_state.get_text(),
+                        }
+                    };
 
-            let _ = app_for_forwarder.emit_all(SUBTITLE_EVENT, payload);
+                    let _ = app_for_forwarder.emit_all(SUBTITLE_EVENT, payload);
+                }
+                app::PipelineEvent::Notice(message) => {
+                    // 把 ASR/翻译/配置问题直接显示到面板，避免“一直等待”却无提示
+                    let _ = app_for_forwarder.emit_all(NOTICE_EVENT, message);
+                }
+            }
         }
 
         // 仅当仍是当前世代时才清理，避免覆盖刚启动的新流水线
@@ -621,6 +642,7 @@ fn run(args: Args) -> anyhow::Result<()> {
             start_capture,
             stop_capture,
             close_overlay,
+            start_dragging,
             set_click_through,
         ])
         .run(tauri::generate_context!())
