@@ -228,7 +228,6 @@ INFO livetranslate::app: ASR backend: edge (Edge ASR (en-US))
 ## VAD 语音分段
 
 默认开启（`vad.enabled = true`），用**按语音边界切句**代替固定时长硬切：
-
 ```text
 静音 ──┐            ┌──────────────┐
        │  确认开始   │   语音持续    │  确认结束
@@ -280,6 +279,44 @@ WARN livetranslate::app: 识别速度跟不上，丢弃一个片段（累计 3 �
 ```
 INFO livetranslate::app: VAD segment ready: 4200 ms
 ```
+
+### VAD 后端：energy / silero
+
+| 后端 | 原理 | 能否区分音乐与人声 | 依赖 |
+|------|------|--------------------|------|
+| `energy`（默认） | 自适应噪声底 + 迟滞 | ❌ 分不出 | 无 |
+| `silero` | Silero VAD 神经网络 | ✅ 能 | 需要 ONNX Runtime 动态库 |
+
+```toml
+[vad]
+backend = "silero"
+silero_threshold = 0.5     # 调大更保守（更不容易误触），调小更灵敏
+# silero_model = ""        # 留空用内嵌模型
+```
+
+**关于 ONNX Runtime**：`silero` 后端通过 `load-dynamic` 在运行期加载
+`onnxruntime`，程序不再自带这份库。两种获取方式：
+
+```bash
+# 1) 放进系统库搜索路径
+#    macOS:   brew install onnxruntime
+#    Linux:   apt install libonnxruntime  (或从官网下载)
+#    Windows: 下载 onnxruntime 的 zip，把 onnxruntime.dll 放到 exe 同级目录
+
+# 2) 或者用环境变量指定完整路径
+export ORT_DYLIB_PATH=/path/to/libonnxruntime.dylib
+```
+
+模型（Silero VAD v5，MIT 许可）已内嵌在二进制里，无需另外下载。
+
+**如果没装 ONNX Runtime 会怎样**：不会崩溃。程序会在启动时探测，
+初始化失败就自动回退到能量 VAD，并在面板状态栏给出提示：
+
+```
+Silero VAD 初始化失败，已回退到能量 VAD：未找到 ONNX Runtime 动态库…
+```
+
+如果不想要这个后端，可以用 `--no-default-features` 重新构建（去掉 `silero-vad`）。
 
 ### 调参建议
 

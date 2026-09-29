@@ -13,8 +13,10 @@ path = "src/main.rs"
 # 不再从 devPath 加载，同时关闭 dev 专用的 plist 生成逻辑。
 # 本项目的 UI 是静态目录 (tauri-ui/)，不使用 tauri dev 服务器，
 # 因此默认开启（否则交叉编译到 Windows 会因为 host 判定而失败）。
-default = ["custom-protocol"]
+default = ["custom-protocol", "silero-vad"]
 custom-protocol = ["tauri/custom-protocol"]
+# Silero VAD（需要 ONNX Runtime 动态库，缺失时会自动回退到能量 VAD）
+silero-vad = ["dep:ort", "dep:libloading"]
 
 [dependencies]
 # Async runtime
@@ -53,6 +55,9 @@ anyhow = "1.0"
 # Config / CLI
 directories = "5.0"
 clap = { version = "4.4", features = ["derive"] }
+ort = { version = "2.0.0-rc.9", features = ["load-dynamic"], optional = true }
+# 用于在调用 ort 之前探测 ONNX Runtime 是否可加载（ort 在缺失时会 panic）
+libloading = { version = "0.8", optional = true }
 
 # Windows-specific
 [target.'cfg(windows)'.dependencies]

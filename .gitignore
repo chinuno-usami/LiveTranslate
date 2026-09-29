@@ -14,3 +14,6 @@ Thumbs.db
 .idea/
 .vscode/
 *.swp
+
+# ONNX Runtime 运行期临时文件
+:memory:.ses
