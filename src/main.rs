@@ -36,6 +36,10 @@ struct Args {
     #[arg(short, long)]
     list_devices: bool,
 
+    /// List models offered by the configured translation / ASR services
+    #[arg(long)]
+    list_models: bool,
+
     /// Run in console mode instead of overlay window
     #[arg(long)]
     console: bool,
@@ -731,6 +735,12 @@ fn run(args: Args) -> anyhow::Result<()> {
     if args.list_devices {
         let runtime = tokio::runtime::Runtime::new()?;
         runtime.block_on(app::list_devices())?;
+        return Ok(());
+    }
+
+    if args.list_models {
+        let runtime = tokio::runtime::Runtime::new()?;
+        runtime.block_on(app::list_models(&config))?;
         return Ok(());
     }
 

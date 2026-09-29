@@ -52,6 +52,52 @@ impl Segmenter {
     }
 }
 
+/// 打印服务端可用模型，用于确认是否存在非思考版本
+pub async fn list_models(config: &AppConfig) -> AppResult<()> {
+    // 翻译服务
+    println!("翻译服务: {}", config.translate.base_url);
+    let client = OpenAiClient::new(config.translate.clone());
+    match client.list_models().await {
+        Ok(models) if !models.is_empty() => {
+            println!("可用模型 ({}):", models.len());
+            for model in &models {
+                println!("  {model}");
+            }
+            println!();
+            println!(
+                "提示: 若其中有非思考版本（常见命名 *-chat / *-instruct / *-non-thinking），\n      \
+                 把 [translate] model 换成它即可直接关闭思考，比调参数可靠"
+            );
+        }
+        Ok(_) => println!("  服务未返回模型列表（部分兼容服务不支持 GET /models）"),
+        Err(e) => println!("  获取失败: {e}"),
+    }
+
+    // 识别服务（可选，失败不影响退出码）
+    if !config.asr.base_url.trim().is_empty() {
+        println!();
+        println!("识别服务: {}", config.asr.base_url);
+        let asr_url = format!("{}/models", config.asr.base_url.trim_end_matches('/'));
+        match reqwest::Client::new()
+            .get(&asr_url)
+            .timeout(std::time::Duration::from_secs(5))
+            .send()
+            .await
+        {
+            Ok(response) if response.status().is_success() => {
+                match response.text().await {
+                    Ok(text) => println!("  {}", text.trim()),
+                    Err(e) => println!("  读取失败: {e}"),
+                }
+            }
+            Ok(response) => println!("  返回 {}", response.status()),
+            Err(e) => println!("  获取失败: {e}"),
+        }
+    }
+
+    Ok(())
+}
+
 pub async fn list_devices() -> AppResult<()> {
     let devices = AudioCapture::list_devices()?;
     if devices.is_empty() {

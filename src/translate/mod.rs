@@ -108,6 +108,59 @@ impl OpenAiClient {
         Value::Object(body)
     }
 
+    /// 拉取服务端可用模型列表（OpenAI 兼容的 `GET /models`）
+    ///
+    /// 用来确认某个服务到底提供哪些型号——例如是否存在非思考版本的
+    /// `*-chat` / `*-instruct`，比猜参数可靠得多。
+    pub async fn list_models(&self) -> AppResult<Vec<String>> {
+        let url = format!("{}/models", self.config.base_url.trim_end_matches('/'));
+
+        let response = self
+            .client
+            .get(&url)
+            .header("Authorization", format!("Bearer {}", self.config.api_key))
+            .timeout(Duration::from_secs(self.config.timeout_secs))
+            .send()
+            .await?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let body = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "Unknown error".to_string());
+            return Err(AppError::Translation(format!(
+                "获取模型列表失败（{status}）: {body}"
+            )));
+        }
+
+        // 兼容两种常见返回：{"data":[{...}]} 与直接一个数组
+        let value: Value = response.json().await?;
+        let extract = |entry: &Value| -> Option<String> {
+            match entry {
+                Value::String(s) => Some(s.clone()),
+                other => other
+                    .get("id")
+                    .and_then(|id| id.as_str())
+                    .map(str::to_string),
+            }
+        };
+
+        let mut models: Vec<String> = match &value {
+            Value::Object(map) => map
+                .get("data")
+                .and_then(|d| d.as_array())
+                .map(|arr| arr.iter().filter_map(extract).collect())
+                .unwrap_or_default(),
+            Value::Array(arr) => arr.iter().filter_map(extract).collect(),
+            _ => Vec::new(),
+        };
+
+        models.sort();
+        models.dedup();
+        Ok(models)
+    }
+
     /// 翻译文本
     pub async fn translate(&self, text: &str) -> AppResult<String> {
         if text.trim().is_empty() {
