@@ -295,7 +295,13 @@ silero_threshold = 0.5     # 调大更保守（更不容易误触），调小更
 ```
 
 **关于 ONNX Runtime**：`silero` 后端通过 `load-dynamic` 在运行期加载
-`onnxruntime`。查找顺序：
+`onnxruntime`。
+
+> **从 Release 下载的包已经内置了该库**（macOS 放在 `.app/Contents/Frameworks/`，
+> Windows/Linux 放在可执行文件同级），开箱即用，无需额外安装。
+> 只有自行编译时才需要自己准备。
+
+查找顺序：
 
 1. 环境变量 `ORT_DYLIB_PATH`（显式指定）
 2. **程序自带的库**（推荐随包分发）

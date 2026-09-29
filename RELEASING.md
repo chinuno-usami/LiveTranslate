@@ -72,8 +72,26 @@ open dist/LiveTranslate.app
 
 内容：
 
-- **Linux / Windows**：可执行文件 + `config/default.toml` + 文档
-- **macOS**：`LiveTranslate.app` bundle（应用图标 + `Info.plist` + 二进制）
+- **Linux / Windows**：可执行文件 + ONNX Runtime 动态库 + `config/default.toml` + 文档
+- **macOS**：`LiveTranslate.app` bundle（应用图标 + `Info.plist` + 二进制 + `Contents/Frameworks/` 下的 ONNX Runtime）
+
+### 关于随包附带的 ONNX Runtime
+
+`silero` VAD 后端需要一个 ONNX Runtime 动态库。CI 在打包时会自动从
+[官方 release](https://github.com/microsoft/onnxruntime/releases) 下载（版本由
+`scripts/fetch-onnxruntime.sh` 中的 `ORT_VERSION` 控制）并放进产物：
+
+| 平台 | 位置 |
+|------|------|
+| Linux | `libonnxruntime.so*`（与二进制同级） |
+| Windows | `onnxruntime.dll`（与 exe 同级） |
+| macOS | `LiveTranslate.app/Contents/Frameworks/libonnxruntime.dylib` |
+
+程序启动时会在这些位置自动发现它（详见 README 的查找顺序），因此**用户无需单独安装**。
+
+> 注意：ONNX Runtime 官方只为 **Apple Silicon** 提供 macOS 预编译库，
+> 没有 x86_64 版本。所以 Intel Mac 上不会内置该库，
+> `silero` 后端会自动回退到能量 VAD（不会报错）。
 
 ## 使用发布产物
 

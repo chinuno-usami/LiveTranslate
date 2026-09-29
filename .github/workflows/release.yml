@@ -106,6 +106,9 @@ jobs:
             [ -f "$f" ] && cp "$f" "$STAGE/"
           done
 
+          # 随包附带 ONNX Runtime（silero VAD 用），程序启动时自动发现
+          bash scripts/fetch-onnxruntime.sh linux-x64 "$STAGE"
+
           tar -C dist -czf "dist/${NAME}.tar.gz" "${NAME}"
           ls -lh dist
 
@@ -114,10 +117,14 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          # 官方只为 Apple Silicon 提供 macOS 预编译库；
+          # Intel Mac 上会自动回退到能量 VAD
+          bash scripts/fetch-onnxruntime.sh macos-arm64 dist/onnxruntime
           bash scripts/make-macos-app.sh \
             "target/universal/release/${BIN_NAME}" \
             dist \
-            "${{ matrix.target }}"
+            "${{ matrix.target }}" \
+            dist/onnxruntime
           ls -lh dist
 
       - name: Package (Windows)
@@ -133,6 +140,20 @@ jobs:
           foreach ($f in @('README.md','QUICKSTART.md')) {
             if (Test-Path $f) { Copy-Item $f $stage }
           }
+
+          # 随包附带 ONNX Runtime（silero VAD 用）
+          $ortVersion = "1.30.0"
+          $ortUrl = "https://github.com/microsoft/onnxruntime/releases/download/v$ortVersion/onnxruntime-win-x64-$ortVersion.zip"
+          $ortZip = Join-Path $env:RUNNER_TEMP "ort.zip"
+          $ortDir = Join-Path $env:RUNNER_TEMP "ort"
+          Write-Host "downloading $ortUrl"
+          Invoke-WebRequest -Uri $ortUrl -OutFile $ortZip
+          Expand-Archive -Path $ortZip -DestinationPath $ortDir -Force
+          $dll = Get-ChildItem $ortDir -Recurse -Filter 'onnxruntime.dll' | Select-Object -First 1
+          if (-not $dll) { throw 'onnxruntime.dll not found in archive' }
+          Copy-Item $dll.FullName $stage
+          Write-Host "bundled: $($dll.Name)"
+
           Compress-Archive -Path $stage -DestinationPath "dist/$name.zip" -Force
           Get-ChildItem dist
 
