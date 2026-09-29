@@ -132,7 +132,16 @@ pub struct SubtitleConfig {
     pub font_size: u32,
     pub text_color: String,
     pub stroke_color: String,
+    /// 字幕面板背景（任意 CSS 颜色，含 alpha）
+    /// - `"transparent"`：完全透明，只显示文字
+    /// - `"rgba(8, 10, 14, 0.6)"`：半透明黑，数值越大越不透明
+    #[serde(default = "default_panel_background")]
     pub background: String,
+    /// 顶部工具栏背景（任意 CSS 颜色，含 alpha）
+    /// - `"transparent"`：完全透明
+    /// - `"rgba(10, 12, 18, 0.42)"`：半透明黑
+    #[serde(default = "default_toolbar_background")]
+    pub toolbar_background: String,
     pub show_source: bool,
     pub window_width: u32,
     pub window_height: u32,
@@ -205,6 +214,14 @@ impl Default for VadConfig {
 
 fn default_true() -> bool {
     true
+}
+fn default_panel_background() -> String {
+    // 与 tauri-ui/styles.css 里的 --panel-bg 保持一致
+    "rgba(8, 10, 14, 0.28)".to_string()
+}
+fn default_toolbar_background() -> String {
+    // 与 tauri-ui/styles.css 里的 --toolbar-bg 保持一致
+    "rgba(10, 12, 18, 0.42)".to_string()
 }
 fn default_vad_frame_ms() -> u32 {
     VadConfig::default().frame_ms
@@ -453,7 +470,8 @@ impl Default for AppConfig {
                 font_size: 28,
                 text_color: "#FFFFFF".to_string(),
                 stroke_color: "#000000".to_string(),
-                background: "transparent".to_string(),
+                background: default_panel_background(),
+                toolbar_background: default_toolbar_background(),
                 show_source: false,
                 window_width: 1200,
                 window_height: 260,

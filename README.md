@@ -147,8 +147,10 @@ font_size = 28
 text_color = "#FFFFFF"
 # 描边颜色
 stroke_color = "#000000"
-# 背景 (transparent)
-background = "transparent"
+# 面板背景（任意 CSS 颜色，含 alpha；支持 rgba 与 #RRGGBBAA，transparent 为完全透明）
+background = "rgba(8, 10, 14, 0.28)"
+# 顶部工具栏背景（格式同上）
+toolbar_background = "rgba(10, 12, 18, 0.42)"
 # 是否显示源文本
 show_source = false
 # 窗口尺寸和位置

@@ -3,6 +3,7 @@
   --text-color: #ffffff;
   --stroke-color: #000000;
   --panel-bg: rgba(8, 10, 14, 0.28);
+  --toolbar-bg: rgba(10, 12, 18, 0.42);
   --panel-border: rgba(255, 255, 255, 0.12);
 }
 
@@ -42,7 +43,7 @@ body {
   border-radius: 14px;
   padding: 8px 12px;
   margin-bottom: 8px;
-  background: rgba(10, 12, 18, 0.42);
+  background: var(--toolbar-bg);
   border: 1px solid rgba(255, 255, 255, 0.1);
   backdrop-filter: blur(10px);
   /* 鼠标移出时收起；用 margin 而非父容器 gap，方便一次性折叠干净 */

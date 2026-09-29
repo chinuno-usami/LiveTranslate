@@ -41,6 +41,18 @@ function applyFontSize(px) {
   }
 }
 
+/// 应用字幕面板背景（支持任意 CSS 颜色，含 alpha；transparent 为完全透明）
+function applyBackground(value) {
+  const color = typeof value === 'string' && value.trim() ? value.trim() : 'rgba(8, 10, 14, 0.28)';
+  document.documentElement.style.setProperty('--panel-bg', color);
+}
+
+/// 应用顶部工具栏背景（同样支持任意 CSS 颜色，含 alpha）
+function applyToolbarBackground(value) {
+  const color = typeof value === 'string' && value.trim() ? value.trim() : 'rgba(10, 12, 18, 0.42)';
+  document.documentElement.style.setProperty('--toolbar-bg', color);
+}
+
 /// 应用"显示原文"开关
 function applyShowSource(enabled) {
   if (els.sourceToggle) {
@@ -85,6 +97,8 @@ async function loadInitialConfig() {
   applyShowSource(config.show_source);
   document.documentElement.style.setProperty('--text-color', config.text_color);
   document.documentElement.style.setProperty('--stroke-color', config.stroke_color);
+  applyBackground(config.background);
+  applyToolbarBackground(config.toolbar_background);
   clickThrough = Boolean(config.click_through);
   updateClickThroughLabel();
   applyClickThroughToToolbar();
@@ -351,6 +365,8 @@ async function bindEvents() {
     applyShowSource(config.show_source);
     document.documentElement.style.setProperty('--text-color', config.text_color);
     document.documentElement.style.setProperty('--stroke-color', config.stroke_color);
+    applyBackground(config.background);
+    applyToolbarBackground(config.toolbar_background);
     clickThrough = Boolean(config.click_through);
     updateClickThroughLabel();
     applyClickThroughToToolbar();
