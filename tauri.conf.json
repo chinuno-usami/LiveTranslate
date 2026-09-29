@@ -46,6 +46,8 @@
         "title": "LiveTranslate Overlay",
         "width": 1200,
         "height": 220,
+        "minWidth": 320,
+        "minHeight": 120,
         "resizable": true,
         "decorations": false,
         "transparent": true,

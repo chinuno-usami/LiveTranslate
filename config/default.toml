@@ -136,6 +136,7 @@ background = "rgba(8, 10, 14, 0.28)"
 toolbar_background = "rgba(10, 12, 18, 0.42)"
 # 是否显示源文本
 show_source = false
+# 窗口尺寸与位置。手动拖动窗口边缘缩放后，抬手会自动把新值写回这里。
 window_width = 1200
 window_height = 260
 position_x = 200

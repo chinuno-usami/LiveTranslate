@@ -349,6 +349,63 @@ fn start_dragging(window: Window) -> Result<(), String> {
     window.start_dragging().map_err(|e| e.to_string())
 }
 
+/// 读取窗口当前位置与尺寸（逻辑像素），供前端做自定义边缘缩放
+#[tauri::command]
+fn window_geometry(window: Window) -> Result<(i32, i32, u32, u32), String> {
+    let scale = window.scale_factor().map_err(|e| e.to_string())?;
+    let pos = window.outer_position().map_err(|e| e.to_string())?;
+    let size = window.outer_size().map_err(|e| e.to_string())?;
+    Ok((
+        (pos.x as f64 / scale).round() as i32,
+        (pos.y as f64 / scale).round() as i32,
+        (size.width as f64 / scale).round() as u32,
+        (size.height as f64 / scale).round() as u32,
+    ))
+}
+
+/// 设置窗口位置与尺寸（逻辑像素），供前端自定义边缘缩放
+///
+/// Tauri v1 没有 `start_resize_dragging`，只能在 JS 里跟踪鼠标位移后反复
+/// 调用本命令；尺寸和位置放在同一个命令里设置，避免两次调用间出现撕裂。
+#[tauri::command]
+fn set_window_bounds(window: Window, x: f64, y: f64, width: f64, height: f64) -> Result<(), String> {
+    let width = width.max(1.0);
+    let height = height.max(1.0);
+    window
+        .set_size(tauri::Size::Logical(LogicalSize::new(width, height)))
+        .map_err(|e| e.to_string())?;
+    window
+        .set_position(tauri::Position::Logical(LogicalPosition::new(x, y)))
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// 手动缩放结束后，把当前窗口尺寸与位置写回配置文件（保留注释）
+///
+/// 直接读窗口实际几何而非相信前端传值，避免与最后一次 `set_window_bounds`
+/// 的异步执行产生竞争。
+#[tauri::command]
+fn persist_window_geometry(
+    state: State<'_, Arc<SharedState>>,
+    window: Window,
+) -> Result<(), String> {
+    let scale = window.scale_factor().map_err(|e| e.to_string())?;
+    let pos = window.outer_position().map_err(|e| e.to_string())?;
+    let size = window.outer_size().map_err(|e| e.to_string())?;
+
+    let x = (pos.x as f64 / scale).round() as i32;
+    let y = (pos.y as f64 / scale).round() as i32;
+    let width = (size.width as f64 / scale).round() as u32;
+    let height = (size.height as f64 / scale).round() as u32;
+
+    let path = state.config_path.as_ref();
+    persist_setting(path, "subtitle", "window_width", &width.to_string());
+    persist_setting(path, "subtitle", "window_height", &height.to_string());
+    persist_setting(path, "subtitle", "position_x", &x.to_string());
+    persist_setting(path, "subtitle", "position_y", &y.to_string());
+    Ok(())
+}
+
 #[tauri::command]
 async fn set_click_through(
     app: AppHandle,
@@ -796,6 +853,9 @@ fn run(args: Args) -> anyhow::Result<()> {
             stop_capture,
             close_overlay,
             start_dragging,
+            window_geometry,
+            set_window_bounds,
+            persist_window_geometry,
             set_click_through,
         ])
         .run(tauri::generate_context!())

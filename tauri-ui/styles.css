@@ -350,3 +350,81 @@ kbd {
   line-height: 1.6;
   color: rgba(255, 255, 255, 0.62);
 }
+
+/* ---------- 窗口边缘缩放热区 ---------- */
+
+/* 窗口去掉了系统装饰，原生缩放热区只有几像素、且位于窗口真实边缘，
+   而面板视觉边框因 .overlay-shell 的留白内缩了 10~12px，导致又难点、
+   又对不上边框。这里铺一圈固定热区：边缘 14px、四角 22px，既压住
+   面板的视觉边框、又能从透明留白处拖到，命中率高很多。
+   想再调大小改下面两个变量即可。
+   z-index 低于弹窗（10），弹窗打开时不会误触缩放。 */
+:root {
+  --resize-edge: 14px;
+  --resize-corner: 22px;
+}
+
+.resize-handle {
+  position: fixed;
+  z-index: 5;
+  background: transparent;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+.resize-handle[data-resize="n"] {
+  top: 0;
+  left: 0;
+  right: 0;
+  height: var(--resize-edge);
+  cursor: ns-resize;
+}
+.resize-handle[data-resize="s"] {
+  bottom: 0;
+  left: 0;
+  right: 0;
+  height: var(--resize-edge);
+  cursor: ns-resize;
+}
+.resize-handle[data-resize="w"] {
+  top: 0;
+  bottom: 0;
+  left: 0;
+  width: var(--resize-edge);
+  cursor: ew-resize;
+}
+.resize-handle[data-resize="e"] {
+  top: 0;
+  bottom: 0;
+  right: 0;
+  width: var(--resize-edge);
+  cursor: ew-resize;
+}
+.resize-handle[data-resize="nw"] {
+  top: 0;
+  left: 0;
+  width: var(--resize-corner);
+  height: var(--resize-corner);
+  cursor: nwse-resize;
+}
+.resize-handle[data-resize="ne"] {
+  top: 0;
+  right: 0;
+  width: var(--resize-corner);
+  height: var(--resize-corner);
+  cursor: nesw-resize;
+}
+.resize-handle[data-resize="sw"] {
+  bottom: 0;
+  left: 0;
+  width: var(--resize-corner);
+  height: var(--resize-corner);
+  cursor: nesw-resize;
+}
+.resize-handle[data-resize="se"] {
+  bottom: 0;
+  right: 0;
+  width: var(--resize-corner);
+  height: var(--resize-corner);
+  cursor: nwse-resize;
+}

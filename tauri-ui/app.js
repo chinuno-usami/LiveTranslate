@@ -188,6 +188,135 @@ async function bindDrag() {
   });
 }
 
+/// 窗口边缘拖拽缩放
+///
+/// Tauri v1 没有 start_resize_dragging，只能在 JS 里跟踪鼠标位移，
+/// 再反复调用 Rust 命令设置窗口尺寸/位置。热区比原生大，且压住面板边框。
+const RESIZE_MIN_WIDTH = 320;
+const RESIZE_MIN_HEIGHT = 120;
+
+function bindResize() {
+  if (typeof invoke !== 'function') {
+    return;
+  }
+
+  const handles = document.querySelectorAll('.resize-handle');
+  if (handles.length === 0) {
+    return;
+  }
+
+  // 串行推送窗口几何：set_size/set_position 不能并发，否则会互相覆盖。
+  // 同一帧内多次移动只保留最新值（latest-wins）；返回的 Promise 会在所有
+  // 待处理值都应用完之后才 resolve，抬手写回配置前需要等它。
+  let pendingBounds = null;
+  let draining = null;
+  function pushBounds(bounds) {
+    pendingBounds = bounds;
+    if (draining) {
+      return draining;
+    }
+    draining = (async () => {
+      while (pendingBounds) {
+        const next = pendingBounds;
+        pendingBounds = null;
+        try {
+          await invoke('set_window_bounds', next);
+        } catch (error) {
+          console.error('set_window_bounds 失败', error);
+        }
+      }
+      draining = null;
+    })();
+    return draining;
+  }
+
+  handles.forEach((handle) => {
+    handle.addEventListener('mousedown', async (event) => {
+      if (event.button !== 0) {
+        return;
+      }
+      event.preventDefault();
+      event.stopPropagation();
+
+      let start;
+      try {
+        const [x, y, width, height] = await invoke('window_geometry');
+        start = { x, y, width, height };
+      } catch (error) {
+        console.error('window_geometry 失败', error);
+        return;
+      }
+
+      const dir = handle.dataset.resize || '';
+      // 用 screen 坐标：缩放时窗口自身在移动，client 坐标会跟着漂移
+      const startX = event.screenX;
+      const startY = event.screenY;
+
+      // 按下鼠标后系统会把鼠标事件锁定到本窗口，指针移出窗口仍能收到 move/up
+      let lastBounds = null;
+      const onMove = (moveEvent) => {
+        const dx = moveEvent.screenX - startX;
+        const dy = moveEvent.screenY - startY;
+
+        let width = start.width;
+        let height = start.height;
+
+        if (dir.includes('e')) {
+          width = start.width + dx;
+        }
+        if (dir.includes('s')) {
+          height = start.height + dy;
+        }
+        if (dir.includes('w')) {
+          width = start.width - dx;
+        }
+        if (dir.includes('n')) {
+          height = start.height - dy;
+        }
+
+        if (width < RESIZE_MIN_WIDTH) {
+          width = RESIZE_MIN_WIDTH;
+        }
+        if (height < RESIZE_MIN_HEIGHT) {
+          height = RESIZE_MIN_HEIGHT;
+        }
+
+        // 拖左/上边时，窗口左上角要跟着走，保证对边固定
+        const x = dir.includes('w') ? start.x + (start.width - width) : start.x;
+        const y = dir.includes('n') ? start.y + (start.height - height) : start.y;
+
+        lastBounds = {
+          x: Math.round(x),
+          y: Math.round(y),
+          width: Math.round(width),
+          height: Math.round(height),
+        };
+        pushBounds(lastBounds);
+      };
+
+      const onUp = () => {
+        window.removeEventListener('mousemove', onMove, true);
+        window.removeEventListener('mouseup', onUp, true);
+
+        // 只是点了一下没拖动，不必写回
+        if (!lastBounds) {
+          return;
+        }
+
+        // 等最后一次尺寸真正应用后再把几何写回配置，避免存到拖拽中的旧值
+        pushBounds(lastBounds).then(() => {
+          invoke('persist_window_geometry').catch((error) => {
+            console.error('persist_window_geometry 失败', error);
+          });
+        });
+      };
+
+      window.addEventListener('mousemove', onMove, true);
+      window.addEventListener('mouseup', onUp, true);
+    });
+  });
+}
+
 /// 在面板上直接显示致命错误，避免“界面正常但点不动”的静默失败
 function fatal(message) {
   console.error(message);
@@ -432,6 +561,12 @@ window.addEventListener('DOMContentLoaded', async () => {
     await bindDrag();
   } catch (error) {
     console.error('bindDrag 失败', error);
+  }
+
+  try {
+    bindResize();
+  } catch (error) {
+    console.error('bindResize 失败', error);
   }
 
   try {
