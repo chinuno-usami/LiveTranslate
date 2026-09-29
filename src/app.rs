@@ -371,6 +371,16 @@ pub async fn run_pipeline(
                                 floor + config.vad.margin_db
                             );
                         }
+                        if let Some(stats) = vad.stats() {
+                            tracing::debug!(
+                                "Silero 最近概率: max={:.3} avg={:.3} 阈值(进/出)={:.2}/{:.2} active={}",
+                                stats.max_prob,
+                                stats.avg_prob,
+                                stats.threshold,
+                                stats.neg_threshold,
+                                stats.active
+                            );
+                        }
                     }
                 }
 

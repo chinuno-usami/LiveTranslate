@@ -13,6 +13,7 @@
 use ort::session::Session;
 use ort::value::Tensor;
 
+use std::collections::VecDeque;
 use std::path::PathBuf;
 
 use crate::error::{AppError, AppResult};
@@ -30,6 +31,29 @@ const STATE_DIM: usize = 128;
 const CONTEXT_LEN_16K: usize = 64;
 /// 8kHz：context 32 + 新样本 256 = 模型输入 288
 const CONTEXT_LEN_8K: usize = 32;
+
+/// 退出门槛相对进入门槛的下调量（迟滞）
+///
+/// 上游 Silero 用 `neg_threshold = threshold - 0.15`：概率在门槛附近
+/// 抖动时不把一句话切碎/漏掉，比单一阈值稳定得多。
+const NEG_THRESHOLD_MARGIN: f32 = 0.15;
+
+/// 概率观测窗口长度（帧）。32ms/帧 时约 2s。
+const PROB_WINDOW: usize = 64;
+
+/// 单步迟滞判决
+///
+/// - 非语音态：`prob >= threshold` 才进入语音
+/// - 语音态：`prob >= neg_threshold` 就继续保持（更宽松）
+///
+/// 独立成函数是为了能在没有 ONNX Runtime 的环境下做单测。
+fn hysteresis_step(active: bool, prob: f32, threshold: f32, neg_threshold: f32) -> bool {
+    if active {
+        prob >= neg_threshold
+    } else {
+        prob >= threshold
+    }
+}
 
 /// 各平台 ONNX Runtime 动态库文件名
 #[cfg(target_os = "windows")]
@@ -52,7 +76,14 @@ pub struct SileroVad {
     /// 送入模型前拼接的上下文样本数（见 [`CONTEXT_LEN_16K`] / [`CONTEXT_LEN_8K`]）
     context_len: usize,
     sample_rate: i64,
+    /// 进入语音的门槛
     threshold: f32,
+    /// 离开语音的门槛（迟滞，低于它才算静音）
+    neg_threshold: f32,
+    /// 当前是否处于语音段（迟滞状态）
+    active: bool,
+    /// 最近 [`PROB_WINDOW`] 帧的概率，用于 debug 观测
+    prob_window: VecDeque<f32>,
 }
 
 impl SileroVad {
@@ -147,13 +178,17 @@ impl SileroVad {
 
         let session = build_cpu_session(model_path)?;
 
+        let threshold = config.silero_threshold.clamp(0.0, 1.0);
+        let neg_threshold = (threshold - NEG_THRESHOLD_MARGIN).max(0.01);
+
         tracing::info!(
-            "Silero VAD 已加载 (input={} samples = {} context + {} new @ {}Hz, threshold={})",
+            "Silero VAD 已加载 (input={} samples = {} context + {} new @ {}Hz, threshold={:.2} 进 / {:.2} 出)",
             context_len + frame_len,
             context_len,
             frame_len,
             sample_rate,
-            config.silero_threshold
+            threshold,
+            neg_threshold
         );
 
         Ok(Self {
@@ -164,7 +199,10 @@ impl SileroVad {
             frame_len,
             context_len,
             sample_rate: sample_rate as i64,
-            threshold: config.silero_threshold,
+            threshold,
+            neg_threshold,
+            active: false,
+            prob_window: VecDeque::with_capacity(PROB_WINDOW),
         })
     }
 
@@ -179,19 +217,52 @@ impl SileroVad {
     pub fn is_speech(&mut self, frame: &[f32]) -> bool {
         self.buffer.extend_from_slice(frame);
 
-        let mut speech = false;
+        let mut speech = self.active;
         while self.buffer.len() >= self.frame_len {
             let chunk: Vec<f32> = self.buffer.drain(..self.frame_len).collect();
 
             match self.infer(&chunk) {
-                Ok(probability) => speech = probability >= self.threshold,
+                Ok(probability) => {
+                    self.remember_probability(probability);
+                    // 迟滞：进入用 threshold，退出用更低的 neg_threshold，
+                    // 避免概率在门槛附近抖动导致整句漏检 / 被切碎
+                    self.active = hysteresis_step(
+                        self.active,
+                        probability,
+                        self.threshold,
+                        self.neg_threshold,
+                    );
+                    speech = self.active;
+                }
                 Err(e) => {
                     tracing::warn!("Silero 推理失败: {e}");
-                    speech = false;
+                    speech = self.active;
                 }
             }
         }
         speech
+    }
+
+    fn remember_probability(&mut self, probability: f32) {
+        if self.prob_window.len() == PROB_WINDOW {
+            self.prob_window.pop_front();
+        }
+        self.prob_window.push_back(probability);
+    }
+
+    /// 最近 [`PROB_WINDOW`] 帧的概率统计，供 `--log-level debug` 调参观测
+    ///
+    /// 返回 `(max, avg, threshold, neg_threshold, active)`；
+    /// 还没推理过时概率按 0 计。
+    pub fn probability_stats(&self) -> (f32, f32, f32, f32, bool) {
+        let (max, avg) = if self.prob_window.is_empty() {
+            (0.0, 0.0)
+        } else {
+            let max = self.prob_window.iter().copied().fold(f32::MIN, f32::max);
+            let avg = self.prob_window.iter().sum::<f32>() / self.prob_window.len() as f32;
+            (max, avg)
+        };
+        (max, avg, self.threshold, self.neg_threshold, self.active)
     }
 
     fn infer(&mut self, chunk: &[f32]) -> AppResult<f32> {
@@ -241,6 +312,8 @@ impl SileroVad {
         self.state.iter_mut().for_each(|v| *v = 0.0);
         self.context.iter_mut().for_each(|v| *v = 0.0);
         self.buffer.clear();
+        self.prob_window.clear();
+        self.active = false;
     }
 }
 
@@ -474,6 +547,18 @@ mod tests {
             err.contains("无法加载") || err.contains("OrtGetApiBase"),
             "错误信息应说明原因: {err}"
         );
+    }
+
+    #[test]
+    fn hysteresis_uses_lower_threshold_to_exit() {
+        // 非语音态：必须达到进入阈值
+        assert!(!hysteresis_step(false, 0.49, 0.5, 0.35));
+        assert!(hysteresis_step(false, 0.5, 0.5, 0.35));
+        // 已处于语音态：掉到 0.35~0.5 仍算继续说话（迟滞）
+        assert!(hysteresis_step(true, 0.4, 0.5, 0.35));
+        assert!(hysteresis_step(true, 0.35, 0.5, 0.35));
+        // 只有低于退出门槛才结束
+        assert!(!hysteresis_step(true, 0.34, 0.5, 0.35));
     }
 
     #[test]

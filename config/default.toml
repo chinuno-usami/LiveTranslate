@@ -39,9 +39,9 @@ noise_percentile = 0.1
 # --- silero 后端专用 ---
 # Silero 模型路径；留空则使用内嵌模型（models/silero_vad.onnx，MIT 许可）
 silero_model = ""
-# 判为语音的概率阈值（0.0 - 1.0）
+# 进入语音的概率阈值（0.0 - 1.0）；退出用更低的 threshold-0.15（迟滞）
 silero_threshold = 0.5
-# 语音需持续多久才确认开始，同时也是最短片段长度
+# 最短语音时长；短于此的片段会被丢弃（起始不再要求连续这么多帧）
 min_speech_ms = 200
 # 静音需持续多久才确认说完（调大可减少句中停顿被误切）
 min_silence_ms = 400

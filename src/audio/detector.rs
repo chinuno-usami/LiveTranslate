@@ -18,6 +18,18 @@ enum VadImpl {
     Silero(SileroVad),
 }
 
+/// VAD 运行期统计，用于 `--log-level debug` 调参观测
+///
+/// 仅 Silero 后端提供（能量型可看噪声底）。
+#[derive(Debug, Clone, Copy)]
+pub struct VadStats {
+    pub max_prob: f32,
+    pub avg_prob: f32,
+    pub threshold: f32,
+    pub neg_threshold: f32,
+    pub active: bool,
+}
+
 pub struct VadEngine {
     inner: VadImpl,
     frame_len: usize,
@@ -118,6 +130,25 @@ impl VadEngine {
             VadImpl::Energy(vad) => Some(vad.current_noise_floor()),
             #[cfg(feature = "silero-vad")]
             VadImpl::Silero(_) => None,
+        }
+    }
+
+    /// Silero 概率统计（仅 silero 后端提供），用于调参
+    pub fn stats(&mut self) -> Option<VadStats> {
+        match &mut self.inner {
+            VadImpl::Energy(_) => None,
+            #[cfg(feature = "silero-vad")]
+            VadImpl::Silero(vad) => {
+                let (max_prob, avg_prob, threshold, neg_threshold, active) =
+                    vad.probability_stats();
+                Some(VadStats {
+                    max_prob,
+                    avg_prob,
+                    threshold,
+                    neg_threshold,
+                    active,
+                })
+            }
         }
     }
 }

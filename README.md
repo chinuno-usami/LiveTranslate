@@ -132,7 +132,7 @@ enabled = true
 frame_ms = 20
 margin_db = 8.0          # 嘈杂环境调大（10~12），安静环境可调小（6）
 noise_percentile = 0.1
-min_speech_ms = 200      # 语音持续多久才确认开始
+min_speech_ms = 200      # 最短语音时长（短于此丢弃）
 min_silence_ms = 400     # 静音持续多久才确认说完
 max_speech_ms = 12000    # 单片段最长时长，超过强制切分
 pre_pad_ms = 200
@@ -269,7 +269,7 @@ INFO livetranslate::app: ASR backend: edge (Edge ASR (en-US))
          ↑ pre_pad_ms                ↑ post_pad_ms
 ```
 
-- 语音需持续 `min_speech_ms` 才确认开始（过滤毛刺噪声）
+- 语音一旦检出就确认开始；短于 `min_speech_ms` 的片段丢弃（过滤毛刺噪声）
 - 静音需持续 `min_silence_ms` 才确认说完（句中停顿不会被切断）
 - 超过 `max_speech_ms` 强制切分，避免延迟无限增长
 - 开始前 / 结束后各保留一段音频，避免吃掉首尾音素
@@ -283,7 +283,7 @@ INFO livetranslate::app: ASR backend: edge (Edge ASR (en-US))
 
 | 阶段 | 默认耗时 | 说明 |
 |------|----------|------|
-| 确认开始（attack） | — | 不产生额外延迟，音频一直在缓冲 |
+| 确认开始 | — | 检出即开始，音频一直在缓冲 |
 | **确认说完** | `min_silence_ms` = 400ms | 句子结尾需要这么久的静音才会提交 |
 | **最长片段上限** | `max_speech_ms` = 12000ms | 如果说话**一直不停顿**，最多等这么久才强制提交 |
 
@@ -327,6 +327,11 @@ backend = "silero"
 silero_threshold = 0.5     # 调大更保守（更不容易误触），调小更灵敏
 # silero_model = ""        # 留空用内嵌模型
 ```
+
+> `silero` 采用**迟滞判决**：进入语音需概率 `>= silero_threshold`，
+> 离开要等到低于 `silero_threshold - 0.15`（下限 0.01），
+> 避免概率在阈值附近抖动时把整句漏掉或被切碎。
+> 调参可用 `--log-level debug` 看 `Silero 最近概率: max=… avg=…`。
 
 **关于 ONNX Runtime**：`silero` 后端通过 `load-dynamic` 在运行期加载
 `onnxruntime`。

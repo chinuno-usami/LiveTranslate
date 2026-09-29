@@ -9,14 +9,15 @@
 //!          ↑ pre_pad                     ↑ post_pad
 //! ```
 //!
-//! - 语音需持续 `min_speech_ms` 才确认开始（抗毛刺）
+//! - 语音一旦检出立即确认开始（抖动由 VAD 后端的迟滞处理）
+//! - 短于 `min_speech_ms` 的片段丢弃（过滤毛刺噪声）
 //! - 静音需持续 `min_silence_ms` 才确认结束（抗句中停顿）
 //! - 超过 `max_speech_ms` 强制切分，避免延迟与内存无限增长
 //! - 开始前保留 `pre_pad_ms`、结束后保留 `post_pad_ms`，避免吃掉首尾音素
 
 use std::collections::VecDeque;
 
-use crate::audio::detector::VadEngine;
+use crate::audio::detector::{VadEngine, VadStats};
 use crate::config::VadConfig;
 
 pub struct SpeechSegmenter {
@@ -24,14 +25,12 @@ pub struct SpeechSegmenter {
     frame_len: usize,
     vad: VadEngine,
 
-    /// 确认"开始说话"所需连续语音帧数
-    attack_frames: u32,
     /// 确认"说完"所需连续静音帧数
     release_frames: u32,
     /// 单个片段最长帧数（超过则强制切分）
     max_frames: u32,
-    /// 片段最短帧数（低于则丢弃）
-    min_frames: u32,
+    /// 片段内最短语音帧数（低于则丢弃；仅统计判定为语音的帧）
+    min_voiced_frames: u32,
     /// 起始前保留的帧数
     pre_pad_frames: usize,
     /// 结束后保留的帧数
@@ -43,7 +42,8 @@ pub struct SpeechSegmenter {
     pre_buf: VecDeque<f32>,
     /// 当前累积的语音片段
     utterance: Vec<f32>,
-    voiced_run: u32,
+    /// 当前片段内判定为语音的帧数
+    voiced_frames: u32,
     unvoiced_run: u32,
     in_speech: bool,
     /// 已完成的片段
@@ -61,16 +61,15 @@ impl SpeechSegmenter {
             sample_rate,
             frame_len,
             vad,
-            attack_frames: frames(cfg.min_speech_ms),
             release_frames: frames(cfg.min_silence_ms),
             max_frames: frames(cfg.max_speech_ms),
-            min_frames: frames(cfg.min_speech_ms),
+            min_voiced_frames: frames(cfg.min_speech_ms),
             pre_pad_frames: (cfg.pre_pad_ms as f32 / frame_ms).ceil() as usize,
             post_pad_frames: (cfg.post_pad_ms as f32 / frame_ms).ceil() as usize,
             leftover: Vec::new(),
             pre_buf: VecDeque::new(),
             utterance: Vec::new(),
-            voiced_run: 0,
+            voiced_frames: 0,
             unvoiced_run: 0,
             in_speech: false,
             ready: VecDeque::new(),
@@ -80,6 +79,11 @@ impl SpeechSegmenter {
     /// 当前噪声底（dBFS），仅能量型后端可用
     pub fn noise_floor_db(&mut self) -> Option<f32> {
         self.vad.noise_floor_db()
+    }
+
+    /// VAD 概率统计（仅 Silero 后端可用），用于调参观测
+    pub fn stats(&mut self) -> Option<VadStats> {
+        self.vad.stats()
     }
 
     /// 喂入任意长度的音频（单声道 f32）
@@ -102,6 +106,7 @@ impl SpeechSegmenter {
             self.utterance.extend_from_slice(frame);
 
             if speech {
+                self.voiced_frames += 1;
                 self.unvoiced_run = 0;
             } else {
                 self.unvoiced_run += 1;
@@ -124,17 +129,14 @@ impl SpeechSegmenter {
             }
 
             if speech {
-                self.voiced_run += 1;
-                if self.voiced_run >= self.attack_frames {
-                    // 确认开始：把 pre-roll 一并带上
-                    self.in_speech = true;
-                    self.utterance.clear();
-                    self.utterance.extend(self.pre_buf.iter().copied());
-                    self.pre_buf.clear();
-                    self.unvoiced_run = 0;
-                }
-            } else {
-                self.voiced_run = 0;
+                // 立即确认开始：不再要求连续 N 帧（抖动已由 VAD 后端的迟滞处理），
+                // 真正的短毛刺靠 min_voiced_frames 过滤
+                self.in_speech = true;
+                self.voiced_frames = 1;
+                self.unvoiced_run = 0;
+                self.utterance.clear();
+                self.utterance.extend(self.pre_buf.iter().copied());
+                self.pre_buf.clear();
             }
         }
     }
@@ -152,11 +154,12 @@ impl SpeechSegmenter {
             }
         }
 
-        if utt.len() >= self.min_frames as usize * self.frame_len {
+        if self.voiced_frames >= self.min_voiced_frames {
             let ms = utt.len() as u32 * 1000 / self.sample_rate.max(1);
             tracing::debug!(
-                "VAD segment: {} ms{}",
+                "VAD segment: {} ms ({} voiced frames){}",
                 ms,
+                self.voiced_frames,
                 if forced { " (forced cut)" } else { "" }
             );
             self.ready.push_back(utt);
@@ -165,11 +168,11 @@ impl SpeechSegmenter {
         if forced {
             // 仍在说话：立刻开启下一段，避免丢掉这段时间的音频
             self.in_speech = true;
-            self.voiced_run = self.attack_frames;
+            self.voiced_frames = 0;
             self.unvoiced_run = 0;
         } else {
             self.in_speech = false;
-            self.voiced_run = 0;
+            self.voiced_frames = 0;
             self.unvoiced_run = 0;
             self.pre_buf.clear();
         }
@@ -221,6 +224,23 @@ mod tests {
         let mut seg = segmenter(&cfg());
         seg.push(&tone(2000, 0.001));
         assert!(seg.pop().is_none(), "纯静音不应产生片段");
+    }
+
+    #[test]
+    fn drops_short_blip() {
+        let mut seg = segmenter(&cfg());
+
+        // 静音 -> 20ms 毛刺（1 帧，远短于 min_speech_ms=200ms）-> 静音
+        seg.push(&tone(500, 0.001));
+        seg.push(&tone(20, 0.3));
+        seg.push(&tone(800, 0.001));
+
+        let segments: Vec<_> = std::iter::from_fn(|| seg.pop()).collect();
+        assert!(
+            segments.is_empty(),
+            "短毛刺不应产生片段, got {}",
+            segments.len()
+        );
     }
 
     #[test]

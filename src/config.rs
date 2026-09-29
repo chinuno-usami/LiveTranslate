@@ -176,7 +176,7 @@ pub struct VadConfig {
     /// Silero 判为语音的概率阈值
     #[serde(default = "default_silero_threshold")]
     pub silero_threshold: f32,
-    /// 语音需持续多久才确认开始（也是最短片段长度）
+    /// 最短语音时长（短于此的片段被丢弃；起始不再要求连续这么多帧）
     #[serde(default = "default_vad_min_speech_ms")]
     pub min_speech_ms: u32,
     /// 静音需持续多久才确认说完
