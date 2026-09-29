@@ -15,5 +15,5 @@ Thumbs.db
 .vscode/
 *.swp
 
-# ONNX Runtime 运行期临时文件
-:memory:.ses
+# 运行期落盘的临时会话文件（如 SQLite 内存库产物）
+*.ses

@@ -197,7 +197,11 @@ fn bundled_library_candidates() -> Vec<PathBuf> {
 /// 若用户未显式指定，且程序目录里随包附带了 ONNX Runtime，则自动使用它
 ///
 /// 必须在调用任何 `ort` API 之前执行：`ort` 只在首次使用时读该环境变量。
-fn ensure_ort_library_env() {
+///
+/// 注意：本函数会写入进程级环境变量 `ORT_DYLIB_PATH`。
+/// 建议在创建任何线程/异步运行时**之前**调用一次
+/// （见 `detector::prepare_ort_library`），以规避多线程下并发读写环境变量的风险。
+pub fn ensure_ort_library_env() {
     if std::env::var("ORT_DYLIB_PATH")
         .map(|v| !v.trim().is_empty())
         .unwrap_or(false)

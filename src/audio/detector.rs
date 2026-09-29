@@ -69,7 +69,18 @@ impl VadEngine {
             }
         }
 
-        (Self::energy(config, sample_rate), None)
+        if requested.is_empty() || requested == "energy" {
+            return (Self::energy(config, sample_rate), None);
+        }
+
+        // 拼写错误等未知后端不应静默忽略，否则用户会以为已启用某个后端
+        (
+            Self::energy(config, sample_rate),
+            Some(format!(
+                "未知的 VAD 后端 `{}`，已回退到能量 VAD（可选: energy | silero）",
+                config.backend.trim()
+            )),
+        )
     }
 
     fn energy(config: &VadConfig, sample_rate: u32) -> Self {
@@ -108,5 +119,56 @@ impl VadEngine {
             #[cfg(feature = "silero-vad")]
             VadImpl::Silero(_) => None,
         }
+    }
+}
+
+/// 尽早探测并设置随包附带的 ONNX Runtime 路径
+///
+/// `ORT_DYLIB_PATH` 是进程级环境变量，且 `ort` 在首次使用时才读取它。
+/// 请在创建任何线程/异步运行时**之前**调用本函数（例如 `main` 开头），
+/// 避免在 worker 线程上执行 `std::env::set_var` 带来的并发风险。
+pub fn prepare_ort_library() {
+    #[cfg(feature = "silero-vad")]
+    crate::audio::silero::ensure_ort_library_env();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cfg_with_backend(backend: &str) -> VadConfig {
+        VadConfig {
+            backend: backend.to_string(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn energy_backend_has_no_warning() {
+        let (engine, warning) = VadEngine::from_config(&cfg_with_backend("energy"), 16_000);
+        assert_eq!(engine.backend(), "energy");
+        assert!(warning.is_none());
+    }
+
+    #[test]
+    fn empty_backend_defaults_to_energy_without_warning() {
+        let (engine, warning) = VadEngine::from_config(&cfg_with_backend(""), 16_000);
+        assert_eq!(engine.backend(), "energy");
+        assert!(warning.is_none());
+    }
+
+    #[test]
+    fn backend_match_is_case_insensitive() {
+        let (engine, warning) = VadEngine::from_config(&cfg_with_backend("  ENERGY  "), 16_000);
+        assert_eq!(engine.backend(), "energy");
+        assert!(warning.is_none());
+    }
+
+    #[test]
+    fn unknown_backend_falls_back_with_warning() {
+        let (engine, warning) = VadEngine::from_config(&cfg_with_backend("silerp"), 16_000);
+        assert_eq!(engine.backend(), "energy");
+        let warning = warning.expect("未知后端应给出提示，而不是静默忽略");
+        assert!(warning.contains("silerp"), "提示应包含原始值: {warning}");
     }
 }
