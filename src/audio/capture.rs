@@ -76,7 +76,14 @@ impl AudioCapture {
             mic_index += 1;
         }
 
-        // 输出设备 => 回环源（仅 Windows WASAPI 支持透明 loopback）
+        // 输出设备 => 回环源
+        //
+        // 仅 Windows WASAPI 支持“把输出设备当输入打开”的透明 loopback。
+        //
+        // 注意：不能拿 `default_input_config()` 当过滤条件！
+        // cpal 的 WASAPI 后端里，该方法只对采集设备（eCapture）返回 Ok，
+        // 对渲染设备（eRender）一律返回 UnsupportedOperation，
+        // 而回环用的恰恰是渲染设备——之前因此把回环选项全部滤掉了。
         if cfg!(target_os = "windows") {
             if let Ok(output_devices) = host.output_devices() {
                 let mut loop_index = 0;
@@ -86,15 +93,17 @@ impl AudioCapture {
                         .map(|d| d.name().to_string())
                         .unwrap_or_else(|_| format!("Output Device {}", loop_index));
 
-                    // 只有能作为输入打开的输出设备才可用于 loopback
-                    if device.default_input_config().is_ok() {
-                        devices.push(DeviceInfo {
-                            index: loop_index,
-                            name,
-                            kind: DeviceKind::Loopback,
-                        });
-                        loop_index += 1;
+                    // 仅作诊断记录，不作为过滤条件
+                    if let Err(e) = device.default_output_config() {
+                        tracing::debug!("Loopback 候选 `{}` 输出格式探测失败（仍列出）: {}", name, e);
                     }
+
+                    devices.push(DeviceInfo {
+                        index: loop_index,
+                        name,
+                        kind: DeviceKind::Loopback,
+                    });
+                    loop_index += 1;
                 }
             }
         }
@@ -121,7 +130,7 @@ impl AudioCapture {
     /// - `loopback:<n>`     : 第 n 个回环设备
     /// - `<n>`              : 合并列表中的第 n 个设备
     /// - 其它字符串         : 按设备名模糊匹配
-    pub fn resolve_device(spec: &str) -> AppResult<cpal::Device> {
+    pub fn resolve_device(spec: &str) -> AppResult<(cpal::Device, DeviceKind)> {
         let host = cpal::default_host();
         let spec = spec.trim();
         let spec_lower = spec.to_lowercase();
@@ -129,6 +138,7 @@ impl AudioCapture {
         if spec.is_empty() || spec_lower == "default" {
             return host
                 .default_input_device()
+                .map(|device| (device, DeviceKind::Microphone))
                 .ok_or(AppError::Audio("No default input device found".to_string()));
         }
 
@@ -166,7 +176,7 @@ impl AudioCapture {
             for device in iter {
                 if let Ok(desc) = device.description() {
                     if desc.name().to_lowercase().contains(&spec_lower) {
-                        return Ok(device);
+                        return Ok((device, DeviceKind::Microphone));
                     }
                 }
             }
@@ -175,10 +185,8 @@ impl AudioCapture {
             if let Ok(iter) = host.output_devices() {
                 for device in iter {
                     if let Ok(desc) = device.description() {
-                        if desc.name().to_lowercase().contains(&spec_lower)
-                            && device.default_input_config().is_ok()
-                        {
-                            return Ok(device);
+                        if desc.name().to_lowercase().contains(&spec_lower) {
+                            return Ok((device, DeviceKind::Loopback));
                         }
                     }
                 }
@@ -188,7 +196,10 @@ impl AudioCapture {
         Err(AppError::DeviceNotFound(spec.to_string()))
     }
 
-    fn nth_input_device(host: &cpal::Host, want_index: usize) -> AppResult<cpal::Device> {
+    fn nth_input_device(
+        host: &cpal::Host,
+        want_index: usize,
+    ) -> AppResult<(cpal::Device, DeviceKind)> {
         let mut idx = 0;
         for device in host
             .input_devices()
@@ -196,7 +207,7 @@ impl AudioCapture {
         {
             if device.default_input_config().is_ok() {
                 if idx == want_index {
-                    return Ok(device);
+                    return Ok((device, DeviceKind::Microphone));
                 }
                 idx += 1;
             }
@@ -207,18 +218,21 @@ impl AudioCapture {
         )))
     }
 
-    fn nth_output_device(host: &cpal::Host, want_index: usize) -> AppResult<cpal::Device> {
-        let mut idx = 0;
-        for device in host
+    /// 取第 N 个输出设备作为回环源
+    ///
+    /// 这里不能像输入设备那样用 `default_input_config()` 筛选：
+    /// WASAPI 下渲染设备的该调用恒定失败，会把所有回环设备排除掉。
+    fn nth_output_device(
+        host: &cpal::Host,
+        want_index: usize,
+    ) -> AppResult<(cpal::Device, DeviceKind)> {
+        for (idx, device) in host
             .output_devices()
             .map_err(|e| AppError::CpalDevices(format!("Failed to enumerate output devices: {}", e)))?
+            .enumerate()
         {
-            // 仅接受能作为输入打开的输出设备（loopback）
-            if device.default_input_config().is_ok() {
-                if idx == want_index {
-                    return Ok(device);
-                }
-                idx += 1;
+            if idx == want_index {
+                return Ok((device, DeviceKind::Loopback));
             }
         }
         Err(AppError::Audio(format!(
@@ -232,17 +246,32 @@ impl AudioCapture {
     /// 使用设备原生配置打开，回调中下混为单声道。
     /// 后续在消费端按需重采样到 Whisper 期望的采样率。
     pub async fn new(device_name: &str, _sample_rate: u32, _channels: u16) -> AppResult<Self> {
-        let device = Self::resolve_device(device_name)?;
+        let (device, kind) = Self::resolve_device(device_name)?;
 
         let device_label = device
             .description()
             .map(|d| d.name().to_string())
             .unwrap_or_else(|_| "Unknown Device".to_string());
 
-        tracing::info!("Opening audio device: '{}'", device_label);
+        tracing::info!(
+            "Opening audio device: '{}' ({})",
+            device_label,
+            match kind {
+                DeviceKind::Microphone => "microphone",
+                DeviceKind::Loopback => "loopback",
+            }
+        );
 
-        let supported = device.default_input_config().map_err(|e| {
-            AppError::CpalBuildStream(format!("Failed to get default input config: {}", e))
+        // 回环设备的配置必须取自「输出」格式：
+        // WASAPI 下渲染设备的 default_input_config() 恒定返回 UnsupportedOperation。
+        // 取到输出混音格式后交给 build_input_stream，
+        // cpal 会自动为渲染设备加上 AUDCLNT_STREAMFLAGS_LOOPBACK。
+        let supported = match kind {
+            DeviceKind::Microphone => device.default_input_config(),
+            DeviceKind::Loopback => device.default_output_config(),
+        }
+        .map_err(|e| {
+            AppError::CpalBuildStream(format!("Failed to get default config for {device_label}: {e}"))
         })?;
 
         let sample_format = supported.sample_format();
