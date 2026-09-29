@@ -357,7 +357,11 @@ silero_threshold = 0.5     # 调大更保守（更不容易误触），调小更
 export ORT_DYLIB_PATH=/path/to/libonnxruntime.dylib
 ```
 
-模型（Silero VAD v5，MIT 许可）已内嵌在二进制里，无需另外下载。
+模型（Silero VAD v6.2，MIT 许可）已内嵌在二进制里，无需另外下载。
+
+> 注意：v6.2 模型每次推理的输入是 `64 样本 context + 512 新样本 = 576`（8kHz 为 `32 + 256 = 288`），
+> context 取上一帧模型输入的最后 64/32 个样本逐帧滚动，`src/audio/silero.rs` 已处理。
+> 若忽略 context、直接喂 512，模型会退化为恒输出 ~0 的概率，表现为“有人说话也检测不到”。
 
 > **为什么不直接静态链接？** 试过了，不可行：ONNX Runtime 官方发行包
 > 基本只提供动态库，而 `ort-sys` 的静态/xcframework 链接路径**只支持 iOS**，

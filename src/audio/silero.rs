@@ -3,7 +3,7 @@
 //! 相比内置的能量 VAD，Silero 是训练出来的语音分类模型，
 //! 能区分「音乐 / 噪声」与「人声」，也能在低信噪比下工作。
 //!
-//! 模型为 Silero VAD v5（MIT 许可），已内嵌进二进制；
+//! 模型为 Silero VAD v6.2（MIT 许可），已内嵌进二进制；
 //! 也可通过 `[vad] silero_model` 指定外部模型文件。
 //!
 //! 运行期需要 ONNX Runtime 动态库（`onnxruntime`）：
@@ -17,11 +17,19 @@ use std::path::PathBuf;
 
 use crate::error::{AppError, AppResult};
 
-/// 内嵌的 Silero VAD v5 模型（models/silero_vad.onnx）
+/// 内嵌的 Silero VAD v6.2 模型（models/silero_vad.onnx）
 const EMBEDDED_MODEL: &[u8] = include_bytes!("../../models/silero_vad.onnx");
 
 /// LSTM 隐状态维度（模型固定值）
 const STATE_DIM: usize = 128;
+
+/// Silero v6.2 需要把上一帧末尾的 context 拼到本帧前面再送入 ONNX。
+///
+/// 16kHz：context 64 + 新样本 512 = 模型输入 576；
+/// 缺少 context 时模型输出会退化成恒 ~0 的概率（有人说话也检测不到）。
+const CONTEXT_LEN_16K: usize = 64;
+/// 8kHz：context 32 + 新样本 256 = 模型输入 288
+const CONTEXT_LEN_8K: usize = 32;
 
 /// 各平台 ONNX Runtime 动态库文件名
 #[cfg(target_os = "windows")]
@@ -35,19 +43,38 @@ pub struct SileroVad {
     session: Session,
     /// LSTM 状态 [2, 1, 128]
     state: Vec<f32>,
+    /// 上一帧末尾的上下文样本（16k 为 64，8k 为 32）
+    context: Vec<f32>,
     /// 未凑满一帧的剩余样本
     buffer: Vec<f32>,
+    /// 每步新增的样本数（16k 为 512，8k 为 256）
     frame_len: usize,
+    /// 送入模型前拼接的上下文样本数（见 [`CONTEXT_LEN_16K`] / [`CONTEXT_LEN_8K`]）
+    context_len: usize,
     sample_rate: i64,
     threshold: f32,
 }
 
 impl SileroVad {
-    /// 模型在 16kHz 下要求每次 512 个样本，8kHz 下 256 个
+    /// 每步新增的样本数（16k 为 512，8k 为 256）
+    ///
+    /// 注意：这不是模型的实际输入长度——实际输入还要再拼上 `context_len`
+    /// 个历史样本（见 [`Self::context_len_for`]）。
     pub fn frame_len_for(sample_rate: u32) -> AppResult<usize> {
         match sample_rate {
             16_000 => Ok(512),
             8_000 => Ok(256),
+            other => Err(AppError::Audio(format!(
+                "Silero VAD 仅支持 8kHz / 16kHz 采样率，当前配置为 {other} Hz"
+            ))),
+        }
+    }
+
+    /// 送入模型前需要拼接的 context 样本数：16k 为 64，8k 为 32
+    fn context_len_for(sample_rate: u32) -> AppResult<usize> {
+        match sample_rate {
+            16_000 => Ok(CONTEXT_LEN_16K),
+            8_000 => Ok(CONTEXT_LEN_8K),
             other => Err(AppError::Audio(format!(
                 "Silero VAD 仅支持 8kHz / 16kHz 采样率，当前配置为 {other} Hz"
             ))),
@@ -87,6 +114,7 @@ impl SileroVad {
 
     fn create(config: &crate::config::VadConfig, sample_rate: u32) -> AppResult<Self> {
         let frame_len = Self::frame_len_for(sample_rate)?;
+        let context_len = Self::context_len_for(sample_rate)?;
 
         let model_path = config
             .silero_model
@@ -94,17 +122,35 @@ impl SileroVad {
             .map(str::trim)
             .filter(|p| !p.is_empty());
 
-        let session = match model_path {
-            Some(path) => Session::builder()
-                .and_then(|mut builder| builder.commit_from_file(path))
-                .map_err(|e| AppError::Audio(format!("加载 Silero 模型 `{path}` 失败: {e}")))?,
-            None => Session::builder()
-                .and_then(|mut builder| builder.commit_from_memory(EMBEDDED_MODEL))
-                .map_err(|e| AppError::Audio(format!("加载内置 Silero 模型失败: {e}")))?,
+        // Silero 模型极小，默认让 ORT 把每次推理 fan-out 到所有核心会带来
+        // 大量线程调度 / spin 开销（实测 CPU 可达单线程的 3~4 倍），
+        // 而单线程的墙钟耗时几乎一样，因此这里固定为单线程。
+        let build_cpu_session = |path: Option<&str>| -> AppResult<Session> {
+            let builder = Session::builder()
+                .map_err(|e| AppError::Audio(format!("创建 ONNX Runtime SessionBuilder 失败: {e}")))?;
+            let builder = builder
+                .with_intra_threads(1)
+                .map_err(|e| AppError::Audio(format!("设置 intra 线程数失败: {e}")))?;
+            let mut builder = builder
+                .with_inter_threads(1)
+                .map_err(|e| AppError::Audio(format!("设置 inter 线程数失败: {e}")))?;
+
+            match path {
+                Some(path) => builder
+                    .commit_from_file(path)
+                    .map_err(|e| AppError::Audio(format!("加载 Silero 模型 `{path}` 失败: {e}"))),
+                None => builder
+                    .commit_from_memory(EMBEDDED_MODEL)
+                    .map_err(|e| AppError::Audio(format!("加载内置 Silero 模型失败: {e}"))),
+            }
         };
 
+        let session = build_cpu_session(model_path)?;
+
         tracing::info!(
-            "Silero VAD 已加载 (frame={} samples @ {}Hz, threshold={})",
+            "Silero VAD 已加载 (input={} samples = {} context + {} new @ {}Hz, threshold={})",
+            context_len + frame_len,
+            context_len,
             frame_len,
             sample_rate,
             config.silero_threshold
@@ -113,8 +159,10 @@ impl SileroVad {
         Ok(Self {
             session,
             state: vec![0.0; 2 * STATE_DIM],
+            context: vec![0.0; context_len],
             buffer: Vec::with_capacity(frame_len * 2),
             frame_len,
+            context_len,
             sample_rate: sample_rate as i64,
             threshold: config.silero_threshold,
         })
@@ -147,7 +195,14 @@ impl SileroVad {
     }
 
     fn infer(&mut self, chunk: &[f32]) -> AppResult<f32> {
-        let input = Tensor::from_array(([1usize, self.frame_len], chunk.to_vec()))
+        // Silero v6.2 的 ONNX 输入 = 上一帧末尾的 context ++ 本帧新样本。
+        // 少了 context，模型会退化成恒输出 ~0 的概率（有人说话也测不到）。
+        let mut input = Vec::with_capacity(self.context_len + self.frame_len);
+        input.extend_from_slice(&self.context);
+        input.extend_from_slice(chunk);
+        let input_len = input.len();
+
+        let input_tensor = Tensor::from_array(([1usize, input_len], input.clone()))
             .map_err(|e| AppError::Audio(format!("构造输入张量失败: {e}")))?;
         let state = Tensor::from_array(([2usize, 1usize, STATE_DIM], self.state.clone()))
             .map_err(|e| AppError::Audio(format!("构造状态张量失败: {e}")))?;
@@ -157,7 +212,7 @@ impl SileroVad {
 
         let outputs = self
             .session
-            .run(ort::inputs![input, state, sample_rate])
+            .run(ort::inputs![input_tensor, state, sample_rate])
             .map_err(|e| AppError::Audio(format!("Silero 推理失败: {e}")))?;
 
         let probability = outputs[0]
@@ -175,11 +230,16 @@ impl SileroVad {
             }
         }
 
+        // context = 本次模型输入的最后 context_len 个样本
+        self.context
+            .copy_from_slice(&input[input_len - self.context_len..]);
+
         Ok(probability)
     }
 
     pub fn reset(&mut self) {
         self.state.iter_mut().for_each(|v| *v = 0.0);
+        self.context.iter_mut().for_each(|v| *v = 0.0);
         self.buffer.clear();
     }
 }
@@ -331,19 +391,21 @@ mod tests {
             return;
         };
 
-        // 由 ONNX Runtime 1.30 跑同一模型 + 同一输入得到
+        // 由 ONNX Runtime 1.30 跑同一模型 + 同一输入（含 context）得到。
+        // 注意：这些值只有在正确拼接 64 样本 context 时才成立；
+        // 旧实现喂 512 无 context，概率会退化成 ~0.001，这里会直接失败。
         let expected = [
-            0.0013514161f32,
-            0.0009435713,
-            0.0009604394,
-            0.0009388328,
-            0.0009409189,
+            0.0176422f32,
+            0.0080044,
+            0.0057910,
+            0.0046635,
+            0.0036013,
         ];
 
         for (i, want) in expected.iter().enumerate() {
             let got = vad.infer(&frame(i)).expect("推理失败");
             assert!(
-                (got - want).abs() < 1e-6,
+                (got - want).abs() < 1e-5,
                 "第 {i} 帧概率与参考不一致: got={got}, want={want}"
             );
         }
@@ -351,9 +413,33 @@ mod tests {
         // LSTM 状态也应一致，说明状态确实被正确传递
         let sum: f32 = vad.state.iter().sum();
         assert!(
-            (sum - 21.05366898).abs() < 1e-2,
-            "LSTM 状态和与参考不一致: got={sum}, want≈21.05366898"
+            (sum - 1.1207).abs() < 1e-2,
+            "LSTM 状态和与参考不一致: got={sum}, want≈1.1207"
         );
+    }
+
+    /// 回归：context 必须逐帧滚动更新，否则模型输入退化为 512 → 概率恒 ~0
+    #[test]
+    fn context_is_carried_between_frames() {
+        let Some(mut vad) = test_vad() else {
+            return;
+        };
+
+        assert_eq!(vad.context_len, 64, "16kHz 的 context 应为 64 样本");
+
+        // 第一帧：context 仍为全零，推理后应变成 frame(0) 的末 64 个样本
+        let first = frame(0);
+        vad.infer(&first).expect("推理失败");
+        assert_eq!(&vad.context[..], &first[first.len() - 64..]);
+
+        // 第二帧：推理后 context 应为 frame(1) 的末 64 个样本
+        let second = frame(1);
+        vad.infer(&second).expect("推理失败");
+        assert_eq!(&vad.context[..], &second[second.len() - 64..]);
+
+        // reset 必须清空 context
+        vad.reset();
+        assert!(vad.context.iter().all(|&v| v == 0.0));
     }
 
     #[test]
@@ -362,13 +448,13 @@ mod tests {
             return;
         };
 
-        // 该输入参考概率约 0.0014，阈值高于它应判为非语音
+        // 该输入参考概率约 0.0176，阈值高于它应判为非语音
         vad.reset();
         vad.threshold = 0.5;
         assert!(!vad.is_speech(&frame(0)));
 
         vad.reset();
-        vad.threshold = 0.0005;
+        vad.threshold = 0.001;
         assert!(vad.is_speech(&frame(0)));
     }
 
@@ -395,6 +481,18 @@ mod tests {
         assert_eq!(SileroVad::frame_len_for(16_000).unwrap(), 512);
         assert_eq!(SileroVad::frame_len_for(8_000).unwrap(), 256);
         assert!(SileroVad::frame_len_for(44_100).is_err());
+    }
+
+    #[test]
+    fn context_len_matches_sample_rate() {
+        assert_eq!(SileroVad::context_len_for(16_000).unwrap(), 64);
+        assert_eq!(SileroVad::context_len_for(8_000).unwrap(), 32);
+        assert!(SileroVad::context_len_for(44_100).is_err());
+        // 8kHz 的实际模型输入应为 32 + 256 = 288
+        assert_eq!(
+            SileroVad::context_len_for(8_000).unwrap() + SileroVad::frame_len_for(8_000).unwrap(),
+            288
+        );
     }
 
     #[test]
