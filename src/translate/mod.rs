@@ -122,6 +122,8 @@ impl OpenAiClient {
         let body = self.build_body(text);
         tracing::debug!("Sending translation request to: {} body={}", url, body);
 
+        let started = std::time::Instant::now();
+
         let response = self
             .client
             .post(&url)
@@ -164,7 +166,25 @@ impl OpenAiClient {
             )));
         }
 
-        tracing::info!("Translated: {} -> {}", text, translated);
+        // 耗时是判断“思考是否已关掉”的最直接依据：
+        // 短句翻译正常应当在几百毫秒级，数秒以上基本就是模型在思考。
+        let elapsed = started.elapsed();
+        tracing::info!(
+            "Translated in {} ms: {} -> {}",
+            elapsed.as_millis(),
+            text,
+            translated
+        );
+
+        if elapsed.as_secs_f32() >= 3.0 && self.config.disable_thinking.trim().is_empty() {
+            tracing::warn!(
+                "翻译耗时 {:.1}s，疑似模型在思考。实时字幕建议：\n  \
+                 1) 改用非思考模型（如 DeepSeek 用 deepseek-chat 而非 deepseek-reasoner）；\n  \
+                 2) 或设置 translate.disable_thinking（reasoning_effort / enable_thinking / chat_template）；\n  \
+                 3) 或设 translate.extra_body 传入该服务对应的关闭字段",
+                elapsed.as_secs_f32()
+            );
+        }
 
         Ok(translated)
     }
