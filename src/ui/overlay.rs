@@ -46,6 +46,18 @@ pub struct DevicesPayload {
     pub current: String,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct LanguageOptionPayload {
+    pub code: String,
+    pub label: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct LanguagesPayload {
+    pub options: Vec<LanguageOptionPayload>,
+    pub current: String,
+}
+
 impl From<&SubtitleConfig> for OverlayConfigPayload {
     fn from(value: &SubtitleConfig) -> Self {
         Self {

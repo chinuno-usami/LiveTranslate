@@ -40,9 +40,22 @@ impl WhisperClient {
     }
 
     /// 识别一段单声道音频
-    pub async fn transcribe(&self, samples: &[f32], sample_rate: u32) -> AppResult<String> {
+    ///
+    /// `language` 为 ISO-639-1 语言码（如 `zh`）或 `auto`；
+    /// 面板上切换语言后会立即用新值发起请求。
+    pub async fn transcribe(
+        &self,
+        samples: &[f32],
+        sample_rate: u32,
+        language: &str,
+    ) -> AppResult<String> {
         let url = self.endpoint();
         let audio_data = wav::encode_wav(samples, sample_rate, 1)?;
+        let language = if language.trim().is_empty() {
+            "auto"
+        } else {
+            language.trim()
+        };
 
         tracing::debug!(
             "Sending audio to ASR: {} ({} bytes, {} samples)",
@@ -57,7 +70,7 @@ impl WhisperClient {
                 reqwest::multipart::Part::bytes(audio_data).file_name("audio.wav"),
             )
             .text("model", self.config.model.clone())
-            .text("language", self.config.language.clone());
+            .text("language", language.to_string());
 
         let mut request = self
             .client

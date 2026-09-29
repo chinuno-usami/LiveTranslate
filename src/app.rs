@@ -1,4 +1,4 @@
-use crate::asr::AsrEngine;
+use crate::asr::{languages, AsrEngine};
 use crate::audio::chunker::AudioChunker;
 use crate::audio::detector::VadEngine;
 use crate::audio::resample::LinearResampler;
@@ -71,8 +71,18 @@ pub async fn start_console(config: AppConfig) -> AppResult<()> {
     let (tx, mut rx) = mpsc::channel(128);
     let (_stop_tx, stop_rx) = watch::channel(false);
 
+    // 控制台模式没有面板，语言直接取自配置（两个后端字段不同）
+    let configured_language = if languages::is_edge_backend(&config.asr.backend) {
+        config.asr.edge.language.clone()
+    } else {
+        config.asr.language.clone()
+    };
+    let initial_language =
+        languages::normalize_for_backend(&config.asr.backend, &configured_language);
+    let (_language_tx, language_rx) = watch::channel(initial_language);
+
     tokio::spawn(async move {
-        if let Err(e) = run_pipeline(config, tx, stop_rx).await {
+        if let Err(e) = run_pipeline(config, tx, stop_rx, language_rx).await {
             tracing::error!("Audio processing error: {}", e);
         }
     });
@@ -173,6 +183,7 @@ pub async fn run_pipeline(
     config: AppConfig,
     tx: mpsc::Sender<PipelineEvent>,
     mut stop_rx: watch::Receiver<bool>,
+    language_rx: watch::Receiver<String>,
 ) -> AppResult<()> {
     tracing::info!("Starting audio pipeline");
 
@@ -240,11 +251,12 @@ pub async fn run_pipeline(
         )?))
     };
 
-    let asr_engine = AsrEngine::from_config(&config.asr)?;
+    let asr_engine = AsrEngine::from_config(&config.asr, language_rx)?;
     tracing::info!(
-        "ASR backend: {} ({})",
+        "ASR backend: {} ({}) language={}",
         asr_engine.name(),
-        asr_engine.endpoint()
+        asr_engine.endpoint(),
+        asr_engine.language()
     );
 
     // 把识别/翻译放到独立任务里：

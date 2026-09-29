@@ -11,6 +11,7 @@ const els = {
   emptyState: document.getElementById('empty-state'),
   subtitleLines: document.getElementById('subtitle-lines'),
   deviceSelect: document.getElementById('device-select'),
+  languageSelect: document.getElementById('language-select'),
   fontSlider: document.getElementById('font-slider'),
   fontSizeValue: document.getElementById('font-size-value'),
   sourceToggle: document.getElementById('source-toggle'),
@@ -214,6 +215,35 @@ async function loadDevices() {
   }
 }
 
+/// 加载识别语言候选（随 ASR 后端不同，语言码格式也不同）
+async function loadLanguages() {
+  try {
+    const payload = await invoke('list_languages');
+    const options = payload.options || [];
+    els.languageSelect.innerHTML = '';
+
+    if (options.length === 0) {
+      const opt = document.createElement('option');
+      opt.value = payload.current || '';
+      opt.textContent = payload.current || '未知';
+      els.languageSelect.appendChild(opt);
+      return;
+    }
+
+    for (const item of options) {
+      const opt = document.createElement('option');
+      opt.value = item.code;
+      opt.textContent = item.label;
+      if (item.code === payload.current) {
+        opt.selected = true;
+      }
+      els.languageSelect.appendChild(opt);
+    }
+  } catch (error) {
+    console.error('加载识别语言失败', error);
+  }
+}
+
 async function bindActions() {
   els.startBtn.addEventListener('click', async () => {
     await invoke('start_capture');
@@ -237,6 +267,17 @@ async function bindActions() {
     } catch (error) {
       console.error('切换设备失败', error);
       setStatus(false, `切换设备失败: ${error}`);
+    }
+  });
+
+  // 识别语言：切换后立即生效，无需重启
+  els.languageSelect.addEventListener('change', async () => {
+    const code = els.languageSelect.value;
+    try {
+      await invoke('set_language', { code });
+    } catch (error) {
+      console.error('切换语言失败', error);
+      setStatus(false, `切换语言失败: ${error}`);
     }
   });
 
@@ -389,7 +430,7 @@ window.addEventListener('DOMContentLoaded', async () => {
     console.error('bindEvents 失败', error);
   }
 
-  for (const step of [loadInitialConfig, loadInitialStatus, loadDevices]) {
+  for (const step of [loadInitialConfig, loadInitialStatus, loadDevices, loadLanguages]) {
     try {
       await step();
     } catch (error) {

@@ -87,12 +87,43 @@ fn default_edge_timeout_secs() -> u64 {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TranslateConfig {    pub base_url: String,
+pub struct TranslateConfig {
+    pub base_url: String,
     pub api_key: String,
     pub model: String,
     pub target_language: String,
     pub system_prompt: String,
     pub timeout_secs: u64,
+    /// 是否在请求里带上 `temperature`
+    ///
+    /// 部分推理模型（如 OpenAI o 系列）不接受该字段，
+    /// 遇到 400 时可以关掉。
+    #[serde(default = "default_true")]
+    pub send_temperature: bool,
+    /// 采样温度（仅 `send_temperature = true` 时发送）
+    #[serde(default = "default_translate_temperature")]
+    pub temperature: f32,
+    /// 关闭推理模型“思考”的策略，空字符串表示不处理
+    ///
+    /// - `"reasoning_effort"`：发送 `reasoning_effort = "minimal"`
+    ///   （OpenAI o 系列 / gpt-5 等）
+    /// - `"enable_thinking"`：发送 `enable_thinking = false`（Qwen3 等）
+    /// - `"chat_template"`：发送
+    ///   `chat_template_kwargs = { enable_thinking = false }`
+    ///   （vLLM / SGLang 部署的 Qwen3 等）
+    ///
+    /// 思考会让翻译首字延迟大幅上升，实时字幕场景通常应当关闭。
+    #[serde(default)]
+    pub disable_thinking: String,
+    /// 追加到请求体的自定义字段（最高优先级，会覆盖上面的预设）
+    ///
+    /// 各家关闭思考的字段名不统一，这里留一个通用口子。例如：
+    /// ```toml
+    /// [translate.extra_body]
+    /// reasoning_effort = "none"
+    /// ```
+    #[serde(default)]
+    pub extra_body: Option<toml::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -183,6 +214,9 @@ fn default_vad_backend() -> String {
 }
 fn default_silero_threshold() -> f32 {
     VadConfig::default().silero_threshold
+}
+fn default_translate_temperature() -> f32 {
+    0.2
 }
 fn default_vad_margin_db() -> f32 {
     VadConfig::default().margin_db
@@ -409,6 +443,10 @@ impl Default for AppConfig {
                 target_language: "zh-CN".to_string(),
                 system_prompt: "You are a real-time subtitle translator. Translate naturally and concisely.".to_string(),
                 timeout_secs: 20,
+                send_temperature: true,
+                temperature: 0.2,
+                disable_thinking: String::new(),
+                extra_body: None,
             },
             subtitle: SubtitleConfig {
                 max_lines: 3,

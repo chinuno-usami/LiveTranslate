@@ -170,6 +170,7 @@ click_through = false
 |------|------|
 | 状态灯 + 文本 | 显示运行状态 / 错误提示 |
 | 设备下拉框 | 切换音频输入设备（运行中会自动重启流水线） |
+| **语言下拉框** | 选择识别语言，**切换后立即生效**（无需重启）；候选随 ASR 后端变化 |
 | **字号滑块** | 实时调整字幕文字大小（12–72），松手后写回配置文件 |
 | **原文开关** | 切换是否在译文上方显示原文，立即重绘当前字幕 |
 | 开始 / 停止 | 控制采集 |
@@ -189,6 +190,37 @@ click_through = false
 > 按住浮窗任意空白处可拖动窗口。
 > 字号与原文开关的修改会**就地写入配置文件并保留原有注释**；
 > 窗口位置目前仅本次运行有效，重启后仍以配置中的 `position_x/position_y` 为准。
+
+### 关闭推理模型的思考
+
+推理模型（o 系列 / gpt-5 / Qwen3 思考模式等）在回答前会先“想”一大段，
+首字延迟可能到数秒甚至十几秒——实时字幕场景基本不可接受。
+
+各家关闭思考的字段名不统一，本项目提供了预设 + 通用口子：
+
+```toml
+[translate]
+# 三选一（空字符串 = 不处理）
+disable_thinking = "reasoning_effort"   # → reasoning_effort = "minimal"
+# disable_thinking = "enable_thinking"  # → enable_thinking = false
+disable_thinking = "chat_template"      # → chat_template_kwargs.enable_thinking = false
+
+# 预设不够用？extra_body 会原样合并进请求体（优先级最高）
+[translate.extra_body]
+reasoning_effort = "none"
+```
+
+| 服务 | 推荐取值 |
+|------|----------|
+| OpenAI o 系列 / gpt-5 | `"reasoning_effort"` |
+| Qwen3（官方 API） | `"enable_thinking"` |
+| Qwen3（vLLM / SGLang 部署） | `"chat_template"` |
+| 其他 OpenAI 兼容服务 | 优先看它的文档，用 `extra_body` 写 |
+
+**双重保障**：即使没能通过请求参数关掉，程序也会把响应里的思考块剥掉，
+不会把“思考过程”当字幕显示。
+
+> 部分推理模型不接受 `temperature` 字段，遇到 400 时设 `send_temperature = false`。
 
 ## 语音识别后端
 

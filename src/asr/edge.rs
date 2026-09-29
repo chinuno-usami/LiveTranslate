@@ -108,13 +108,31 @@ impl EdgeAsrClient {
     }
 
     /// 识别一段单声道音频
-    pub async fn transcribe(&self, samples: &[f32], sample_rate: u32) -> AppResult<String> {
+    ///
+    /// `language` 为 BCP-47 标签（如 `en-US`）；面板切换后立即生效。
+    /// 传入空值时回退到配置中的语言。
+    pub async fn transcribe(
+        &self,
+        samples: &[f32],
+        sample_rate: u32,
+        language: &str,
+    ) -> AppResult<String> {
         if samples.is_empty() {
             return Ok(String::new());
         }
 
+        let language = if language.trim().is_empty() {
+            self.language.clone()
+        } else {
+            language.trim().to_string()
+        };
+
         let started = Instant::now();
-        match tokio::time::timeout(self.timeout, self.transcribe_inner(samples, sample_rate)).await
+        match tokio::time::timeout(
+            self.timeout,
+            self.transcribe_inner(samples, sample_rate, &language),
+        )
+        .await
         {
             Ok(result) => {
                 tracing::debug!("Edge ASR turn took {:?}", started.elapsed());
@@ -127,8 +145,13 @@ impl EdgeAsrClient {
         }
     }
 
-    async fn transcribe_inner(&self, samples: &[f32], sample_rate: u32) -> AppResult<String> {
-        let url = self.build_url();
+    async fn transcribe_inner(
+        &self,
+        samples: &[f32],
+        sample_rate: u32,
+        language: &str,
+    ) -> AppResult<String> {
+        let url = self.build_url(language);
         tracing::debug!("Connecting Edge ASR: {}", url);
 
         let mut request = url
@@ -280,7 +303,7 @@ impl EdgeAsrClient {
         Ok(text)
     }
 
-    fn build_url(&self) -> String {
+    fn build_url(&self, language: &str) -> String {
         let gec = generate_sec_ms_gec(&self.identity.token);
         format!(
             "wss://{SPEECH_HOST}{RECOGNITION_PATH}\
@@ -288,7 +311,6 @@ impl EdgeAsrClient {
              &Sec-MS-GEC-Version={version}&language={language}&profanity=raw",
             token = self.identity.token,
             version = self.identity.sec_ms_gec_version(),
-            language = self.language,
         )
     }
 }

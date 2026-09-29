@@ -81,6 +81,8 @@ pub(crate) struct SharedState {
     font_size: AtomicU32,
     /// 是否显示原文
     show_source: AtomicBool,
+    /// 识别语言（面板改动可实时生效，无需重启流水线）
+    language_tx: watch::Sender<String>,
 }
 
 impl SharedState {
@@ -95,6 +97,16 @@ impl SharedState {
         let font_size = config.subtitle.font_size;
         let show_source = config.subtitle.show_source;
 
+        // 两个后端的语言字段不同，先取出再按后端归一化
+        let configured_language = if asr::languages::is_edge_backend(&config.asr.backend) {
+            config.asr.edge.language.clone()
+        } else {
+            config.asr.language.clone()
+        };
+        let language =
+            asr::languages::normalize_for_backend(&config.asr.backend, &configured_language);
+        let (language_tx, _) = watch::channel(language);
+
         Self {
             config,
             config_path,
@@ -104,6 +116,7 @@ impl SharedState {
             click_through: AtomicBool::new(click_through),
             font_size: AtomicU32::new(font_size),
             show_source: AtomicBool::new(show_source),
+            language_tx,
         }
     }
 }
@@ -190,6 +203,55 @@ async fn set_show_source(
         "show_source",
         &enabled.to_string(),
     );
+    Ok(())
+}
+
+/// 面板上的识别语言候选（按当前后端给出不同的语言码格式）
+#[tauri::command]
+async fn list_languages(
+    state: State<'_, Arc<SharedState>>,
+) -> Result<ui::LanguagesPayload, String> {
+    let backend = state.config.asr.backend.clone();
+    let current = state.language_tx.borrow().clone();
+
+    Ok(ui::LanguagesPayload {
+        options: asr::languages::options_for_backend(&backend)
+            .into_iter()
+            .map(|item| ui::LanguageOptionPayload {
+                code: item.code,
+                label: item.label,
+            })
+            .collect(),
+        current,
+    })
+}
+
+/// 切换识别语言（立即生效，并写回配置文件）
+#[tauri::command]
+async fn set_language(
+    state: State<'_, Arc<SharedState>>,
+    code: String,
+) -> Result<(), String> {
+    let backend = state.config.asr.backend.clone();
+    let normalized = asr::languages::normalize_for_backend(&backend, &code);
+
+    // watch::Sender::send 仅在“无接收者”时失败，不影响设置本身
+    let _ = state.language_tx.send(normalized.clone());
+
+    // 两个后端的语言字段位置不同
+    let (section, key) = if asr::languages::is_edge_backend(&backend) {
+        ("asr.edge", "language")
+    } else {
+        ("asr", "language")
+    };
+    persist_setting(
+        state.config_path.as_ref(),
+        section,
+        key,
+        &format!("\"{}\"", normalized.replace('"', "")),
+    );
+
+    tracing::info!("ASR language set to: {}", normalized);
     Ok(())
 }
 
@@ -314,6 +376,8 @@ async fn start_capture_impl(app: AppHandle, state: Arc<SharedState>) -> Result<(
         mpsc::Receiver<app::PipelineEvent>,
     ) = mpsc::channel(128);
     let (stop_tx, stop_rx) = watch::channel(false);
+    // 语言用独立通道：面板切换可实时生效，不需要重启流水线
+    let language_rx = state.language_tx.subscribe();
 
     let mut config = state.config.clone();
     {
@@ -330,7 +394,7 @@ async fn start_capture_impl(app: AppHandle, state: Arc<SharedState>) -> Result<(
 
     let app_for_runner = app.clone();
     let runner = tauri::async_runtime::spawn(async move {
-        if let Err(e) = app::run_pipeline(config, event_tx, stop_rx).await {
+        if let Err(e) = app::run_pipeline(config, event_tx, stop_rx, language_rx).await {
             tracing::error!("Audio processing error: {}", e);
             let _ = app_for_runner.emit_all(ERROR_EVENT, e.to_string());
             emit_status(&app_for_runner, false, format!("运行失败: {}", e));
@@ -713,6 +777,8 @@ fn run(args: Args) -> anyhow::Result<()> {
             get_overlay_config,
             set_font_size,
             set_show_source,
+            list_languages,
+            set_language,
             get_status,
             list_devices_command,
             set_device,
