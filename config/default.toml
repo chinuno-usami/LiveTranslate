@@ -93,9 +93,10 @@ timeout_secs = 15
 
 [translate]
 # OpenAI 兼容 API
-base_url = "https://api.openai.com/v1"
+base_url = "https://api.deepseek.com/v1"
 api_key = "YOUR_API_KEY"
-model = "gpt-4o-mini"
+# DeepSeek 模型名，以官方文档/控制台为准（如 deepseek-flash）
+model = "deepseek-flash"
 target_language = "zh-CN"
 system_prompt = "You are a real-time subtitle translator. Translate naturally and concisely without adding any explanation."
 timeout_secs = 20
@@ -110,10 +111,14 @@ temperature = 0.2
 #   "enable_thinking"  发送 enable_thinking = false（Qwen3 等）
 #   "chat_template"    发送 chat_template_kwargs = { enable_thinking = false }
 #                      （vLLM / SGLang 部署的 Qwen3 等）
+#
+# DeepSeek（OpenAI 兼容格式）没有预设可选，必须用下面的 extra_body 传
+# thinking.type = "disabled"。注意 reasoning_effort 关不掉思考，只控制强度。
 disable_thinking = ""
-# 还需其他字段时，用 extra_body 追加到请求体（优先级最高）。例如：
-# [translate.extra_body]
-# reasoning_effort = "none"
+# 还需其他字段时，用 extra_body 追加到请求体（优先级最高）。
+# DeepSeek 关闭思考模式：
+[translate.extra_body]
+thinking = { type = "disabled" }
 
 [subtitle]
 # 最多显示行数
