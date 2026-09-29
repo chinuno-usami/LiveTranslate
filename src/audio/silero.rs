@@ -58,23 +58,29 @@ impl SileroVad {
         // 允许把 ONNX Runtime 随包分发：先寻找程序目录旁的动态库
         ensure_ort_library_env();
 
-        // `ort` 在找不到动态库时是 `.expect(...)` 直接 panic，回退逻辑拦不住，
-        // 所以先自己探测一次；同时用 catch_unwind 兜住其余意外 panic，
-        // 避免为了一个可选后端把整个程序拖崩。
-        if !onnxruntime_loadable() {
-            return Err(AppError::Audio(
-                "未找到 ONNX Runtime 动态库（onnxruntime）。"
-                    .to_string()
-                    + "可将其装入系统库搜索路径，或用 ORT_DYLIB_PATH 指定完整路径",
-            ));
-        }
+        // 仅“能 dlopen”不足以判断可用：系统里可能存在 API 版本不兼容的
+        // onnxruntime，此时 ort 会在初始化时 panic，并把其内部互斥锁毒化；
+        // 进程退出时 ort 的 atexit 钩子会再次 panic（无法 unwind）直接 abort。
+        // 所以这里先做一次**功能性**探测，不通过就完全不碰 ort。
+        let ort_version = match probe_onnxruntime() {
+            Ok(version) => version,
+            Err(why) => {
+                return Err(AppError::Audio(format!(
+                    "ONNX Runtime 不可用：{why}。\
+                     可按 README 把动态库放到程序同级目录，或用 ORT_DYLIB_PATH 指定路径"
+                )));
+            }
+        };
+        tracing::info!("ONNX Runtime {} 就绪", ort_version);
 
+        // ort 内部仍有可能 panic（例如模型无法加载），
+        // 这里兜住以保证回退到能量 VAD 而不是拖崩程序。
         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             Self::create(config, sample_rate)
         })) {
             Ok(result) => result,
             Err(_) => Err(AppError::Audio(
-                "初始化 Silero 时发生 panic（多半是 ONNX Runtime 版本不兼容）".to_string(),
+                "初始化 Silero 时发生 panic（多半是模型或运行时异常）".to_string(),
             )),
         }
     }
@@ -220,18 +226,61 @@ pub fn ensure_ort_library_env() {
     }
 }
 
-/// 探测 ONNX Runtime 动态库是否可加载
-///
-/// 必须在调用任何 `ort` API 之前执行：`ort` 加载失败时会直接 panic。
-fn onnxruntime_loadable() -> bool {
-    let path = std::env::var("ORT_DYLIB_PATH")
+/// 待加载的 ONNX Runtime 路径（环境变量优先，否则用平台默认文件名交给系统搜索）
+fn ort_library_path() -> String {
+    std::env::var("ORT_DYLIB_PATH")
         .ok()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| ORT_LIB_NAME.to_string());
+        .unwrap_or_else(|| ORT_LIB_NAME.to_string())
+}
 
-    // 只探测是否能加载，不保留句柄
-    unsafe { libloading::Library::new(&path).is_ok() }
+fn cstring_to_string(ptr: *const std::ffi::c_char) -> String {
+    if ptr.is_null() {
+        return "unknown".to_string();
+    }
+    // SAFETY: ONNX Runtime 保证该指针指向以 NUL 结尾的静态字符串
+    unsafe { std::ffi::CStr::from_ptr(ptr).to_string_lossy().to_string() }
+}
+
+/// 功能性探测 ONNX Runtime：可加载 + API 版本兼容
+///
+/// 成功返回库自身版本号。必须在调用任何 `ort` API 之前执行。
+fn probe_onnxruntime() -> Result<String, String> {
+    probe_onnxruntime_at(&ort_library_path())
+}
+
+/// 与 [`probe_onnxruntime`] 相同，但显式指定库路径（便于测试，避免改动全局环境变量）
+fn probe_onnxruntime_at(path: &str) -> Result<String, String> {
+    use ort::sys::{OrtApiBase, ORT_API_VERSION};
+
+    // SAFETY: 只读取符号与查询版本，不做其他调用；
+    // 库句柄在函数结束前一直有效。
+    unsafe {
+        let library = libloading::Library::new(path)
+            .map_err(|e| format!("无法加载 `{path}`：{e}"))?;
+
+        let get_api_base = library
+            .get::<unsafe extern "system" fn() -> *const OrtApiBase>(b"OrtGetApiBase\0")
+            .map_err(|e| format!("`{path}` 不是有效的 ONNX Runtime（缺少 OrtGetApiBase）：{e}"))?;
+
+        let base = get_api_base();
+        if base.is_null() {
+            return Err(format!("`{path}` 的 OrtGetApiBase 返回空指针"));
+        }
+
+        // 关键：只有库支持该 API 版本时 GetApi 才返回非空
+        let api = ((*base).GetApi)(ORT_API_VERSION);
+        let version = cstring_to_string(((*base).GetVersionString)());
+
+        if api.is_null() {
+            return Err(format!(
+                "`{path}` 版本过低（库版本 {version}，需要 API 版本 {ORT_API_VERSION}）"
+            ));
+        }
+
+        Ok(version)
+    }
 }
 
 #[cfg(test)]
@@ -239,8 +288,24 @@ mod tests {
     use super::*;
     use crate::config::VadConfig;
 
-    /// ONNX Runtime 不可用时跳过（不视为失败）
+    /// Silero 测试需要真实的 ONNX Runtime，默认跳过（opt-in）
+    ///
+    /// 用 `ORT_DYLIB_PATH` 显式指定库后才会执行，例如：
+    ///   ORT_DYLIB_PATH=/path/to/libonnxruntime.dylib cargo test --bin livetranslate
+    ///
+    /// 这样做的原因：若让测试去探测系统里的库，CI 上可能加载到版本不兼容的
+    /// onnxruntime，导致 ort 初始化 panic 并把内部锁毒化，
+    /// 最终在进程退出时 abort（表现为测试全通过但整体失败）。
     fn test_vad() -> Option<SileroVad> {
+        let configured = std::env::var("ORT_DYLIB_PATH")
+            .map(|v| !v.trim().is_empty())
+            .unwrap_or(false);
+
+        if !configured {
+            eprintln!("跳过 Silero 测试：未设置 ORT_DYLIB_PATH（需要 ONNX Runtime 才可运行）");
+            return None;
+        }
+
         match SileroVad::new(&VadConfig::default(), 16_000) {
             Ok(vad) => Some(vad),
             Err(e) => {
@@ -305,6 +370,24 @@ mod tests {
         vad.reset();
         vad.threshold = 0.0005;
         assert!(vad.is_speech(&frame(0)));
+    }
+
+    #[test]
+    fn probe_reports_clear_reason_when_library_missing() {
+        // 探测一个不存在的路径，必须返回可读的错误而不是 panic
+        let err = probe_onnxruntime_at("/nonexistent/definitely/not/libonnxruntime.dylib")
+            .expect_err("不存在的库应探测失败");
+        assert!(err.contains("无法加载"), "错误信息应说明无法加载: {err}");
+    }
+
+    #[test]
+    fn probe_fails_for_a_non_library_file() {
+        // 现成的非库文件（本文件）应被识别为“不是有效的 ONNX Runtime”
+        let err = probe_onnxruntime_at(file!()).expect_err("普通文件不应探测成功");
+        assert!(
+            err.contains("无法加载") || err.contains("OrtGetApiBase"),
+            "错误信息应说明原因: {err}"
+        );
     }
 
     #[test]
