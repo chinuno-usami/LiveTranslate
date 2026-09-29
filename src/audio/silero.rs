@@ -13,6 +13,8 @@
 use ort::session::Session;
 use ort::value::Tensor;
 
+use std::path::PathBuf;
+
 use crate::error::{AppError, AppResult};
 
 /// 内嵌的 Silero VAD v5 模型（models/silero_vad.onnx）
@@ -20,6 +22,14 @@ const EMBEDDED_MODEL: &[u8] = include_bytes!("../../models/silero_vad.onnx");
 
 /// LSTM 隐状态维度（模型固定值）
 const STATE_DIM: usize = 128;
+
+/// 各平台 ONNX Runtime 动态库文件名
+#[cfg(target_os = "windows")]
+const ORT_LIB_NAME: &str = "onnxruntime.dll";
+#[cfg(target_os = "macos")]
+const ORT_LIB_NAME: &str = "libonnxruntime.dylib";
+#[cfg(all(unix, not(target_os = "macos")))]
+const ORT_LIB_NAME: &str = "libonnxruntime.so";
 
 pub struct SileroVad {
     session: Session,
@@ -45,6 +55,9 @@ impl SileroVad {
     }
 
     pub fn new(config: &crate::config::VadConfig, sample_rate: u32) -> AppResult<Self> {
+        // 允许把 ONNX Runtime 随包分发：先寻找程序目录旁的动态库
+        ensure_ort_library_env();
+
         // `ort` 在找不到动态库时是 `.expect(...)` 直接 panic，回退逻辑拦不住，
         // 所以先自己探测一次；同时用 catch_unwind 兜住其余意外 panic，
         // 避免为了一个可选后端把整个程序拖崩。
@@ -165,22 +178,53 @@ impl SileroVad {
     }
 }
 
+/// 随包附带 ONNX Runtime 时的候选位置
+fn bundled_library_candidates() -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            candidates.push(dir.join(ORT_LIB_NAME));
+            candidates.push(dir.join("lib").join(ORT_LIB_NAME));
+            // macOS .app: Contents/MacOS/ -> Contents/Frameworks/
+            candidates.push(dir.join("..").join("Frameworks").join(ORT_LIB_NAME));
+        }
+    }
+
+    candidates
+}
+
+/// 若用户未显式指定，且程序目录里随包附带了 ONNX Runtime，则自动使用它
+///
+/// 必须在调用任何 `ort` API 之前执行：`ort` 只在首次使用时读该环境变量。
+fn ensure_ort_library_env() {
+    if std::env::var("ORT_DYLIB_PATH")
+        .map(|v| !v.trim().is_empty())
+        .unwrap_or(false)
+    {
+        return;
+    }
+
+    for candidate in bundled_library_candidates() {
+        if candidate.is_file() {
+            if let Ok(absolute) = candidate.canonicalize() {
+                tracing::info!("使用随附的 ONNX Runtime: {}", absolute.display());
+                std::env::set_var("ORT_DYLIB_PATH", &absolute);
+            }
+            return;
+        }
+    }
+}
+
 /// 探测 ONNX Runtime 动态库是否可加载
 ///
 /// 必须在调用任何 `ort` API 之前执行：`ort` 加载失败时会直接 panic。
 fn onnxruntime_loadable() -> bool {
-    #[cfg(target_os = "windows")]
-    const DEFAULT_LIB: &str = "onnxruntime.dll";
-    #[cfg(target_os = "macos")]
-    const DEFAULT_LIB: &str = "libonnxruntime.dylib";
-    #[cfg(all(unix, not(target_os = "macos")))]
-    const DEFAULT_LIB: &str = "libonnxruntime.so";
-
     let path = std::env::var("ORT_DYLIB_PATH")
         .ok()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| DEFAULT_LIB.to_string());
+        .unwrap_or_else(|| ORT_LIB_NAME.to_string());
 
     // 只探测是否能加载，不保留句柄
     unsafe { libloading::Library::new(&path).is_ok() }
@@ -264,5 +308,21 @@ mod tests {
         assert_eq!(SileroVad::frame_len_for(16_000).unwrap(), 512);
         assert_eq!(SileroVad::frame_len_for(8_000).unwrap(), 256);
         assert!(SileroVad::frame_len_for(44_100).is_err());
+    }
+
+    #[test]
+    fn bundled_candidates_cover_expected_locations() {
+        let candidates = bundled_library_candidates();
+        assert!(!candidates.is_empty());
+        // 全部应以平台对应的库名结尾
+        assert!(candidates.iter().all(|p| p.ends_with(ORT_LIB_NAME)));
+        // 至少包含“可执行文件同级”这一项
+        let exe_dir = std::env::current_exe().unwrap();
+        let exe_dir = exe_dir.parent().unwrap();
+        assert!(candidates.contains(&exe_dir.join(ORT_LIB_NAME)));
+        // 以及 macOS .app 的 Frameworks 目录
+        assert!(candidates
+            .iter()
+            .any(|p| p.to_string_lossy().contains("Frameworks")));
     }
 }

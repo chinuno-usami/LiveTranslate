@@ -295,19 +295,37 @@ silero_threshold = 0.5     # 调大更保守（更不容易误触），调小更
 ```
 
 **关于 ONNX Runtime**：`silero` 后端通过 `load-dynamic` 在运行期加载
-`onnxruntime`，程序不再自带这份库。两种获取方式：
+`onnxruntime`。查找顺序：
+
+1. 环境变量 `ORT_DYLIB_PATH`（显式指定）
+2. **程序自带的库**（推荐随包分发）
+   - 可执行文件同级目录
+   - `lib/` 子目录
+   - macOS `.app` 的 `Contents/Frameworks/`
+3. 系统库搜索路径
 
 ```bash
-# 1) 放进系统库搜索路径
-#    macOS:   brew install onnxruntime
-#    Linux:   apt install libonnxruntime  (或从官网下载)
-#    Windows: 下载 onnxruntime 的 zip，把 onnxruntime.dll 放到 exe 同级目录
+# 方式一：随包分发（用户无需安装）
+#   把库放在上面任一位置即可，程序会自动找到
+#   macOS:   libonnxruntime.dylib
+#   Windows: onnxruntime.dll
+#   Linux:   libonnxruntime.so
 
-# 2) 或者用环境变量指定完整路径
+# 方式二：装到系统里
+#   macOS:   brew install onnxruntime
+#   Linux:   apt install libonnxruntime
+
+# 方式三：显式指定路径
 export ORT_DYLIB_PATH=/path/to/libonnxruntime.dylib
 ```
 
 模型（Silero VAD v5，MIT 许可）已内嵌在二进制里，无需另外下载。
+
+> **为什么不直接静态链接？** 试过了，不可行：ONNX Runtime 官方发行包
+> 基本只提供动态库，而 `ort-sys` 的静态/xcframework 链接路径**只支持 iOS**，
+> macOS 桌面端会直接输出 `can't do xcframework linking for target
+> 'aarch64-apple-darwin'` 并放弃。所以“自包含”在这里能做到的上限是
+> **随包附带动态库 + 程序自动发现**，而不是单文件零依赖。
 
 **如果没装 ONNX Runtime 会怎样**：不会崩溃。程序会在启动时探测，
 初始化失败就自动回退到能量 VAD，并在面板状态栏给出提示：
