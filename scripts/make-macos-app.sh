@@ -3,10 +3,11 @@
 # 组装 macOS .app bundle（不依赖 tauri-cli）
 #
 # 用法:
-#   scripts/make-macos-app.sh <binary-path> <out-dir> [label]
+#   scripts/make-macos-app.sh <binary-path> <out-dir> [label] [onnxruntime-dir]
 #
 # 例:
 #   scripts/make-macos-app.sh target/universal/release/livetranslate dist macos-universal
+#   scripts/make-macos-app.sh target/release/livetranslate dist macos-arm64 /tmp/ortlib
 #
 # 产出:
 #   <out-dir>/LiveTranslate.app
@@ -14,9 +15,10 @@
 #
 set -euo pipefail
 
-BIN_PATH="${1:?usage: make-macos-app.sh <binary-path> <out-dir> [label]}"
-OUT_DIR="${2:?usage: make-macos-app.sh <binary-path> <out-dir> [label]}"
+BIN_PATH="${1:?usage: make-macos-app.sh <binary-path> <out-dir> [label] [onnxruntime-dir]}"
+OUT_DIR="${2:?usage: make-macos-app.sh <binary-path> <out-dir> [label] [onnxruntime-dir]}"
 LABEL="${3:-macos}"
+ORT_DIR="${4:-}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -42,6 +44,22 @@ chmod +x "$APP_DIR/Contents/MacOS/$EXEC_NAME"
 # 图标
 if [ -f "$ROOT_DIR/icons/icon.icns" ]; then
   cp "$ROOT_DIR/icons/icon.icns" "$APP_DIR/Contents/Resources/AppIcon.icns"
+fi
+
+# 随包附带 ONNX Runtime（供 silero VAD 后端使用）
+# 放在 Contents/Frameworks/ 下，程序启动时会自动发现
+if [ -n "$ORT_DIR" ]; then
+  mkdir -p "$APP_DIR/Contents/Frameworks"
+  copied=0
+  for lib in "$ORT_DIR"/libonnxruntime*.dylib; do
+    [ -f "$lib" ] || continue
+    cp -a "$lib" "$APP_DIR/Contents/Frameworks/"
+    echo "bundled ONNX Runtime: $(basename "$lib")"
+    copied=$((copied + 1))
+  done
+  if [ "$copied" -eq 0 ]; then
+    echo "warning: no libonnxruntime*.dylib found in $ORT_DIR" >&2
+  fi
 fi
 
 # Info.plist

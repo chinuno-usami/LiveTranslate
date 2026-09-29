@@ -640,6 +640,10 @@ fn main() {
 fn run(args: Args) -> anyhow::Result<()> {
     tracing::info!("Starting LiveTranslate Application");
 
+    // ONNX Runtime 动态库探测必须在创建任何线程/异步运行时之前完成：
+    // 它会写入进程级环境变量 ORT_DYLIB_PATH，多线程下与 env 读取并发存在 UB 风险。
+    audio::detector::prepare_ort_library();
+
     let (config, config_path) = match AppConfig::resolve(args.config.clone()) {
         Ok(resolved) => resolved,
         Err(e) => {

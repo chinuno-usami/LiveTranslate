@@ -24,13 +24,23 @@ silence_threshold = 0.01
 # 是否启用 VAD 分段（推荐开启）
 # 开启后按“语音边界”切句，而不是固定时长硬切，能显著减少句子被截断
 enabled = true
-# 帧长（毫秒），推荐 20
+# VAD 后端:
+#   "energy" - 内置能量型，自适应噪声底 + 迟滞。无额外依赖，但不能区分音乐与人声
+#   "silero" - Silero VAD 神经网络（需 ONNX Runtime 动态库），能区分音乐/噪声与人声
+#              缺失 ONNX Runtime 时会自动回退到 energy 并在面板上提示
+backend = "energy"
+# 帧长（毫秒，仅 energy 后端；silero 固定为 512 样本 @16k）
 frame_ms = 20
-# 判为语音所需的、高于自适应噪声底的余量（dB）
+# 判为语音所需的、高于自适应噪声底的余量（dB，仅 energy 后端）
 # 环境嘈杂就调大（如 10~12），安静环境可调小（如 6）
 margin_db = 8.0
-# 噪声底估计所用的分位数（0.0 - 1.0）
+# 噪声底估计所用的分位数（0.0 - 1.0，仅 energy 后端）
 noise_percentile = 0.1
+# --- silero 后端专用 ---
+# Silero 模型路径；留空则使用内嵌模型（models/silero_vad.onnx，MIT 许可）
+silero_model = ""
+# 判为语音的概率阈值（0.0 - 1.0）
+silero_threshold = 0.5
 # 语音需持续多久才确认开始，同时也是最短片段长度
 min_speech_ms = 200
 # 静音需持续多久才确认说完（调大可减少句中停顿被误切）

@@ -1,8 +1,9 @@
+use crate::asr::AsrEngine;
 use crate::audio::chunker::AudioChunker;
+use crate::audio::detector::VadEngine;
 use crate::audio::resample::LinearResampler;
 use crate::audio::segmenter::SpeechSegmenter;
-use crate::audio::{AudioCapture};
-use crate::asr::AsrEngine;
+use crate::audio::AudioCapture;
 use crate::config::AppConfig;
 use crate::error::AppResult;
 use crate::subtitle::{Subtitle, SubtitleProcessor};
@@ -206,15 +207,26 @@ pub async fn run_pipeline(
     );
 
     let mut segmenter = if config.vad.enabled {
+        let (engine, warning) = VadEngine::from_config(&config.vad, target_rate);
         tracing::info!(
-            "VAD segmentation enabled: frame={}ms margin={}dB min_speech={}ms min_silence={}ms max={}ms",
-            config.vad.frame_ms,
-            config.vad.margin_db,
+            "VAD enabled: backend={} frame_len={} min_speech={}ms min_silence={}ms max={}ms",
+            engine.backend(),
+            engine.frame_len(),
             config.vad.min_speech_ms,
             config.vad.min_silence_ms,
             config.vad.max_speech_ms
         );
-        Segmenter::Vad(Box::new(SpeechSegmenter::new(&config.vad, target_rate)))
+
+        // 例如请求了 silero 但缺 ONNX Runtime，这里会把原因告知用户
+        if let Some(message) = warning {
+            send_notice(&tx, &mut last_notice, message).await;
+        }
+
+        Segmenter::Vad(Box::new(SpeechSegmenter::new(
+            &config.vad,
+            target_rate,
+            engine,
+        )))
     } else {
         tracing::info!(
             "VAD disabled: fixed {}s chunks",
@@ -294,11 +306,13 @@ pub async fn run_pipeline(
                 pushed_chunks += 1;
                 if pushed_chunks % 500 == 0 {
                     if let Segmenter::Vad(vad) = &mut segmenter {
-                        tracing::debug!(
-                            "VAD 噪声底 ≈ {:.1} dBFS (speech 阈值 ≈ {:.1} dBFS)",
-                            vad.noise_floor_db(),
-                            vad.noise_floor_db() + config.vad.margin_db
-                        );
+                        if let Some(floor) = vad.noise_floor_db() {
+                            tracing::debug!(
+                                "VAD 噪声底 ≈ {:.1} dBFS (speech 阈值 ≈ {:.1} dBFS)",
+                                floor,
+                                floor + config.vad.margin_db
+                            );
+                        }
                     }
                 }
 

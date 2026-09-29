@@ -228,7 +228,6 @@ INFO livetranslate::app: ASR backend: edge (Edge ASR (en-US))
 ## VAD 语音分段
 
 默认开启（`vad.enabled = true`），用**按语音边界切句**代替固定时长硬切：
-
 ```text
 静音 ──┐            ┌──────────────┐
        │  确认开始   │   语音持续    │  确认结束
@@ -280,6 +279,68 @@ WARN livetranslate::app: 识别速度跟不上，丢弃一个片段（累计 3 �
 ```
 INFO livetranslate::app: VAD segment ready: 4200 ms
 ```
+
+### VAD 后端：energy / silero
+
+| 后端 | 原理 | 能否区分音乐与人声 | 依赖 |
+|------|------|--------------------|------|
+| `energy`（默认） | 自适应噪声底 + 迟滞 | ❌ 分不出 | 无 |
+| `silero` | Silero VAD 神经网络 | ✅ 能 | 需要 ONNX Runtime 动态库 |
+
+```toml
+[vad]
+backend = "silero"
+silero_threshold = 0.5     # 调大更保守（更不容易误触），调小更灵敏
+# silero_model = ""        # 留空用内嵌模型
+```
+
+**关于 ONNX Runtime**：`silero` 后端通过 `load-dynamic` 在运行期加载
+`onnxruntime`。
+
+> **从 Release 下载的包已经内置了该库**（macOS 放在 `.app/Contents/Frameworks/`，
+> Windows/Linux 放在可执行文件同级），开箱即用，无需额外安装。
+> 只有自行编译时才需要自己准备。
+
+查找顺序：
+
+1. 环境变量 `ORT_DYLIB_PATH`（显式指定）
+2. **程序自带的库**（推荐随包分发）
+   - 可执行文件同级目录
+   - `lib/` 子目录
+   - macOS `.app` 的 `Contents/Frameworks/`
+3. 系统库搜索路径
+
+```bash
+# 方式一：随包分发（用户无需安装）
+#   把库放在上面任一位置即可，程序会自动找到
+#   macOS:   libonnxruntime.dylib
+#   Windows: onnxruntime.dll
+#   Linux:   libonnxruntime.so
+
+# 方式二：装到系统里
+#   macOS:   brew install onnxruntime
+#   Linux:   apt install libonnxruntime
+
+# 方式三：显式指定路径
+export ORT_DYLIB_PATH=/path/to/libonnxruntime.dylib
+```
+
+模型（Silero VAD v5，MIT 许可）已内嵌在二进制里，无需另外下载。
+
+> **为什么不直接静态链接？** 试过了，不可行：ONNX Runtime 官方发行包
+> 基本只提供动态库，而 `ort-sys` 的静态/xcframework 链接路径**只支持 iOS**，
+> macOS 桌面端会直接输出 `can't do xcframework linking for target
+> 'aarch64-apple-darwin'` 并放弃。所以“自包含”在这里能做到的上限是
+> **随包附带动态库 + 程序自动发现**，而不是单文件零依赖。
+
+**如果没装 ONNX Runtime 会怎样**：不会崩溃。程序会在启动时探测，
+初始化失败就自动回退到能量 VAD，并在面板状态栏给出提示：
+
+```
+Silero VAD 初始化失败，已回退到能量 VAD：未找到 ONNX Runtime 动态库…
+```
+
+如果不想要这个后端，可以用 `--no-default-features` 重新构建（去掉 `silero-vad`）。
 
 ### 调参建议
 

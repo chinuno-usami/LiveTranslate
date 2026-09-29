@@ -116,15 +116,26 @@ pub struct VadConfig {
     /// 是否启用 VAD 分段（关闭则回到固定时长切片）
     #[serde(default = "default_true")]
     pub enabled: bool,
-    /// VAD 帧长（毫秒），推荐 20
+    /// VAD 算法后端：
+    /// - `energy`：内置能量型（无额外依赖，默认）
+    /// - `silero`：Silero VAD 神经网络（需 ONNX Runtime，能区分音乐与人声）
+    #[serde(default = "default_vad_backend")]
+    pub backend: String,
+    /// VAD 帧长（毫秒），推荐 20（仅 energy 后端使用）
     #[serde(default = "default_vad_frame_ms")]
     pub frame_ms: u32,
-    /// 判为语音所需的、高于自适应噪声底的余量（dB）
+    /// 判为语音所需的、高于自适应噪声底的余量（dB，仅 energy 后端）
     #[serde(default = "default_vad_margin_db")]
     pub margin_db: f32,
-    /// 噪声底估计所用的分位数（0.0-1.0）
+    /// 噪声底估计所用的分位数（0.0-1.0，仅 energy 后端）
     #[serde(default = "default_vad_noise_percentile")]
     pub noise_percentile: f32,
+    /// Silero 模型路径；留空则使用内嵌模型
+    #[serde(default)]
+    pub silero_model: Option<String>,
+    /// Silero 判为语音的概率阈值
+    #[serde(default = "default_silero_threshold")]
+    pub silero_threshold: f32,
     /// 语音需持续多久才确认开始（也是最短片段长度）
     #[serde(default = "default_vad_min_speech_ms")]
     pub min_speech_ms: u32,
@@ -146,9 +157,12 @@ impl Default for VadConfig {
     fn default() -> Self {
         Self {
             enabled: true,
+            backend: "energy".to_string(),
             frame_ms: 20,
             margin_db: 8.0,
             noise_percentile: 0.1,
+            silero_model: None,
+            silero_threshold: 0.5,
             min_speech_ms: 200,
             min_silence_ms: 400,
             max_speech_ms: 12_000,
@@ -163,6 +177,12 @@ fn default_true() -> bool {
 }
 fn default_vad_frame_ms() -> u32 {
     VadConfig::default().frame_ms
+}
+fn default_vad_backend() -> String {
+    VadConfig::default().backend
+}
+fn default_silero_threshold() -> f32 {
+    VadConfig::default().silero_threshold
 }
 fn default_vad_margin_db() -> f32 {
     VadConfig::default().margin_db

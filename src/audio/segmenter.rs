@@ -16,13 +16,13 @@
 
 use std::collections::VecDeque;
 
-use crate::audio::vad::EnergyVad;
+use crate::audio::detector::VadEngine;
 use crate::config::VadConfig;
 
 pub struct SpeechSegmenter {
     sample_rate: u32,
     frame_len: usize,
-    vad: EnergyVad,
+    vad: VadEngine,
 
     /// 确认"开始说话"所需连续语音帧数
     attack_frames: u32,
@@ -51,15 +51,16 @@ pub struct SpeechSegmenter {
 }
 
 impl SpeechSegmenter {
-    pub fn new(cfg: &VadConfig, sample_rate: u32) -> Self {
-        let frame_ms = cfg.frame_ms.max(1) as f32;
-        let frame_len = ((sample_rate as f32 * frame_ms / 1000.0).round() as usize).max(1);
+    pub fn new(cfg: &VadConfig, sample_rate: u32, vad: VadEngine) -> Self {
+        // 帧长由 VAD 后端决定：能量型跟随 frame_ms，Silero 固定为 512/256 样本
+        let frame_len = vad.frame_len();
+        let frame_ms = (frame_len as f32 * 1000.0 / sample_rate.max(1) as f32).max(0.1);
         let frames = |ms: u32| ((ms as f32 / frame_ms).ceil() as u32).max(1);
 
         Self {
             sample_rate,
             frame_len,
-            vad: EnergyVad::new(cfg.margin_db, cfg.noise_percentile),
+            vad,
             attack_frames: frames(cfg.min_speech_ms),
             release_frames: frames(cfg.min_silence_ms),
             max_frames: frames(cfg.max_speech_ms),
@@ -76,9 +77,9 @@ impl SpeechSegmenter {
         }
     }
 
-    /// 当前噪声底（dBFS），便于日志观察
-    pub fn noise_floor_db(&mut self) -> f32 {
-        self.vad.current_noise_floor()
+    /// 当前噪声底（dBFS），仅能量型后端可用
+    pub fn noise_floor_db(&mut self) -> Option<f32> {
+        self.vad.noise_floor_db()
     }
 
     /// 喂入任意长度的音频（单声道 f32）
@@ -186,6 +187,11 @@ mod tests {
 
     const SR: u32 = 16000;
 
+    fn segmenter(cfg: &VadConfig) -> SpeechSegmenter {
+        let (engine, _) = VadEngine::from_config(cfg, SR);
+        SpeechSegmenter::new(cfg, SR, engine)
+    }
+
     fn cfg() -> VadConfig {
         VadConfig {
             enabled: true,
@@ -197,6 +203,9 @@ mod tests {
             max_speech_ms: 10_000,
             pre_pad_ms: 100,
             post_pad_ms: 100,
+            // 其余字段（backend / silero_*）保持默认，确保分段器测试
+            // 使用能量后端，不依赖 ONNX Runtime
+            ..Default::default()
         }
     }
 
@@ -209,14 +218,14 @@ mod tests {
 
     #[test]
     fn no_segment_on_pure_silence() {
-        let mut seg = SpeechSegmenter::new(&cfg(), SR);
+        let mut seg = segmenter(&cfg());
         seg.push(&tone(2000, 0.001));
         assert!(seg.pop().is_none(), "纯静音不应产生片段");
     }
 
     #[test]
     fn emits_one_segment_for_a_sentence() {
-        let mut seg = SpeechSegmenter::new(&cfg(), SR);
+        let mut seg = segmenter(&cfg());
 
         // 静音 -> 说话 -> 静音
         seg.push(&tone(600, 0.001));
@@ -232,7 +241,7 @@ mod tests {
 
     #[test]
     fn does_not_split_on_short_pause_inside_sentence() {
-        let mut seg = SpeechSegmenter::new(&cfg(), SR);
+        let mut seg = segmenter(&cfg());
 
         seg.push(&tone(500, 0.001));
         seg.push(&tone(800, 0.3)); // 说
@@ -248,7 +257,7 @@ mod tests {
     fn force_cuts_long_speech() {
         let mut c = cfg();
         c.max_speech_ms = 1000;
-        let mut seg = SpeechSegmenter::new(&c, SR);
+        let mut seg = segmenter(&c);
 
         seg.push(&tone(500, 0.001));
         seg.push(&tone(3500, 0.3)); // 连续说话 3.5s，远超 max 1s
