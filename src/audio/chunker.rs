@@ -3,8 +3,6 @@ use crate::error::{AppError, AppResult};
 /// 音频分片器
 /// 将连续的音频流切分成固定大小的块，支持重叠
 pub struct AudioChunker {
-    sample_rate: u32,
-    chunk_seconds: f32,
     chunk_samples: usize,
     overlap_samples: usize,
     silence_threshold: f32,
@@ -38,8 +36,6 @@ impl AudioChunker {
         );
 
         Ok(Self {
-            sample_rate,
-            chunk_seconds,
             chunk_samples,
             overlap_samples,
             silence_threshold,
@@ -61,7 +57,8 @@ impl AudioChunker {
 
         // 取一个完整分片，只前进 chunk - overlap，末尾 overlap 个样本留给下一片
         let chunk = self.buffer[..self.chunk_samples].to_vec();
-        self.buffer.drain(0..self.chunk_samples - self.overlap_samples);
+        self.buffer
+            .drain(0..self.chunk_samples - self.overlap_samples);
 
         Some(chunk)
     }
@@ -79,26 +76,6 @@ impl AudioChunker {
 
         max_amplitude < self.silence_threshold
     }
-
-    /// 获取缓冲区中的样本数
-    pub fn buffer_len(&self) -> usize {
-        self.buffer.len()
-    }
-
-    /// 获取缓冲区是否有足够的数据
-    pub fn has_next(&self) -> bool {
-        self.buffer.len() >= self.chunk_samples
-    }
-
-    /// 清空缓冲区
-    pub fn clear(&mut self) {
-        self.buffer.clear();
-    }
-
-    /// 获取分片时长（秒）
-    pub fn chunk_duration_secs(&self) -> f32 {
-        self.chunk_seconds
-    }
 }
 
 #[cfg(test)]
@@ -108,7 +85,7 @@ mod tests {
     #[test]
     fn test_chunker_basic() {
         let mut chunker = AudioChunker::new(16000, 1.0, 0.25, 0.01).unwrap();
-        
+
         // 1 秒的样本 = 16000 个样本
         let samples = vec![0.1; 16000];
         chunker.push_samples(&samples);
@@ -121,7 +98,7 @@ mod tests {
     #[test]
     fn test_silence_detection() {
         let chunker = AudioChunker::new(16000, 1.0, 0.0, 0.01).unwrap();
-        
+
         let silent = vec![0.001; 1000];
         assert!(chunker.is_silence(&silent));
 

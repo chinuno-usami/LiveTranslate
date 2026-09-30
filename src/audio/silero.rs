@@ -157,8 +157,9 @@ impl SileroVad {
         // 大量线程调度 / spin 开销（实测 CPU 可达单线程的 3~4 倍），
         // 而单线程的墙钟耗时几乎一样，因此这里固定为单线程。
         let build_cpu_session = |path: Option<&str>| -> AppResult<Session> {
-            let builder = Session::builder()
-                .map_err(|e| AppError::Audio(format!("创建 ONNX Runtime SessionBuilder 失败: {e}")))?;
+            let builder = Session::builder().map_err(|e| {
+                AppError::Audio(format!("创建 ONNX Runtime SessionBuilder 失败: {e}"))
+            })?;
             let builder = builder
                 .with_intra_threads(1)
                 .map_err(|e| AppError::Audio(format!("设置 intra 线程数失败: {e}")))?;
@@ -277,9 +278,8 @@ impl SileroVad {
             .map_err(|e| AppError::Audio(format!("构造输入张量失败: {e}")))?;
         let state = Tensor::from_array(([2usize, 1usize, STATE_DIM], self.state.clone()))
             .map_err(|e| AppError::Audio(format!("构造状态张量失败: {e}")))?;
-        let sample_rate =
-            Tensor::from_array((Vec::<i64>::new(), vec![self.sample_rate]))
-                .map_err(|e| AppError::Audio(format!("构造采样率张量失败: {e}")))?;
+        let sample_rate = Tensor::from_array((Vec::<i64>::new(), vec![self.sample_rate]))
+            .map_err(|e| AppError::Audio(format!("构造采样率张量失败: {e}")))?;
 
         let outputs = self
             .session
@@ -308,6 +308,7 @@ impl SileroVad {
         Ok(probability)
     }
 
+    #[cfg(test)]
     pub fn reset(&mut self) {
         self.state.iter_mut().for_each(|v| *v = 0.0);
         self.context.iter_mut().for_each(|v| *v = 0.0);
@@ -390,8 +391,8 @@ fn probe_onnxruntime_at(path: &str) -> Result<String, String> {
     // SAFETY: 只读取符号与查询版本，不做其他调用；
     // 库句柄在函数结束前一直有效。
     unsafe {
-        let library = libloading::Library::new(path)
-            .map_err(|e| format!("无法加载 `{path}`：{e}"))?;
+        let library =
+            libloading::Library::new(path).map_err(|e| format!("无法加载 `{path}`：{e}"))?;
 
         let get_api_base = library
             .get::<unsafe extern "system" fn() -> *const OrtApiBase>(b"OrtGetApiBase\0")
@@ -467,13 +468,7 @@ mod tests {
         // 由 ONNX Runtime 1.30 跑同一模型 + 同一输入（含 context）得到。
         // 注意：这些值只有在正确拼接 64 样本 context 时才成立；
         // 旧实现喂 512 无 context，概率会退化成 ~0.001，这里会直接失败。
-        let expected = [
-            0.0176422f32,
-            0.0080044,
-            0.0057910,
-            0.0046635,
-            0.0036013,
-        ];
+        let expected = [0.0176422f32, 0.0080044, 0.0057910, 0.0046635, 0.0036013];
 
         for (i, want) in expected.iter().enumerate() {
             let got = vad.infer(&frame(i)).expect("推理失败");

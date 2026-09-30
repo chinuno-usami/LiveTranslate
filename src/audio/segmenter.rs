@@ -161,7 +161,9 @@ impl SpeechSegmenter {
         }
 
         // 强制切段后的续段即使很短也属于同一句话，不做最短语音过滤
-        if self.voiced_frames >= self.min_voiced_frames || (self.continuing && self.voiced_frames > 0) {
+        if self.voiced_frames >= self.min_voiced_frames
+            || (self.continuing && self.voiced_frames > 0)
+        {
             let ms = utt.len() as u32 * 1000 / self.sample_rate.max(1);
             tracing::debug!(
                 "VAD segment: {} ms ({} voiced frames){}",
@@ -292,6 +294,10 @@ mod tests {
         seg.push(&tone(3500, 0.3)); // 连续说话 3.5s，远超 max 1s
 
         let segments: Vec<_> = std::iter::from_fn(|| seg.pop()).collect();
-        assert!(segments.len() >= 2, "超长语音应被强制切分, got {}", segments.len());
+        assert!(
+            segments.len() >= 2,
+            "超长语音应被强制切分, got {}",
+            segments.len()
+        );
     }
 }

@@ -84,12 +84,10 @@ pub async fn list_models(config: &AppConfig) -> AppResult<()> {
             .send()
             .await
         {
-            Ok(response) if response.status().is_success() => {
-                match response.text().await {
-                    Ok(text) => println!("  {}", text.trim()),
-                    Err(e) => println!("  读取失败: {e}"),
-                }
-            }
+            Ok(response) if response.status().is_success() => match response.text().await {
+                Ok(text) => println!("  {}", text.trim()),
+                Err(e) => println!("  读取失败: {e}"),
+            },
             Ok(response) => println!("  返回 {}", response.status()),
             Err(e) => println!("  获取失败: {e}"),
         }
@@ -105,7 +103,12 @@ pub async fn list_devices() -> AppResult<()> {
     } else {
         println!("Available audio devices:");
         for device in devices.iter() {
-            println!("  [{}] {} ({})", device.spec(), device.name, device.kind_label());
+            println!(
+                "  [{}] {} ({})",
+                device.spec(),
+                device.name,
+                device.kind_label()
+            );
         }
         println!();
         println!("提示: 在 config/default.toml 中设置 device_name 为 [方括号] 内的值即可选择设备");
@@ -158,6 +161,7 @@ async fn send_notice(tx: &mpsc::Sender<PipelineEvent>, last: &mut String, msg: S
 /// 处理一个音频片段：ASR -> 翻译 -> 去重 -> 发送
 ///
 /// 返回 `Ok(false)` 表示接收端已关闭，流水线应结束。
+#[allow(clippy::too_many_arguments)]
 async fn process_segment(
     chunk: &[f32],
     sample_rate: u32,
@@ -192,7 +196,10 @@ async fn process_segment(
                             processor.record(&text, &translated);
 
                             if tx
-                                .send(PipelineEvent::Subtitle(Subtitle::new(clean_text, clean_trans)))
+                                .send(PipelineEvent::Subtitle(Subtitle::new(
+                                    clean_text,
+                                    clean_trans,
+                                )))
                                 .await
                                 .is_err()
                             {
@@ -287,10 +294,7 @@ pub async fn run_pipeline(
             engine,
         )))
     } else {
-        tracing::info!(
-            "VAD disabled: fixed {}s chunks",
-            config.audio.chunk_seconds
-        );
+        tracing::info!("VAD disabled: fixed {}s chunks", config.audio.chunk_seconds);
         Segmenter::Fixed(Box::new(AudioChunker::new(
             target_rate,
             config.audio.chunk_seconds,
@@ -316,8 +320,7 @@ pub async fn run_pipeline(
     let filter_hallucination = config.asr.filter_hallucination;
 
     let worker = tokio::spawn(async move {
-        let mut subtitle_processor = SubtitleProcessor::new()
-            .with_overlap_removal(overlap_removal);
+        let mut subtitle_processor = SubtitleProcessor::new().with_overlap_removal(overlap_removal);
         let mut last_notice = String::new();
 
         while let Some(chunk) = utterance_rx.recv().await {

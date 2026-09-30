@@ -275,7 +275,8 @@ impl EdgeAsrClient {
 
                 match path.as_str() {
                     "speech.phrase" => {
-                        let payload: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
+                        let payload: serde_json::Value =
+                            serde_json::from_str(&body).unwrap_or_default();
                         let status = payload
                             .get("RecognitionStatus")
                             .and_then(|v| v.as_str())
@@ -370,7 +371,10 @@ where
     S: SinkExt<Message> + Unpin,
     S::Error: std::fmt::Display,
 {
-    let mut headers = vec![format!("X-Timestamp:{}", timestamp()), format!("Path:{path}")];
+    let mut headers = vec![
+        format!("X-Timestamp:{}", timestamp()),
+        format!("Path:{path}"),
+    ];
     if let Some(id) = request_id {
         headers.push(format!("X-RequestId:{id}"));
     }
@@ -541,7 +545,9 @@ mod tests {
     fn gec_is_uppercase_sha256_hex() {
         let gec = generate_sec_ms_gec(DEFAULT_TRUSTED_CLIENT_TOKEN);
         assert_eq!(gec.len(), 64, "SHA256 十六进制应为 64 字符");
-        assert!(gec.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_lowercase()));
+        assert!(gec
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_lowercase()));
     }
 
     #[test]
@@ -558,7 +564,10 @@ mod tests {
         assert_eq!(&header[0..4], b"RIFF");
         assert_eq!(&header[8..12], b"WAVE");
         assert_eq!(&header[36..40], b"data");
-        assert_eq!(u32::from_le_bytes([header[24], header[25], header[26], header[27]]), 16_000);
+        assert_eq!(
+            u32::from_le_bytes([header[24], header[25], header[26], header[27]]),
+            16_000
+        );
     }
 
     #[test]

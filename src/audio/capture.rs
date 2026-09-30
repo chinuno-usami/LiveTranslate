@@ -1,11 +1,11 @@
+use crate::audio::resample;
+use crate::error::{AppError, AppResult};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::StreamConfig;
 use serde::Serialize;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc;
-use crate::audio::resample;
-use crate::error::{AppError, AppResult};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -52,9 +52,9 @@ impl AudioCapture {
         let mut devices = Vec::new();
 
         // 输入设备（麦克风）
-        let input_devices = host
-            .input_devices()
-            .map_err(|e| AppError::CpalDevices(format!("Failed to enumerate input devices: {}", e)))?;
+        let input_devices = host.input_devices().map_err(|e| {
+            AppError::CpalDevices(format!("Failed to enumerate input devices: {}", e))
+        })?;
 
         let mut mic_index = 0;
         for device in input_devices {
@@ -86,8 +86,7 @@ impl AudioCapture {
         // 而回环用的恰恰是渲染设备——之前因此把回环选项全部滤掉了。
         if cfg!(target_os = "windows") {
             if let Ok(output_devices) = host.output_devices() {
-                let mut loop_index = 0;
-                for device in output_devices {
+                for (loop_index, device) in output_devices.enumerate() {
                     let name = device
                         .description()
                         .map(|d| d.name().to_string())
@@ -95,7 +94,11 @@ impl AudioCapture {
 
                     // 仅作诊断记录，不作为过滤条件
                     if let Err(e) = device.default_output_config() {
-                        tracing::debug!("Loopback 候选 `{}` 输出格式探测失败（仍列出）: {}", name, e);
+                        tracing::debug!(
+                            "Loopback 候选 `{}` 输出格式探测失败（仍列出）: {}",
+                            name,
+                            e
+                        );
                     }
 
                     devices.push(DeviceInfo {
@@ -103,7 +106,6 @@ impl AudioCapture {
                         name,
                         kind: DeviceKind::Loopback,
                     });
-                    loop_index += 1;
                 }
             }
         }
@@ -201,10 +203,9 @@ impl AudioCapture {
         want_index: usize,
     ) -> AppResult<(cpal::Device, DeviceKind)> {
         let mut idx = 0;
-        for device in host
-            .input_devices()
-            .map_err(|e| AppError::CpalDevices(format!("Failed to enumerate input devices: {}", e)))?
-        {
+        for device in host.input_devices().map_err(|e| {
+            AppError::CpalDevices(format!("Failed to enumerate input devices: {}", e))
+        })? {
             // 必须与 list_devices 的计数规则一致，否则 mic:N 会打开错误的设备
             if device.description().is_ok() || device.default_input_config().is_ok() {
                 if idx == want_index {
@@ -229,7 +230,9 @@ impl AudioCapture {
     ) -> AppResult<(cpal::Device, DeviceKind)> {
         for (idx, device) in host
             .output_devices()
-            .map_err(|e| AppError::CpalDevices(format!("Failed to enumerate output devices: {}", e)))?
+            .map_err(|e| {
+                AppError::CpalDevices(format!("Failed to enumerate output devices: {}", e))
+            })?
             .enumerate()
         {
             if idx == want_index {
@@ -272,7 +275,9 @@ impl AudioCapture {
             DeviceKind::Loopback => device.default_output_config(),
         }
         .map_err(|e| {
-            AppError::CpalBuildStream(format!("Failed to get default config for {device_label}: {e}"))
+            AppError::CpalBuildStream(format!(
+                "Failed to get default config for {device_label}: {e}"
+            ))
         })?;
 
         let sample_format = supported.sample_format();
@@ -303,18 +308,21 @@ impl AudioCapture {
                 };
                 device
                     .build_input_stream(config, data_fn, err_fn, None)
-                    .map_err(|e| AppError::CpalBuildStream(format!("Failed to build F32 stream: {}", e)))?
+                    .map_err(|e| {
+                        AppError::CpalBuildStream(format!("Failed to build F32 stream: {}", e))
+                    })?
             }
             cpal::SampleFormat::I16 => {
                 let data_fn = move |data: &[i16], _: &cpal::InputCallbackInfo| {
-                    let converted: Vec<f32> =
-                        data.iter().map(|&s| s as f32 / 32768.0).collect();
+                    let converted: Vec<f32> = data.iter().map(|&s| s as f32 / 32768.0).collect();
                     let mono = resample::downmix_to_mono(&converted, native_channels);
                     send_or_count(&tx, mono, &dropped);
                 };
                 device
                     .build_input_stream(config, data_fn, err_fn, None)
-                    .map_err(|e| AppError::CpalBuildStream(format!("Failed to build I16 stream: {}", e)))?
+                    .map_err(|e| {
+                        AppError::CpalBuildStream(format!("Failed to build I16 stream: {}", e))
+                    })?
             }
             cpal::SampleFormat::U16 => {
                 let data_fn = move |data: &[u16], _: &cpal::InputCallbackInfo| {
@@ -327,7 +335,9 @@ impl AudioCapture {
                 };
                 device
                     .build_input_stream(config, data_fn, err_fn, None)
-                    .map_err(|e| AppError::CpalBuildStream(format!("Failed to build U16 stream: {}", e)))?
+                    .map_err(|e| {
+                        AppError::CpalBuildStream(format!("Failed to build U16 stream: {}", e))
+                    })?
             }
             other => {
                 return Err(AppError::Audio(format!(
@@ -391,7 +401,10 @@ fn send_or_count(
     if let Err(mpsc::error::TrySendError::Full(_)) = tx.try_send(data) {
         let n = dropped.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
         if n == 1 || n % 100 == 0 {
-            tracing::warn!("Audio consumer is lagging, dropped {} audio blocks so far", n);
+            tracing::warn!(
+                "Audio consumer is lagging, dropped {} audio blocks so far",
+                n
+            );
         }
     }
 }

@@ -23,8 +23,8 @@ fn read_png_dims(bytes: &[u8]) -> Option<(u32, u32)> {
 #[test]
 fn ico_is_valid() {
     let path = manifest_path("icons/icon.ico");
-    let file = File::open(&path)
-        .unwrap_or_else(|e| panic!("无法打开 {path}: {e}（Windows 构建必需）"));
+    let file =
+        File::open(&path).unwrap_or_else(|e| panic!("无法打开 {path}: {e}（Windows 构建必需）"));
     let dir = ico::IconDir::read(BufReader::new(file))
         .unwrap_or_else(|e| panic!("{path} 不是合法的 ICO: {e}"));
 
@@ -82,9 +82,12 @@ fn icns_is_valid() {
     let mut pos = 8;
     let mut chunks = 0;
     while pos + 8 <= bytes.len() {
-        let len =
-            u32::from_be_bytes([bytes[pos + 4], bytes[pos + 5], bytes[pos + 6], bytes[pos + 7]])
-                as usize;
+        let len = u32::from_be_bytes([
+            bytes[pos + 4],
+            bytes[pos + 5],
+            bytes[pos + 6],
+            bytes[pos + 7],
+        ]) as usize;
         assert!(len >= 8, "ICNS chunk 长度非法");
         assert!(pos + len <= bytes.len(), "ICNS chunk 越界");
         chunks += 1;

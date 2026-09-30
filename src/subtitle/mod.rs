@@ -40,10 +40,7 @@ impl SubtitleState {
             self.history.pop_front();
         }
 
-        tracing::debug!(
-            "Subtitle pushed. Current count: {}",
-            self.history.len()
-        );
+        tracing::debug!("Subtitle pushed. Current count: {}", self.history.len());
     }
 
     /// 获取所有当前字幕
@@ -73,15 +70,5 @@ impl SubtitleState {
     /// 切换是否显示原文（影响 `get_all` 的输出）
     pub fn set_show_source(&mut self, show_source: bool) {
         self.show_source = show_source;
-    }
-
-    /// 获取当前字幕数
-    pub fn len(&self) -> usize {
-        self.history.len()
-    }
-
-    /// 是否为空
-    pub fn is_empty(&self) -> bool {
-        self.history.is_empty()
     }
 }

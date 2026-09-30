@@ -32,10 +32,7 @@ pub struct AsrEngine {
 }
 
 impl AsrEngine {
-    pub fn from_config(
-        config: &AsrConfig,
-        language: watch::Receiver<String>,
-    ) -> AppResult<Self> {
+    pub fn from_config(config: &AsrConfig, language: watch::Receiver<String>) -> AppResult<Self> {
         let backend = config.backend.trim().to_ascii_lowercase();
 
         let inner = match backend.as_str() {

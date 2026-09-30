@@ -1,8 +1,8 @@
-use serde::{Deserialize, Serialize};
+use crate::error::{AppError, AppResult};
 use directories::ProjectDirs;
+use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
-use crate::error::{AppError, AppResult};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AudioConfig {
@@ -314,8 +314,8 @@ impl AppConfig {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        let content = toml::to_string_pretty(&AppConfig::default())
-            .map_err(AppError::TomlSerialize)?;
+        let content =
+            toml::to_string_pretty(&AppConfig::default()).map_err(AppError::TomlSerialize)?;
         fs::write(path, content)?;
         Ok(true)
     }
@@ -401,22 +401,14 @@ impl AppConfig {
         Ok((AppConfig::default(), None))
     }
 
-    /// 保存配置到文件
-    pub fn save(&self, path: &Path) -> AppResult<()> {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        let content = toml::to_string_pretty(self)
-            .map_err(AppError::TomlSerialize)?;
-        fs::write(path, content)?;
-        tracing::info!("Config saved to: {}", path.display());
-        Ok(())
-    }
-
     /// 返回一份抹掉密钥的副本，仅用于日志输出
     pub fn redacted(&self) -> Self {
         fn mask(s: &str) -> String {
-            if s.is_empty() { String::new() } else { "***".to_string() }
+            if s.is_empty() {
+                String::new()
+            } else {
+                "***".to_string()
+            }
         }
         let mut c = self.clone();
         c.translate.api_key = mask(&c.translate.api_key);
@@ -483,7 +475,9 @@ impl Default for AppConfig {
                 api_key: "YOUR_API_KEY".to_string(),
                 model: "gpt-4o-mini".to_string(),
                 target_language: "zh-CN".to_string(),
-                system_prompt: "You are a real-time subtitle translator. Translate naturally and concisely.".to_string(),
+                system_prompt:
+                    "You are a real-time subtitle translator. Translate naturally and concisely."
+                        .to_string(),
                 timeout_secs: 20,
                 send_temperature: true,
                 temperature: 0.2,
@@ -579,11 +573,8 @@ fn patch_toml(content: &str, section: &str, key: &str, value: &str) -> String {
 mod tests {
     use super::*;
     fn temp_config_path(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "livetranslate-test-{}-{}",
-            std::process::id(),
-            tag
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("livetranslate-test-{}-{}", std::process::id(), tag));
         let _ = fs::remove_dir_all(&dir);
         dir.join("config.toml")
     }
@@ -629,7 +620,10 @@ mod tests {
         let src = "[subtitle]\nfont_size = 28\n\n[other]\nkey = 1\n";
         let out = patch_toml(src, "subtitle", "show_source", "true");
         let subtitle_part = out.split("[other]").next().unwrap();
-        assert!(subtitle_part.contains("show_source = true"), "应插入到 subtitle 段内");
+        assert!(
+            subtitle_part.contains("show_source = true"),
+            "应插入到 subtitle 段内"
+        );
         assert!(out.contains("[other]\nkey = 1"), "其他段不应受影响");
     }
 

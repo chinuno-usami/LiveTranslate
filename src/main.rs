@@ -1,13 +1,13 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
-mod audio;
 mod asr;
+mod audio;
 mod config;
 mod error;
 mod subtitle;
-mod tray;
 mod translate;
+mod tray;
 mod ui;
 
 use clap::Parser;
@@ -93,10 +93,8 @@ pub(crate) struct SharedState {
 
 impl SharedState {
     fn new(config: AppConfig, config_path: Option<PathBuf>) -> Self {
-        let subtitle_state = SubtitleState::new(
-            config.subtitle.max_lines,
-            config.subtitle.show_source,
-        );
+        let subtitle_state =
+            SubtitleState::new(config.subtitle.max_lines, config.subtitle.show_source);
 
         let device = config.audio.device_name.clone();
         let click_through = config.subtitle.click_through;
@@ -167,10 +165,7 @@ fn persist_setting(config_path: Option<&PathBuf>, section: &str, key: &str, valu
 
 /// 调整字幕字号（面板滑块）
 #[tauri::command]
-async fn set_font_size(
-    state: State<'_, Arc<SharedState>>,
-    size: u32,
-) -> Result<(), String> {
+async fn set_font_size(state: State<'_, Arc<SharedState>>, size: u32) -> Result<(), String> {
     // 与前端滑块范围（tauri-ui/app.js MIN_FONT/MAX_FONT）保持一致
     let size = size.clamp(12, 72);
     state.font_size.store(size, Ordering::SeqCst);
@@ -236,10 +231,7 @@ async fn list_languages(
 
 /// 切换识别语言（立即生效，并写回配置文件）
 #[tauri::command]
-async fn set_language(
-    state: State<'_, Arc<SharedState>>,
-    code: String,
-) -> Result<(), String> {
+async fn set_language(state: State<'_, Arc<SharedState>>, code: String) -> Result<(), String> {
     let backend = state.config.asr.backend.clone();
     let normalized = asr::languages::normalize_for_backend(&backend, &code);
     // 值会写回 TOML，只接受语言代码常见字符，防止换行/引号注入破坏配置
@@ -273,7 +265,9 @@ async fn set_language(
 }
 
 #[tauri::command]
-async fn get_overlay_config(state: State<'_, Arc<SharedState>>) -> Result<OverlayConfigPayload, String> {
+async fn get_overlay_config(
+    state: State<'_, Arc<SharedState>>,
+) -> Result<OverlayConfigPayload, String> {
     Ok(OverlayConfigPayload::from(&state.config.subtitle))
 }
 
@@ -291,7 +285,9 @@ async fn get_status(state: State<'_, Arc<SharedState>>) -> Result<StatusPayload,
 }
 
 #[tauri::command]
-async fn list_devices_command(state: State<'_, Arc<SharedState>>) -> Result<ui::DevicesPayload, String> {
+async fn list_devices_command(
+    state: State<'_, Arc<SharedState>>,
+) -> Result<ui::DevicesPayload, String> {
     let devices = audio::capture::AudioCapture::list_devices().map_err(|e| e.to_string())?;
     let current = state.current_device.lock().await.clone();
     Ok(ui::DevicesPayload {
@@ -382,7 +378,13 @@ fn window_geometry(window: Window) -> Result<(i32, i32, u32, u32), String> {
 /// Tauri v1 没有 `start_resize_dragging`，只能在 JS 里跟踪鼠标位移后反复
 /// 调用本命令；尺寸和位置放在同一个命令里设置，避免两次调用间出现撕裂。
 #[tauri::command]
-fn set_window_bounds(window: Window, x: f64, y: f64, width: f64, height: f64) -> Result<(), String> {
+fn set_window_bounds(
+    window: Window,
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+) -> Result<(), String> {
     let width = width.max(1.0);
     let height = height.max(1.0);
     window
@@ -562,7 +564,8 @@ async fn stop_capture_locked(app: AppHandle, state: Arc<SharedState>) -> Result<
     Ok(())
 }
 
-fn emit_status(app: &AppHandle, running: bool, message: impl Into<String>) {    let _ = app.emit_all(
+fn emit_status(app: &AppHandle, running: bool, message: impl Into<String>) {
+    let _ = app.emit_all(
         STATUS_EVENT,
         StatusPayload {
             running,
@@ -749,8 +752,7 @@ fn install_panic_hook() {
 
         #[cfg(target_os = "windows")]
         {
-            static SHOWN: std::sync::atomic::AtomicBool =
-                std::sync::atomic::AtomicBool::new(false);
+            static SHOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
             if !SHOWN.swap(true, std::sync::atomic::Ordering::SeqCst) {
                 show_error_dialog("LiveTranslate 崩溃", &format!("{info}"));
             }
@@ -826,7 +828,10 @@ fn run(args: Args) -> anyhow::Result<()> {
             let hint = AppConfig::user_config_path()
                 .map(|p| p.display().to_string())
                 .unwrap_or_else(|_| "<unknown>".to_string());
-            tracing::warn!("Using built-in defaults. 建议在该位置创建配置文件: {}", hint);
+            tracing::warn!(
+                "Using built-in defaults. 建议在该位置创建配置文件: {}",
+                hint
+            );
         }
     }
     tracing::debug!("Config: {:?}", config.redacted());
@@ -864,13 +869,16 @@ fn run(args: Args) -> anyhow::Result<()> {
                 app.set_activation_policy(tauri::ActivationPolicy::Regular);
             }
 
-            let window = app.get_window("main").ok_or_else(|| anyhow::anyhow!("main window not found"))?;
+            let window = app
+                .get_window("main")
+                .ok_or_else(|| anyhow::anyhow!("main window not found"))?;
 
             // 以下步骤均“尽力而为”，失败不应阻止应用启动
             if let Err(e) = apply_window_config(&window, &config) {
                 tracing::warn!("Failed to apply window config: {e}");
             }
-            if let Err(e) = window.emit(CONFIG_EVENT, OverlayConfigPayload::from(&config.subtitle)) {
+            if let Err(e) = window.emit(CONFIG_EVENT, OverlayConfigPayload::from(&config.subtitle))
+            {
                 tracing::warn!("Failed to emit config event: {e}");
             }
             if let Err(e) = tray::register_global_shortcuts(&app.handle()) {

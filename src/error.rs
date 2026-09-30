@@ -32,9 +32,6 @@ pub enum AppError {
     #[error("Device not found: {0}")]
     DeviceNotFound(String),
 
-    #[error("Recording error: {0}")]
-    Recording(String),
-
     #[error("CPAL error: {0}")]
     CpalDevices(String),
 
@@ -43,9 +40,6 @@ pub enum AppError {
 
     #[error("CPAL play stream error: {0}")]
     CpalPlayStream(String),
-
-    #[error("Unknown error: {0}")]
-    Unknown(String),
 }
 
 impl From<cpal::Error> for AppError {

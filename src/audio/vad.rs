@@ -71,9 +71,9 @@ impl EnergyVad {
         self.scratch.clear();
         self.scratch.extend(self.window.iter().copied());
         let idx = ((self.scratch.len() as f32 - 1.0) * self.percentile) as usize;
-        let (_, &mut value, _) =
-            self.scratch
-                .select_nth_unstable_by(idx, |a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let (_, &mut value, _) = self.scratch.select_nth_unstable_by(idx, |a, b| {
+            a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
+        });
         value
     }
 
@@ -115,12 +115,6 @@ impl EnergyVad {
     pub fn current_noise_floor(&mut self) -> f32 {
         self.noise_floor()
     }
-
-    pub fn reset(&mut self) {
-        self.window.clear();
-        self.active = false;
-        self.active_frames = 0;
-    }
 }
 
 #[cfg(test)]
@@ -129,9 +123,7 @@ mod tests {
 
     fn tone(len: usize, amplitude: f32, freq: f32, sample_rate: f32) -> Vec<f32> {
         (0..len)
-            .map(|i| {
-                amplitude * (2.0 * std::f32::consts::PI * freq * i as f32 / sample_rate).sin()
-            })
+            .map(|i| amplitude * (2.0 * std::f32::consts::PI * freq * i as f32 / sample_rate).sin())
             .collect()
     }
 

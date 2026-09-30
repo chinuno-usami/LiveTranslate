@@ -110,7 +110,11 @@ mod tests {
         let input: Vec<f32> = (0..48000).map(|i| (i as f32 * 0.01).sin()).collect();
         let mut output = Vec::new();
         resampler.process(&input, &mut output);
-        assert!(output.len() >= 15000 && output.len() <= 16500, "got {}", output.len());
+        assert!(
+            output.len() >= 15000 && output.len() <= 16500,
+            "got {}",
+            output.len()
+        );
     }
 
     #[test]
@@ -124,7 +128,12 @@ mod tests {
 
     #[test]
     fn test_resample_streaming_blocks_do_not_stall_or_drift() {
-        for &(rate, block) in &[(48000u32, 512usize), (48000, 1024), (44100, 512), (44100, 1024)] {
+        for &(rate, block) in &[
+            (48000u32, 512usize),
+            (48000, 1024),
+            (44100, 512),
+            (44100, 1024),
+        ] {
             let mut resampler = LinearResampler::new(rate, 16000);
             let total = rate as usize * 5;
             let input: Vec<f32> = (0..total).map(|i| (i as f32 * 0.01).sin()).collect();

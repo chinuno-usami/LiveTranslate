@@ -90,7 +90,25 @@ fn is_wrapped_in_brackets(text: &str) -> bool {
 fn normalize(text: &str) -> String {
     text.chars()
         .filter(|c| !c.is_whitespace() && !c.is_ascii_punctuation())
-        .filter(|c| !matches!(c, '，' | '。' | '！' | '？' | '、' | '；' | '：' | '“' | '”' | '‘' | '’' | '（' | '）' | '【' | '】'))
+        .filter(|c| {
+            !matches!(
+                c,
+                '，' | '。'
+                    | '！'
+                    | '？'
+                    | '、'
+                    | '；'
+                    | '：'
+                    | '“'
+                    | '”'
+                    | '‘'
+                    | '’'
+                    | '（'
+                    | '）'
+                    | '【'
+                    | '】'
+            )
+        })
         .flat_map(|c| c.to_lowercase())
         .collect()
 }
@@ -119,7 +137,9 @@ pub fn is_meaningful_speech(text: &str) -> bool {
         let normalized = normalize(trimmed);
         if !normalized.is_empty()
             && (EXACT_HALLUCINATIONS.iter().any(|p| normalized == *p)
-                || SUBSTRING_HALLUCINATIONS.iter().any(|p| normalized.contains(p)))
+                || SUBSTRING_HALLUCINATIONS
+                    .iter()
+                    .any(|p| normalized.contains(p)))
         {
             return false;
         }
@@ -162,7 +182,9 @@ mod tests {
     fn keeps_real_speech() {
         assert!(is_meaningful_speech("Hello, everyone."));
         assert!(is_meaningful_speech("今天我们来聊一个很有意思的话题"));
-        assert!(is_meaningful_speech("The quick brown fox jumps over the lazy dog."));
+        assert!(is_meaningful_speech(
+            "The quick brown fox jumps over the lazy dog."
+        ));
         // 括号出现在句子中间不应被丢弃
         assert!(is_meaningful_speech("他说（大概）明天会来"));
         // 通用标记词出现在真实语句中不应丢弃
@@ -178,7 +200,8 @@ mod tests {
     #[test]
     fn long_text_is_not_phrase_filtered() {
         // 长句即使包含敏感短语也不过滤，避免误伤
-        let long = "This is a very long sentence that happens to contain the words thanks for watching \
+        let long =
+            "This is a very long sentence that happens to contain the words thanks for watching \
                     but it is clearly a real utterance from the speaker in this recording.";
         assert!(long.chars().count() > MAX_PHRASE_CHECK_LEN);
         assert!(is_meaningful_speech(long));

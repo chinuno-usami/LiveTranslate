@@ -260,8 +260,14 @@ impl OpenAiClient {
 /// 全角标签用 Unicode 转义书写，避免源文件里出现全角字符导致被工具链丢失。
 pub fn strip_reasoning(text: &str) -> String {
     // ｜ = U+FF5C，▁ = U+2581
-    const OPENS: [&str; 2] = ["<think>", "<\u{FF5C}begin\u{2581}of\u{2581}thinking\u{FF5C}>"];
-    const CLOSES: [&str; 2] = ["</think>", "<\u{FF5C}end\u{2581}of\u{2581}thinking\u{FF5C}>"];
+    const OPENS: [&str; 2] = [
+        "<think>",
+        "<\u{FF5C}begin\u{2581}of\u{2581}thinking\u{FF5C}>",
+    ];
+    const CLOSES: [&str; 2] = [
+        "</think>",
+        "<\u{FF5C}end\u{2581}of\u{2581}thinking\u{FF5C}>",
+    ];
 
     fn find_close(s: &str) -> Option<(usize, usize)> {
         CLOSES
@@ -330,7 +336,10 @@ mod tests {
         assert!((temperature - 0.2).abs() < 1e-6, "温度不对: {temperature}");
 
         assert!(body.get("reasoning_effort").is_none());
-        assert!(body["messages"][0]["content"].as_str().unwrap().contains("sys"));
+        assert!(body["messages"][0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("sys"));
     }
 
     #[test]
@@ -338,7 +347,10 @@ mod tests {
         let mut cfg = config("");
         cfg.send_temperature = false;
         let body = OpenAiClient::new(cfg).build_body("hi");
-        assert!(body.get("temperature").is_none(), "关闭后不应发送 temperature");
+        assert!(
+            body.get("temperature").is_none(),
+            "关闭后不应发送 temperature"
+        );
     }
 
     #[test]
@@ -356,9 +368,8 @@ mod tests {
     #[test]
     fn extra_body_overrides_presets() {
         let mut cfg = config("reasoning_effort");
-        cfg.extra_body = Some(
-            toml::from_str::<toml::Value>("reasoning_effort = \"none\"").unwrap(),
-        );
+        cfg.extra_body =
+            Some(toml::from_str::<toml::Value>("reasoning_effort = \"none\"").unwrap());
 
         let body = OpenAiClient::new(cfg).build_body("x");
         assert_eq!(body["reasoning_effort"], "none", "extra_body 应覆盖预设");
@@ -407,7 +418,8 @@ mod tests {
 
     #[test]
     fn null_content_deserializes_as_empty() {
-        let m: ChatMessage = serde_json::from_str(r#"{"role":"assistant","content":null}"#).unwrap();
+        let m: ChatMessage =
+            serde_json::from_str(r#"{"role":"assistant","content":null}"#).unwrap();
         assert_eq!(m.content, "");
     }
 }

@@ -3,11 +3,7 @@ use hound::{WavSpec, WavWriter};
 use std::io::Cursor;
 
 /// 将 f32 音频样本编码为 WAV 格式
-pub fn encode_wav(
-    samples: &[f32],
-    sample_rate: u32,
-    channels: u16,
-) -> AppResult<Vec<u8>> {
+pub fn encode_wav(samples: &[f32], sample_rate: u32, channels: u16) -> AppResult<Vec<u8>> {
     let spec = WavSpec {
         channels,
         sample_rate,
@@ -42,7 +38,7 @@ mod tests {
     fn test_encode_wav() {
         let samples = vec![0.1; 1000];
         let wav = encode_wav(&samples, 16000, 1).unwrap();
-        
+
         // WAV 文件应该有有效的头
         assert!(wav.len() > 44); // 最小 WAV 头大小
         assert_eq!(&wav[0..4], b"RIFF");

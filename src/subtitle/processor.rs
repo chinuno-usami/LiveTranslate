@@ -49,11 +49,7 @@ impl SubtitleProcessor {
 
     /// 尝试做前缀/后缀去重 - 返回去重后的文本和翻译
     /// 用于处理重叠分片的情况
-    pub fn deduplicate_overlap(
-        &self,
-        text: &str,
-        translation: &str,
-    ) -> (String, String) {
+    pub fn deduplicate_overlap(&self, text: &str, translation: &str) -> (String, String) {
         let mut deduplicated_text = text.to_string();
         let mut deduplicated_translation = translation.to_string();
         if !self.overlap_removal {
@@ -65,14 +61,18 @@ impl SubtitleProcessor {
             // 尝试从当前文本中移除与上一条文本重叠的部分
             if let Some(dedup) = Self::remove_prefix_overlap(last_text, text) {
                 deduplicated_text = dedup;
-                tracing::debug!("Removed text prefix overlap: {} -> {}", text, deduplicated_text);
+                tracing::debug!(
+                    "Removed text prefix overlap: {} -> {}",
+                    text,
+                    deduplicated_text
+                );
             }
         }
 
         if let Some(last_trans) = self.recent_translations.back() {
             // 译文完全重叠时保留原译文（是否跳过由原文决定）
-            if let Some(dedup) = Self::remove_prefix_overlap(last_trans, translation)
-                .filter(|d| !d.is_empty())
+            if let Some(dedup) =
+                Self::remove_prefix_overlap(last_trans, translation).filter(|d| !d.is_empty())
             {
                 deduplicated_translation = dedup;
                 tracing::debug!(
@@ -93,7 +93,8 @@ impl SubtitleProcessor {
     /// - 无空格语言（中文、日文等）
     fn remove_prefix_overlap(previous: &str, current: &str) -> Option<String> {
         // 含空格的文本按词匹配；逐字符匹配只用于无空格语言，避免在英文单词中间截断
-        let spaced = previous.contains(char::is_whitespace) || current.contains(char::is_whitespace);
+        let spaced =
+            previous.contains(char::is_whitespace) || current.contains(char::is_whitespace);
         if spaced {
             return Self::remove_word_overlap(previous, current);
         }
@@ -185,6 +186,7 @@ impl SubtitleProcessor {
     }
 
     /// 计算 Levenshtein 距离
+    #[allow(clippy::needless_range_loop)]
     fn levenshtein_distance(a: &str, b: &str) -> usize {
         let a_chars: Vec<char> = a.chars().collect();
         let b_chars: Vec<char> = b.chars().collect();
@@ -200,10 +202,14 @@ impl SubtitleProcessor {
 
         for i in 1..=a_chars.len() {
             for j in 1..=b_chars.len() {
-                let cost = if a_chars[i - 1] == b_chars[j - 1] { 0 } else { 1 };
+                let cost = if a_chars[i - 1] == b_chars[j - 1] {
+                    0
+                } else {
+                    1
+                };
                 matrix[i][j] = *[
-                    matrix[i - 1][j] + 1,      // deletion
-                    matrix[i][j - 1] + 1,      // insertion
+                    matrix[i - 1][j] + 1,        // deletion
+                    matrix[i][j - 1] + 1,        // insertion
                     matrix[i - 1][j - 1] + cost, // substitution
                 ]
                 .iter()
@@ -233,9 +239,15 @@ mod tests {
         let result = SubtitleProcessor::remove_prefix_overlap(prev, curr);
         assert_eq!(result, Some("you".to_string()));
         // 单个词巧合不算重叠
-        assert_eq!(SubtitleProcessor::remove_prefix_overlap("I think so", "so what"), None);
+        assert_eq!(
+            SubtitleProcessor::remove_prefix_overlap("I think so", "so what"),
+            None
+        );
         // 英文不做逐字符截断
-        assert_eq!(SubtitleProcessor::remove_prefix_overlap("go to the", "theory is"), None);
+        assert_eq!(
+            SubtitleProcessor::remove_prefix_overlap("go to the", "theory is"),
+            None
+        );
     }
 
     #[test]
