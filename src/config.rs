@@ -413,6 +413,18 @@ impl AppConfig {
         Ok(())
     }
 
+    /// 返回一份抹掉密钥的副本，仅用于日志输出
+    pub fn redacted(&self) -> Self {
+        fn mask(s: &str) -> String {
+            if s.is_empty() { String::new() } else { "***".to_string() }
+        }
+        let mut c = self.clone();
+        c.translate.api_key = mask(&c.translate.api_key);
+        c.asr.api_key = c.asr.api_key.as_deref().map(mask);
+        c.asr.edge.trusted_client_token = c.asr.edge.trusted_client_token.as_deref().map(mask);
+        c
+    }
+
     /// 就地修改配置文件里的单个键值（**保留注释与原有排版**）
     ///
     /// 不直接重写整个文件，因为那会丢失用户在配置里写的注释。
@@ -422,10 +434,23 @@ impl AppConfig {
         key: &str,
         value: &str,
     ) -> AppResult<()> {
-        let original = fs::read_to_string(path).unwrap_or_default();
+        // 多个命令（异步线程 + 主线程）可能同时写配置，串行化读改写
+        static WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        // 读取失败（非 UTF-8、被占用等）必须报错：若当成空文件，
+        // 写回时只剩一个键值，会抹掉用户整个配置（包括 API Key）
+        let original = match fs::read_to_string(path) {
+            Ok(s) => s,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(e) => return Err(e.into()),
+        };
         let updated = patch_toml(&original, section, key, value);
         if updated != original {
-            fs::write(path, updated)?;
+            // 先写临时文件再 rename，避免中途崩溃/并发读看到截断的文件
+            let tmp = path.with_extension("toml.tmp");
+            fs::write(&tmp, updated)?;
+            fs::rename(&tmp, path)?;
         }
         Ok(())
     }

@@ -782,6 +782,11 @@ fn run(args: Args) -> anyhow::Result<()> {
 
     let (config, config_path) = match AppConfig::resolve(args.config.clone()) {
         Ok(resolved) => resolved,
+        // 显式指定的配置解析失败必须报错退出，否则 UI 改动会无处保存且提示误导
+        Err(e) if args.config.is_some() => {
+            tracing::error!("Failed to load config: {}", e);
+            return Err(e.into());
+        }
         Err(e) => {
             tracing::error!("Failed to load config: {}", e);
             tracing::warn!("Falling back to built-in default configuration");
@@ -798,7 +803,7 @@ fn run(args: Args) -> anyhow::Result<()> {
             tracing::warn!("Using built-in defaults. 建议在该位置创建配置文件: {}", hint);
         }
     }
-    tracing::debug!("Config: {:?}", config);
+    tracing::debug!("Config: {:?}", config.redacted());
 
     if args.list_devices {
         let runtime = tokio::runtime::Runtime::new()?;

@@ -8,6 +8,8 @@ pub struct SubtitleProcessor {
     recent_translations: VecDeque<String>,
     /// 历史大小
     history_size: usize,
+    /// 是否做重叠去重（仅固定分片且分片有重叠时才有意义；VAD 分段之间没有重叠）
+    overlap_removal: bool,
 }
 
 impl SubtitleProcessor {
@@ -16,7 +18,14 @@ impl SubtitleProcessor {
             recent_texts: VecDeque::with_capacity(3),
             recent_translations: VecDeque::with_capacity(3),
             history_size: 3,
+            overlap_removal: false,
         }
+    }
+
+    /// 开启/关闭重叠去重
+    pub fn with_overlap_removal(mut self, enabled: bool) -> Self {
+        self.overlap_removal = enabled;
+        self
     }
 
     /// 检查是否重复
@@ -47,6 +56,9 @@ impl SubtitleProcessor {
     ) -> (String, String) {
         let mut deduplicated_text = text.to_string();
         let mut deduplicated_translation = translation.to_string();
+        if !self.overlap_removal {
+            return (deduplicated_text, deduplicated_translation);
+        }
 
         // 如果最后一条有记录，尝试移除前缀重叠
         if let Some(last_text) = self.recent_texts.back() {
@@ -58,7 +70,10 @@ impl SubtitleProcessor {
         }
 
         if let Some(last_trans) = self.recent_translations.back() {
-            if let Some(dedup) = Self::remove_prefix_overlap(last_trans, translation) {
+            // 译文完全重叠时保留原译文（是否跳过由原文决定）
+            if let Some(dedup) = Self::remove_prefix_overlap(last_trans, translation)
+                .filter(|d| !d.is_empty())
+            {
                 deduplicated_translation = dedup;
                 tracing::debug!(
                     "Removed translation prefix overlap: {} -> {}",
@@ -77,8 +92,10 @@ impl SubtitleProcessor {
     /// - 空格分词语言（英文等）
     /// - 无空格语言（中文、日文等）
     fn remove_prefix_overlap(previous: &str, current: &str) -> Option<String> {
-        if let Some(word_result) = Self::remove_word_overlap(previous, current) {
-            return Some(word_result);
+        // 含空格的文本按词匹配；逐字符匹配只用于无空格语言，避免在英文单词中间截断
+        let spaced = previous.contains(char::is_whitespace) || current.contains(char::is_whitespace);
+        if spaced {
+            return Self::remove_word_overlap(previous, current);
         }
         Self::remove_char_overlap(previous, current)
     }
@@ -92,16 +109,14 @@ impl SubtitleProcessor {
             return None;
         }
 
-        for overlap_count in (1..=prev_words.len().min(curr_words.len())).rev() {
+        // 至少 2 个词才认为是重叠，单词巧合（如 "so"）不处理
+        for overlap_count in (2..=prev_words.len().min(curr_words.len())).rev() {
             let prev_end = &prev_words[prev_words.len() - overlap_count..];
             let curr_start = &curr_words[..overlap_count];
 
             if prev_end == curr_start {
-                let remaining: Vec<&str> = curr_words[overlap_count..].to_vec();
-                if remaining.is_empty() {
-                    return None;
-                }
-                return Some(remaining.join(" "));
+                // 完全重叠返回空串，由调用方跳过
+                return Some(curr_words[overlap_count..].join(" "));
             }
         }
 
@@ -125,11 +140,7 @@ impl SubtitleProcessor {
 
             if prev_end == curr_start {
                 let remaining: String = curr_chars[overlap_count..].iter().collect();
-                let trimmed = remaining.trim();
-                if trimmed.is_empty() {
-                    return None;
-                }
-                return Some(trimmed.to_string());
+                return Some(remaining.trim().to_string());
             }
         }
 
@@ -163,7 +174,8 @@ impl SubtitleProcessor {
         }
 
         // 简单的编辑距离相似度
-        let max_len = a.len().max(b.len());
+        // 编辑距离按字符计，长度也必须按字符计（CJK 每字 3 字节）
+        let max_len = a_lower.chars().count().max(b_lower.chars().count());
         if max_len == 0 {
             return 1.0;
         }
@@ -216,10 +228,14 @@ mod tests {
 
     #[test]
     fn test_remove_prefix_overlap() {
-        let prev = "hello world how";
+        let prev = "hello world how are";
         let curr = "how are you";
         let result = SubtitleProcessor::remove_prefix_overlap(prev, curr);
-        assert_eq!(result, Some("are you".to_string()));
+        assert_eq!(result, Some("you".to_string()));
+        // 单个词巧合不算重叠
+        assert_eq!(SubtitleProcessor::remove_prefix_overlap("I think so", "so what"), None);
+        // 英文不做逐字符截断
+        assert_eq!(SubtitleProcessor::remove_prefix_overlap("go to the", "theory is"), None);
     }
 
     #[test]
@@ -252,5 +268,20 @@ mod tests {
         assert!(SubtitleProcessor::similarity("hello", "hello") > 0.95);
         assert!(SubtitleProcessor::similarity("hello", "hallo") > 0.7);
         assert!(SubtitleProcessor::similarity("abc", "xyz") < 0.5);
+    }
+
+    #[test]
+    fn test_similarity_cjk_uses_char_length() {
+        let a = "今天我们讨论一下这个项目的进展和问题";
+        let b = "今天我们讨论一下那个项目的进度和问题";
+        assert!(SubtitleProcessor::similarity(a, b) < 0.95);
+    }
+
+    #[test]
+    fn test_overlap_removal_disabled_by_default() {
+        let mut p = SubtitleProcessor::new();
+        p.record("hello world how are", "x");
+        let (t, _) = p.deduplicate_overlap("how are you", "y");
+        assert_eq!(t, "how are you");
     }
 }

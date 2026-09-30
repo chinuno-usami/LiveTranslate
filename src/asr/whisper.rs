@@ -64,18 +64,21 @@ impl WhisperClient {
             samples.len()
         );
 
-        let form = reqwest::multipart::Form::new()
+        let mut form = reqwest::multipart::Form::new()
             .part(
                 "file",
                 reqwest::multipart::Part::bytes(audio_data).file_name("audio.wav"),
             )
-            .text("model", self.config.model.clone())
-            .text("language", language.to_string());
+            .text("model", self.config.model.clone());
+        // "auto" 不是 ISO-639-1 代码，OpenAI 等会返回 400；省略字段即为自动检测
+        if !language.eq_ignore_ascii_case("auto") {
+            form = form.text("language", language.to_string());
+        }
 
         let mut request = self
             .client
             .post(&url)
-            .timeout(Duration::from_secs(self.config.timeout_secs))
+            .timeout(Duration::from_secs(self.config.timeout_secs.max(1)))
             .multipart(form);
 
         // 可选认证：默认 Authorization: Bearer <token>

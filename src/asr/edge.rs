@@ -275,16 +275,21 @@ impl EdgeAsrClient {
                         .and_then(|v| v.as_str())
                         .unwrap_or("");
                     if status == "Success" {
-                        text = payload
+                        // 一个 turn 可能产出多个 phrase（长片段中间有停顿），需要拼接
+                        let phrase = payload
                             .get("DisplayText")
                             .and_then(|v| v.as_str())
                             .unwrap_or("")
-                            .trim()
-                            .to_string();
+                            .trim();
+                        if !phrase.is_empty() {
+                            if !text.is_empty() {
+                                text.push(' ');
+                            }
+                            text.push_str(phrase);
+                        }
                     } else {
-                        // NoMatch / InitialSilenceTimeout 等都属于正常结果
+                        // NoMatch / InitialSilenceTimeout 等都属于正常结果，不清空已识别内容
                         tracing::debug!("Edge ASR status: {}", status);
-                        text.clear();
                     }
                 }
                 "turn.end" => break,

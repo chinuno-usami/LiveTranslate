@@ -263,6 +263,8 @@ pub async fn run_pipeline(
         resampler.is_needed()
     );
 
+    // VAD 分段之间没有重叠，只有固定分片模式需要做重叠去重
+    let overlap_removal = !config.vad.enabled;
     let mut segmenter = if config.vad.enabled {
         let (engine, warning) = VadEngine::from_config(&config.vad, target_rate);
         tracing::info!(
@@ -314,7 +316,8 @@ pub async fn run_pipeline(
     let filter_hallucination = config.asr.filter_hallucination;
 
     let worker = tokio::spawn(async move {
-        let mut subtitle_processor = SubtitleProcessor::new();
+        let mut subtitle_processor = SubtitleProcessor::new()
+            .with_overlap_removal(overlap_removal);
         let mut last_notice = String::new();
 
         while let Some(chunk) = utterance_rx.recv().await {
@@ -342,7 +345,7 @@ pub async fn run_pipeline(
     let mut pushed_chunks: u64 = 0;
     let mut dropped_segments: u64 = 0;
 
-    loop {
+    'capture: loop {
         tokio::select! {
             changed = stop_rx.changed() => {
                 // 发送端被丢弃也视为停止，避免 changed() 持续返回 Err 导致空转
@@ -352,9 +355,11 @@ pub async fn run_pipeline(
                 }
             }
             samples = audio_capture.next_chunk() => {
+                // 音频通道关闭（设备拔出/流错误）：结束流水线而不是空转
                 let Some(samples) = samples else {
-                    tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
-                    continue;
+                    tracing::warn!("Audio stream ended, stopping pipeline");
+                    send_notice(&tx, &mut last_notice, "音频输入已中断（设备断开？），已停止采集".to_string()).await;
+                    break 'capture;
                 };
 
                 // 下混已是单声道，这里做重采样到目标采样率
@@ -403,7 +408,7 @@ pub async fn run_pipeline(
                                 dropped_segments
                             );
                         }
-                        Err(TrySendError::Closed(_)) => break,
+                        Err(TrySendError::Closed(_)) => break 'capture,
                     }
                 }
             }
@@ -411,8 +416,16 @@ pub async fn run_pipeline(
     }
 
     // 采集结束：关闭发送端，等处理任务收尾
+    // 最多等待一小段时间让在途请求收尾，超时直接中止，避免停止操作卡住数分钟
     drop(utterance_tx);
-    let _ = worker.await;
+    let mut worker = worker;
+    if tokio::time::timeout(std::time::Duration::from_secs(2), &mut worker)
+        .await
+        .is_err()
+    {
+        tracing::info!("Worker did not finish in time, aborting pending segments");
+        worker.abort();
+    }
 
     audio_capture.stop();
     tracing::info!("Audio pipeline stopped");

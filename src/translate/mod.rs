@@ -9,7 +9,13 @@ use crate::error::{AppError, AppResult};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
     pub role: String,
+    /// 部分服务在只输出推理或被截断时返回 `"content": null`
+    #[serde(default, deserialize_with = "null_as_empty")]
     pub content: String,
+}
+
+fn null_as_empty<'de, D: serde::Deserializer<'de>>(d: D) -> Result<String, D::Error> {
+    Ok(Option::<String>::deserialize(d)?.unwrap_or_default())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -119,7 +125,7 @@ impl OpenAiClient {
             .client
             .get(&url)
             .header("Authorization", format!("Bearer {}", self.config.api_key))
-            .timeout(Duration::from_secs(self.config.timeout_secs))
+            .timeout(Duration::from_secs(self.config.timeout_secs.max(1)))
             .send()
             .await?;
 
@@ -181,7 +187,7 @@ impl OpenAiClient {
             .client
             .post(&url)
             .header("Authorization", format!("Bearer {}", self.config.api_key))
-            .timeout(Duration::from_secs(self.config.timeout_secs))
+            .timeout(Duration::from_secs(self.config.timeout_secs.max(1)))
             .json(&body)
             .send()
             .await?;
@@ -397,5 +403,11 @@ mod tests {
     fn keeps_plain_text_intact() {
         assert_eq!(strip_reasoning("你好，世界"), "你好，世界");
         assert_eq!(strip_reasoning("  前后空白  "), "前后空白");
+    }
+
+    #[test]
+    fn null_content_deserializes_as_empty() {
+        let m: ChatMessage = serde_json::from_str(r#"{"role":"assistant","content":null}"#).unwrap();
+        assert_eq!(m.content, "");
     }
 }

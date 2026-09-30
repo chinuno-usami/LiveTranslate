@@ -7,9 +7,10 @@
 //!
 //! 这里做保守过滤：只丢掉明显不是语音内容的输出，避免误伤真实语句。
 
-/// 归一化后用于比对的已知幻听短语（小写、无空格与标点）
-const HALLUCINATIONS: &[&str] = &[
-    // 通用标记
+/// 通用标记词：归一化后必须**整段相等**才丢弃
+///
+/// 这些词在真实语句里也常见（"I love music"、"我订阅了"），不能做子串匹配。
+const EXACT_HALLUCINATIONS: &[&str] = &[
     "music",
     "applause",
     "laughter",
@@ -23,7 +24,12 @@ const HALLUCINATIONS: &[&str] = &[
     "笑声",
     "音乐",
     "静音",
-    // 常见的"字幕组/感谢观看"类幻听
+    "訂閱",
+    "订阅",
+];
+
+/// 特征明显的长短语：短文本中以子串出现即丢弃
+const SUBSTRING_HALLUCINATIONS: &[&str] = &[
     "thanksforwatching",
     "thankyouforwatching",
     "pleasesubscribe",
@@ -35,9 +41,7 @@ const HALLUCINATIONS: &[&str] = &[
     "字幕志愿者",
     "感谢观看",
     "谢谢观看",
-    "请不吝",
-    "訂閱",
-    "订阅",
+    "请不吝点赞",
     "ご視聴ありがとうございました",
     "ご視聴ありがとう",
 ];
@@ -58,14 +62,28 @@ fn is_wrapped_in_brackets(text: &str) -> bool {
         ('《', '》'),
     ];
 
-    let mut chars = text.chars();
-    let (Some(first), Some(last)) = (chars.next(), text.chars().last()) else {
+    let Some(first) = text.chars().next() else {
+        return false;
+    };
+    let Some(&(open, close)) = PAIRS.iter().find(|(o, _)| *o == first) else {
         return false;
     };
 
-    PAIRS
-        .iter()
-        .any(|(open, close)| first == *open && last == *close)
+    // 首字符的配对闭括号必须恰好是最后一个字符：
+    // "(laughs) Hello (sighs)" 首尾虽是括号，但中间有正文，不能丢弃
+    let mut depth = 0usize;
+    let count = text.chars().count();
+    for (i, c) in text.chars().enumerate() {
+        if c == open {
+            depth += 1;
+        } else if c == close {
+            depth = depth.saturating_sub(1);
+            if depth == 0 {
+                return i == count - 1;
+            }
+        }
+    }
+    false
 }
 
 /// 归一化：转小写并去掉所有空白与标点符号
@@ -99,7 +117,10 @@ pub fn is_meaningful_speech(text: &str) -> bool {
     // 短文本才做幻听短语比对，长句不比对以免误伤
     if trimmed.chars().count() <= MAX_PHRASE_CHECK_LEN {
         let normalized = normalize(trimmed);
-        if !normalized.is_empty() && HALLUCINATIONS.iter().any(|p| normalized.contains(p)) {
+        if !normalized.is_empty()
+            && (EXACT_HALLUCINATIONS.iter().any(|p| normalized == *p)
+                || SUBSTRING_HALLUCINATIONS.iter().any(|p| normalized.contains(p)))
+        {
             return false;
         }
     }
@@ -144,6 +165,14 @@ mod tests {
         assert!(is_meaningful_speech("The quick brown fox jumps over the lazy dog."));
         // 括号出现在句子中间不应被丢弃
         assert!(is_meaningful_speech("他说（大概）明天会来"));
+        // 通用标记词出现在真实语句中不应丢弃
+        assert!(is_meaningful_speech("I love music"));
+        assert!(is_meaningful_speech("Keep the noise down"));
+        assert!(is_meaningful_speech("我订阅了"));
+        assert!(!is_meaningful_speech("Music."));
+        // 首尾是括号但中间有正文
+        assert!(is_meaningful_speech("(laughs) Hello there (sighs)"));
+        assert!(is_meaningful_speech("[Music] hi [Music]"));
     }
 
     #[test]
