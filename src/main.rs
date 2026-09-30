@@ -171,7 +171,8 @@ async fn set_font_size(
     state: State<'_, Arc<SharedState>>,
     size: u32,
 ) -> Result<(), String> {
-    let size = size.clamp(10, 120);
+    // 与前端滑块范围（tauri-ui/app.js MIN_FONT/MAX_FONT）保持一致
+    let size = size.clamp(12, 72);
     state.font_size.store(size, Ordering::SeqCst);
     persist_setting(
         state.config_path.as_ref(),
@@ -241,6 +242,15 @@ async fn set_language(
 ) -> Result<(), String> {
     let backend = state.config.asr.backend.clone();
     let normalized = asr::languages::normalize_for_backend(&backend, &code);
+    // 值会写回 TOML，只接受语言代码常见字符，防止换行/引号注入破坏配置
+    if normalized.is_empty()
+        || normalized.len() > 32
+        || !normalized
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return Err(format!("非法语言代码: {code}"));
+    }
 
     // watch::Sender::send 仅在“无接收者”时失败，不影响设置本身
     let _ = state.language_tx.send(normalized.clone());
@@ -255,7 +265,7 @@ async fn set_language(
         state.config_path.as_ref(),
         section,
         key,
-        &format!("\"{}\"", normalized.replace('"', "")),
+        &format!("\"{}\"", normalized),
     );
 
     tracing::info!("ASR language set to: {}", normalized);
@@ -672,7 +682,23 @@ fn init_logging(level: &str) -> Option<tracing_appender::non_blocking::WorkerGua
 
     // 文件输出：双击运行（GUI 子系统、无控制台）时唯一的可诊断手段
     if let Some((log_path, log_dir, file_name)) = resolve_log_target() {
-        let appender = tracing_appender::rolling::never(&log_dir, file_name);
+        // 按天滚动并只保留最近 7 个文件，避免日志无限增长
+        let appender = match tracing_appender::rolling::Builder::new()
+            .rotation(tracing_appender::rolling::Rotation::DAILY)
+            .filename_prefix(file_name.clone())
+            .max_log_files(7)
+            .build(&log_dir)
+        {
+            Ok(a) => a,
+            Err(e) => {
+                eprintln!("failed to create rolling log ({e}), falling back to single file");
+                tracing_appender::rolling::RollingFileAppender::new(
+                    tracing_appender::rolling::Rotation::NEVER,
+                    &log_dir,
+                    file_name,
+                )
+            }
+        };
         let (writer, guard) = tracing_appender::non_blocking(appender);
 
         let file_layer = tracing_subscriber::fmt::layer()
@@ -688,7 +714,7 @@ fn init_logging(level: &str) -> Option<tracing_appender::non_blocking::WorkerGua
         if let Err(e) = tracing::subscriber::set_global_default(subscriber) {
             eprintln!("failed to set tracing subscriber: {e}");
         }
-        eprintln!("log file: {}", log_path.display());
+        eprintln!("log file: {}.<date>", log_path.display());
         return Some(guard);
     }
 

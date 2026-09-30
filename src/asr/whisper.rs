@@ -145,7 +145,7 @@ impl WhisperClient {
         if text.is_empty() {
             tracing::debug!("Empty ASR response");
         } else {
-            tracing::info!("ASR result: {}", text);
+            tracing::debug!("ASR result: {}", text);
         }
 
         Ok(text)

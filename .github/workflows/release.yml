@@ -186,6 +186,8 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
+
       - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
@@ -206,10 +208,22 @@ jobs:
             echo "tag=${INPUT_TAG}" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Verify tag matches crate version
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          version=$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"(.*)".*/\1/')
+          if [ "${TAG}" != "v${version}" ]; then
+            echo "::error::tag ${TAG} does not match Cargo.toml version v${version}"
+            exit 1
+          fi
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.tag.outputs.tag }}
+          # 手动触发时让 tag 指向实际构建的提交，而不是默认分支 HEAD
+          target_commitish: ${{ github.sha }}
           name: LiveTranslate ${{ steps.tag.outputs.tag }}
           files: dist/*
           generate_release_notes: true

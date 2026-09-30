@@ -46,6 +46,8 @@ pub struct SpeechSegmenter {
     voiced_frames: u32,
     unvoiced_run: u32,
     in_speech: bool,
+    /// 当前段是强制切段后的续段
+    continuing: bool,
     /// 已完成的片段
     ready: VecDeque<Vec<f32>>,
 }
@@ -72,6 +74,7 @@ impl SpeechSegmenter {
             voiced_frames: 0,
             unvoiced_run: 0,
             in_speech: false,
+            continuing: false,
             ready: VecDeque::new(),
         }
     }
@@ -121,21 +124,24 @@ impl SpeechSegmenter {
                 self.finish(true);
             }
         } else {
-            // 维护 pre-roll 缓冲
-            self.pre_buf.extend(frame.iter().copied());
-            let cap = self.pre_pad_frames * self.frame_len;
-            while self.pre_buf.len() > cap {
-                self.pre_buf.pop_front();
-            }
-
-            if speech {
+            if !speech {
+                // 维护 pre-roll 缓冲（只存触发帧之前的帧）
+                self.pre_buf.extend(frame.iter().copied());
+                let cap = self.pre_pad_frames * self.frame_len;
+                while self.pre_buf.len() > cap {
+                    self.pre_buf.pop_front();
+                }
+            } else {
                 // 立即确认开始：不再要求连续 N 帧（抖动已由 VAD 后端的迟滞处理），
                 // 真正的短毛刺靠 min_voiced_frames 过滤
                 self.in_speech = true;
                 self.voiced_frames = 1;
                 self.unvoiced_run = 0;
                 self.utterance.clear();
+                self.continuing = false;
                 self.utterance.extend(self.pre_buf.iter().copied());
+                // 触发帧本身也属于语音，不能丢
+                self.utterance.extend(frame.iter().copied());
                 self.pre_buf.clear();
             }
         }
@@ -154,7 +160,8 @@ impl SpeechSegmenter {
             }
         }
 
-        if self.voiced_frames >= self.min_voiced_frames {
+        // 强制切段后的续段即使很短也属于同一句话，不做最短语音过滤
+        if self.voiced_frames >= self.min_voiced_frames || (self.continuing && self.voiced_frames > 0) {
             let ms = utt.len() as u32 * 1000 / self.sample_rate.max(1);
             tracing::debug!(
                 "VAD segment: {} ms ({} voiced frames){}",
@@ -167,10 +174,12 @@ impl SpeechSegmenter {
 
         if forced {
             // 仍在说话：立刻开启下一段，避免丢掉这段时间的音频
+            self.continuing = true;
             self.in_speech = true;
             self.voiced_frames = 0;
             self.unvoiced_run = 0;
         } else {
+            self.continuing = false;
             self.in_speech = false;
             self.voiced_frames = 0;
             self.unvoiced_run = 0;

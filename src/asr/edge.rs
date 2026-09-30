@@ -204,105 +204,120 @@ impl EdgeAsrClient {
         )
         .await?;
 
-        // 3) 音频：先发一个零长度 WAV 头，再发 PCM16
-        let pcm = f32_to_pcm16(samples);
-        sink.send(binary_message(
-            "audio",
-            &request_id,
-            &wav_header(sample_rate),
-            Some(stream_id),
-            Some("audio/x-wav"),
-        ))
-        .await
-        .map_err(|e| AppError::Asr(format!("Edge ASR 发送失败: {e}")))?;
-
-        let chunk_bytes = ((sample_rate as f64 * AUDIO_CHUNK_SECS) as usize).max(1) * 2;
-        for block in pcm.chunks(chunk_bytes) {
+        // 3) 发送与接收并发进行：服务端可能在上传途中就结束本轮或关闭连接，
+        //    若先发完再读，发送失败会丢掉已识别出的结果
+        let send_audio = async {
+            // 3) 音频：先发一个零长度 WAV 头，再发 PCM16
+            let pcm = f32_to_pcm16(samples);
             sink.send(binary_message(
                 "audio",
                 &request_id,
-                block,
+                &wav_header(sample_rate),
                 Some(stream_id),
-                None,
+                Some("audio/x-wav"),
             ))
             .await
             .map_err(|e| AppError::Asr(format!("Edge ASR 发送失败: {e}")))?;
-        }
 
-        // 结尾静音，随后空负载表示流结束（让服务端尽快收敛结果）
-        let silence_len = (sample_rate as f64 * TRAILING_SILENCE_SECS) as usize * 2;
-        if silence_len > 0 {
-            sink.send(binary_message(
-                "audio",
-                &request_id,
-                &vec![0u8; silence_len],
-                Some(stream_id),
-                None,
-            ))
-            .await
-            .map_err(|e| AppError::Asr(format!("Edge ASR 发送失败: {e}")))?;
-        }
-
-        sink.send(binary_message(
-            "audio",
-            &request_id,
-            &[],
-            Some(stream_id),
-            None,
-        ))
-        .await
-        .map_err(|e| AppError::Asr(format!("Edge ASR 发送失败: {e}")))?;
-
-        // 4) 读取直到 turn.end
-        let mut text = String::new();
-        loop {
-            let Some(message) = stream.next().await else {
-                break;
-            };
-
-            let message =
-                message.map_err(|e| AppError::Asr(format!("Edge ASR 读取失败: {e}")))?;
-
-            let Some((path, body)) = parse_frame(&message) else {
-                continue;
-            };
-
-            match path.as_str() {
-                "speech.phrase" => {
-                    let payload: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
-                    let status = payload
-                        .get("RecognitionStatus")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("");
-                    if status == "Success" {
-                        // 一个 turn 可能产出多个 phrase（长片段中间有停顿），需要拼接
-                        let phrase = payload
-                            .get("DisplayText")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("")
-                            .trim();
-                        if !phrase.is_empty() {
-                            if !text.is_empty() {
-                                text.push(' ');
-                            }
-                            text.push_str(phrase);
-                        }
-                    } else {
-                        // NoMatch / InitialSilenceTimeout 等都属于正常结果，不清空已识别内容
-                        tracing::debug!("Edge ASR status: {}", status);
-                    }
-                }
-                "turn.end" => break,
-                _ => {}
+            let chunk_bytes = ((sample_rate as f64 * AUDIO_CHUNK_SECS) as usize).max(1) * 2;
+            for block in pcm.chunks(chunk_bytes) {
+                sink.send(binary_message(
+                    "audio",
+                    &request_id,
+                    block,
+                    Some(stream_id),
+                    None,
+                ))
+                .await
+                .map_err(|e| AppError::Asr(format!("Edge ASR 发送失败: {e}")))?;
             }
-        }
+
+            // 结尾静音，随后空负载表示流结束（让服务端尽快收敛结果）
+            let silence_len = (sample_rate as f64 * TRAILING_SILENCE_SECS) as usize * 2;
+            if silence_len > 0 {
+                sink.send(binary_message(
+                    "audio",
+                    &request_id,
+                    &vec![0u8; silence_len],
+                    Some(stream_id),
+                    None,
+                ))
+                .await
+                .map_err(|e| AppError::Asr(format!("Edge ASR 发送失败: {e}")))?;
+            }
+
+            sink.send(binary_message(
+                "audio",
+                &request_id,
+                &[],
+                Some(stream_id),
+                None,
+            ))
+            .await
+            .map_err(|e| AppError::Asr(format!("Edge ASR 发送失败: {e}")))?;
+            Ok::<(), AppError>(())
+        };
+
+        let read_result = async {
+            // 4) 读取直到 turn.end
+            let mut text = String::new();
+            loop {
+                let Some(message) = stream.next().await else {
+                    break;
+                };
+
+                let message =
+                    message.map_err(|e| AppError::Asr(format!("Edge ASR 读取失败: {e}")))?;
+
+                let Some((path, body)) = parse_frame(&message) else {
+                    continue;
+                };
+
+                match path.as_str() {
+                    "speech.phrase" => {
+                        let payload: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
+                        let status = payload
+                            .get("RecognitionStatus")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+                        if status == "Success" {
+                            // 一个 turn 可能产出多个 phrase（长片段中间有停顿），需要拼接
+                            let phrase = payload
+                                .get("DisplayText")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .trim();
+                            if !phrase.is_empty() {
+                                if !text.is_empty() {
+                                    text.push(' ');
+                                }
+                                text.push_str(phrase);
+                            }
+                        } else {
+                            // NoMatch / InitialSilenceTimeout 等都属于正常结果，不清空已识别内容
+                            tracing::debug!("Edge ASR status: {}", status);
+                        }
+                    }
+                    "turn.end" => break,
+                    _ => {}
+                }
+            }
+            Ok::<String, AppError>(text)
+        };
+
+        let (send_res, read_res) = tokio::join!(send_audio, read_result);
+        let text = match (send_res, read_res) {
+            (_, Ok(text)) if !text.is_empty() => text,
+            (Err(e), _) => return Err(e),
+            (Ok(()), res) => res?,
+        };
 
         let _ = sink.close().await;
 
         if text.is_empty() {
             tracing::debug!("Empty Edge ASR result");
         } else {
-            tracing::info!("ASR result (edge): {}", text);
+            tracing::debug!("ASR result (edge): {}", text);
         }
 
         Ok(text)

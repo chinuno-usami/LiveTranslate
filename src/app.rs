@@ -176,7 +176,7 @@ async fn process_segment(
                 return Ok(true);
             }
 
-            tracing::info!("Recognized text: {}", text);
+            tracing::debug!("Recognized text: {}", text);
 
             match translator.translate(&text).await {
                 Ok(translated) => {

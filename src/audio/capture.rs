@@ -205,7 +205,8 @@ impl AudioCapture {
             .input_devices()
             .map_err(|e| AppError::CpalDevices(format!("Failed to enumerate input devices: {}", e)))?
         {
-            if device.default_input_config().is_ok() {
+            // 必须与 list_devices 的计数规则一致，否则 mic:N 会打开错误的设备
+            if device.description().is_ok() || device.default_input_config().is_ok() {
                 if idx == want_index {
                     return Ok((device, DeviceKind::Microphone));
                 }
@@ -287,6 +288,8 @@ impl AudioCapture {
         );
 
         let (tx, rx) = mpsc::channel(128);
+        // 消费端跟不上时的丢块计数（实时回调里不能阻塞，只能丢弃并记录）
+        let dropped = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
         let err_fn = |err| {
             tracing::error!("Audio stream error: {}", err);
         };
@@ -296,7 +299,7 @@ impl AudioCapture {
             cpal::SampleFormat::F32 => {
                 let data_fn = move |data: &[f32], _: &cpal::InputCallbackInfo| {
                     let mono = resample::downmix_to_mono(data, native_channels);
-                    let _ = tx.try_send(mono);
+                    send_or_count(&tx, mono, &dropped);
                 };
                 device
                     .build_input_stream(config, data_fn, err_fn, None)
@@ -307,7 +310,7 @@ impl AudioCapture {
                     let converted: Vec<f32> =
                         data.iter().map(|&s| s as f32 / 32768.0).collect();
                     let mono = resample::downmix_to_mono(&converted, native_channels);
-                    let _ = tx.try_send(mono);
+                    send_or_count(&tx, mono, &dropped);
                 };
                 device
                     .build_input_stream(config, data_fn, err_fn, None)
@@ -320,7 +323,7 @@ impl AudioCapture {
                         .map(|&s| (s as f32 - 32768.0) / 32768.0)
                         .collect();
                     let mono = resample::downmix_to_mono(&converted, native_channels);
-                    let _ = tx.try_send(mono);
+                    send_or_count(&tx, mono, &dropped);
                 };
                 device
                     .build_input_stream(config, data_fn, err_fn, None)
@@ -377,4 +380,18 @@ impl DeviceInfo {
 /// 解析 `prefix:<n>` 形式的索引；仅 `prefix` 时返回 None
 fn parse_suffix_index(spec: &str) -> Option<usize> {
     spec.split_once(':').and_then(|(_, idx)| idx.parse().ok())
+}
+
+/// 在音频回调中投递数据；通道满时计数并低频告警
+fn send_or_count(
+    tx: &mpsc::Sender<Vec<f32>>,
+    data: Vec<f32>,
+    dropped: &std::sync::atomic::AtomicU64,
+) {
+    if let Err(mpsc::error::TrySendError::Full(_)) = tx.try_send(data) {
+        let n = dropped.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        if n == 1 || n % 100 == 0 {
+            tracing::warn!("Audio consumer is lagging, dropped {} audio blocks so far", n);
+        }
+    }
 }
