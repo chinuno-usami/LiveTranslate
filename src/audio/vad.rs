@@ -6,7 +6,8 @@
 //! - 帧能量高于 `噪声底 + margin_db` 判为语音（开启阈值）
 //! - 已处于语音态时，需低于 `噪声底 + margin_db * release_ratio` 才回落
 //!   （迟滞可避免句子中间的短暂停顿被误判为结束）
-//! - 噪声底**只在非语音段更新**，避免长句把自己的噪声底抬高而中途截断
+//! - 噪声底主要在非语音段更新；语音态下每 N 帧慢速采样一次，
+//!   使持续抬升的背景噪声（风扇、音乐）最终能被吸收进噪声底，避免 VAD 永久卡在语音态
 //!
 //! 注意：本模块只做"这一帧是不是语音"，句子的起止由 `segmenter` 决定。
 
@@ -26,6 +27,8 @@ pub struct EnergyVad {
     active: bool,
     /// 计算分位数时的临时缓冲
     scratch: Vec<f32>,
+    /// 语音态下已经过的帧数（用于慢速更新噪声底）
+    active_frames: usize,
 }
 
 impl EnergyVad {
@@ -33,6 +36,8 @@ impl EnergyVad {
     const COLD_START_DB: f32 = -60.0;
     /// 冷启动阶段强制采集的帧数
     const BOOTSTRAP_FRAMES: usize = 25;
+    /// 语音态下每隔多少帧把当前帧计入噪声窗口（约 100ms @20ms）
+    const ACTIVE_UPDATE_INTERVAL: usize = 5;
 
     pub fn new(margin_db: f32, percentile: f32) -> Self {
         let window_size = 150; // 约 3s @20ms
@@ -44,6 +49,7 @@ impl EnergyVad {
             release_ratio: 0.6,
             active: false,
             scratch: Vec::with_capacity(window_size),
+            active_frames: 0,
         }
     }
 
@@ -76,7 +82,13 @@ impl EnergyVad {
         let db = Self::frame_db(frame);
 
         // 仅在非语音态更新噪声底（冷启动阶段强制采集足够样本）
-        if !self.active || self.window.len() < Self::BOOTSTRAP_FRAMES {
+        // 语音态下低频采样：正常语句（有停顿）对低分位噪声底影响很小，
+        // 但持续的背景噪声会在若干秒后把噪声底抬上来，从而退出语音态
+        let sample_while_active = self.active && {
+            self.active_frames += 1;
+            self.active_frames % Self::ACTIVE_UPDATE_INTERVAL == 0
+        };
+        if !self.active || sample_while_active || self.window.len() < Self::BOOTSTRAP_FRAMES {
             self.window.push_back(db);
             while self.window.len() > self.window_size {
                 self.window.pop_front();
@@ -90,6 +102,7 @@ impl EnergyVad {
         if self.active {
             if db < threshold_off {
                 self.active = false;
+                self.active_frames = 0;
             }
         } else if db > threshold_on {
             self.active = true;
@@ -106,6 +119,7 @@ impl EnergyVad {
     pub fn reset(&mut self) {
         self.window.clear();
         self.active = false;
+        self.active_frames = 0;
     }
 }
 
@@ -140,5 +154,25 @@ mod tests {
         }
         assert!(!vad.is_speech(&noisy), "纯噪声不应被判为语音");
         assert!(vad.is_speech(&speech), "明显高于噪声底应判为语音");
+    }
+
+    #[test]
+    fn recovers_from_sustained_background_rise() {
+        let mut vad = EnergyVad::new(8.0, 0.1);
+        let quiet = tone(320, 0.002, 300.0, 16000.0);
+        let fan = tone(320, 0.05, 200.0, 16000.0);
+        for _ in 0..40 {
+            vad.is_speech(&quiet);
+        }
+        assert!(vad.is_speech(&fan), "突增的噪声先被判为语音");
+        // 持续的背景噪声最终应被吸收进噪声底
+        let mut released = false;
+        for _ in 0..3000 {
+            if !vad.is_speech(&fan) {
+                released = true;
+                break;
+            }
+        }
+        assert!(released, "持续噪声不应让 VAD 永久处于语音态");
     }
 }

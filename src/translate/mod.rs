@@ -245,34 +245,44 @@ impl OpenAiClient {
 
 /// 去掉模型输出里的思考块
 ///
-/// 兼容两种常见形态：
-/// - 成对标签：` thinking...` + 闭标签 + `答案`
+/// 兼容的形态：
+/// - `<think>...</think>答案`（DeepSeek-R1 / Qwen 等 OpenAI 兼容服务）
+/// - DeepSeek 全角闭标签 `<｜end▁of▁thinking｜>`（可带或不带开始标签）
 /// - 只剩闭标签（服务端已剥离开始标签）：`思考内容` + 闭标签 + `答案`
+/// - 以开始标签起头但未闭合（输出被截断）：整体视为思考内容
 ///
-/// 闭标签用 Unicode 转义书写，避免源文件里出现全角字符导致被工具链丢失。
+/// 全角标签用 Unicode 转义书写，避免源文件里出现全角字符导致被工具链丢失。
 pub fn strip_reasoning(text: &str) -> String {
-    // "<｜end▁of▁thinking｜>"，其中 ｜ = U+FF5C，▁ = U+2581
-    const CLOSE: &str = "<\u{FF5C}end\u{2581}of\u{2581}thinking\u{FF5C}>";
-    const OPEN: &str = " thinking";
+    // ｜ = U+FF5C，▁ = U+2581
+    const OPENS: [&str; 2] = ["<think>", "<\u{FF5C}begin\u{2581}of\u{2581}thinking\u{FF5C}>"];
+    const CLOSES: [&str; 2] = ["</think>", "<\u{FF5C}end\u{2581}of\u{2581}thinking\u{FF5C}>"];
+
+    fn find_close(s: &str) -> Option<(usize, usize)> {
+        CLOSES
+            .iter()
+            .filter_map(|c| s.find(c).map(|i| (i, c.len())))
+            .min_by_key(|&(i, _)| i)
+    }
+    fn rfind_open(s: &str) -> Option<usize> {
+        OPENS.iter().filter_map(|o| s.rfind(o)).max()
+    }
 
     let mut output = String::with_capacity(text.len());
     let mut rest = text;
 
-    while let Some(end) = rest.find(CLOSE) {
-        match rest[..end].rfind(OPEN) {
-            // 有成对标签：丢掉标签之间的内容，保留标签之前的部分
-            Some(start) => output.push_str(&rest[..start]),
-            // 没有开始标签：闭标签之前的内容整段按思考处理
-            None => {}
+    while let Some((end, close_len)) = find_close(rest) {
+        // 有成对标签：保留开始标签之前的部分；没有开始标签：闭标签前整段按思考处理
+        if let Some(start) = rfind_open(&rest[..end]) {
+            output.push_str(&rest[..start]);
         }
-        rest = &rest[end + CLOSE.len()..];
+        rest = &rest[end + close_len..];
     }
-
     output.push_str(rest);
 
-    // 兜底：遇到未闭合的 ` thinking` 时，丢掉它之后的内容
-    if let Some(start) = output.find(OPEN) {
-        output.truncate(start);
+    // 兜底：以未闭合的开始标签起头（被截断），整体丢弃
+    let trimmed = output.trim_start();
+    if OPENS.iter().any(|o| trimmed.starts_with(o)) {
+        return String::new();
     }
 
     output.trim().to_string()
@@ -301,7 +311,7 @@ mod tests {
 
     /// 拼一个“思考块 + 答案”的样本
     fn with_think(inner: &str, answer: &str) -> String {
-        format!(" thinking{inner}{CLOSE}{answer}")
+        format!("<think>{inner}{CLOSE}{answer}")
     }
 
     #[test]
@@ -366,7 +376,21 @@ mod tests {
     #[test]
     fn drops_unterminated_think_block() {
         // 只有开始标签没有结束标签时，之后的内容按思考处理
-        assert_eq!(strip_reasoning(" thinking还在思考中"), "");
+        assert_eq!(strip_reasoning("<think>还在思考中"), "");
+    }
+
+    #[test]
+    fn keeps_word_thinking_in_translation() {
+        assert_eq!(
+            strip_reasoning("I was thinking about it"),
+            "I was thinking about it"
+        );
+    }
+
+    #[test]
+    fn strips_standard_think_tags() {
+        assert_eq!(strip_reasoning("<think>reasoning</think>\n答案"), "答案");
+        assert_eq!(strip_reasoning("reasoning</think>答案"), "答案");
     }
 
     #[test]

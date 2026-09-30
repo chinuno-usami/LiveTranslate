@@ -345,7 +345,8 @@ pub async fn run_pipeline(
     loop {
         tokio::select! {
             changed = stop_rx.changed() => {
-                if changed.is_ok() && *stop_rx.borrow() {
+                // 发送端被丢弃也视为停止，避免 changed() 持续返回 Err 导致空转
+                if changed.is_err() || *stop_rx.borrow() {
                     tracing::info!("Received stop signal for audio pipeline");
                     break;
                 }

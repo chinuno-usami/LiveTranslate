@@ -79,6 +79,8 @@ pub(crate) struct SharedState {
     current_device: Mutex<String>,
     subtitle_state: Mutex<SubtitleState>,
     pipeline: Mutex<PipelineControl>,
+    /// 串行化启动/停止/切换设备，避免并发启动产生无法停止的孤儿流水线
+    lifecycle: Mutex<()>,
     /// 当前窗口是否处于点击穿透（托盘/快捷键需要读写它）
     pub(crate) click_through: AtomicBool,
     /// 当前字号（面板滑块可调）
@@ -117,6 +119,7 @@ impl SharedState {
             current_device: Mutex::new(device),
             subtitle_state: Mutex::new(subtitle_state),
             pipeline: Mutex::new(PipelineControl::new()),
+            lifecycle: Mutex::new(()),
             click_through: AtomicBool::new(click_through),
             font_size: AtomicU32::new(font_size),
             show_source: AtomicBool::new(show_source),
@@ -301,6 +304,7 @@ async fn set_device(
     spec: String,
 ) -> Result<(), String> {
     let state = state.inner().clone();
+    let _lifecycle = state.lifecycle.lock().await;
     let was_running = {
         let pipeline = state.pipeline.lock().await;
         pipeline.is_running()
@@ -308,7 +312,7 @@ async fn set_device(
 
     // 运行中先停止，切换设备后再启动
     if was_running {
-        stop_capture_impl(app.clone(), state.clone()).await?;
+        stop_capture_locked(app.clone(), state.clone()).await?;
     }
 
     {
@@ -317,7 +321,7 @@ async fn set_device(
     }
 
     if was_running {
-        start_capture_impl(app.clone(), state.clone()).await?;
+        start_capture_locked(app.clone(), state.clone()).await?;
     }
 
     emit_status(&app, was_running, format!("设备已切换: {}", spec));
@@ -418,6 +422,12 @@ async fn set_click_through(
 }
 
 async fn start_capture_impl(app: AppHandle, state: Arc<SharedState>) -> Result<(), String> {
+    let _lifecycle = state.lifecycle.lock().await;
+    start_capture_locked(app, state.clone()).await
+}
+
+/// 调用方必须已持有 `state.lifecycle`
+async fn start_capture_locked(app: AppHandle, state: Arc<SharedState>) -> Result<(), String> {
     {
         let pipeline = state.pipeline.lock().await;
         if pipeline.is_running() {
@@ -446,12 +456,12 @@ async fn start_capture_impl(app: AppHandle, state: Arc<SharedState>) -> Result<(
         config.audio.device_name = current_device.clone();
     }
 
-    // 分配新的世代号
-    let generation = {
-        let mut pipeline = state.pipeline.lock().await;
-        pipeline.generation = pipeline.generation.wrapping_add(1);
-        pipeline.generation
-    };
+    // 在持有 pipeline 锁期间分配世代号、spawn 并登记句柄：
+    // 即使 runner 立即失败，forwarder 的清理也必须等句柄登记完才能拿到锁
+    emit_status(&app, true, "字幕采集中");
+    let mut pipeline = state.pipeline.lock().await;
+    pipeline.generation = pipeline.generation.wrapping_add(1);
+    let generation = pipeline.generation;
 
     let app_for_runner = app.clone();
     let runner = tauri::async_runtime::spawn(async move {
@@ -498,18 +508,19 @@ async fn start_capture_impl(app: AppHandle, state: Arc<SharedState>) -> Result<(
         }
     });
 
-    {
-        let mut pipeline = state.pipeline.lock().await;
-        pipeline.stop_tx = Some(stop_tx);
-        pipeline.runner = Some(runner);
-        pipeline.forwarder = Some(forwarder);
-    }
-
-    emit_status(&app, true, "字幕采集中");
+    pipeline.stop_tx = Some(stop_tx);
+    pipeline.runner = Some(runner);
+    pipeline.forwarder = Some(forwarder);
     Ok(())
 }
 
 async fn stop_capture_impl(app: AppHandle, state: Arc<SharedState>) -> Result<(), String> {
+    let _lifecycle = state.lifecycle.lock().await;
+    stop_capture_locked(app, state.clone()).await
+}
+
+/// 调用方必须已持有 `state.lifecycle`
+async fn stop_capture_locked(app: AppHandle, state: Arc<SharedState>) -> Result<(), String> {
     let (stop_tx, runner, forwarder) = {
         let mut pipeline = state.pipeline.lock().await;
         (

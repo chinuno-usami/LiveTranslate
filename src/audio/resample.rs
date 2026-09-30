@@ -58,18 +58,10 @@ impl LinearResampler {
             self.pos += self.ratio;
         }
 
-        // 保存状态：减去已消费的样本数
-        let consumed = self.pos.floor() as usize;
-        if consumed > 0 && consumed <= samples.len() {
-            self.last = samples.get(consumed.saturating_sub(1)).copied().or(Some(*samples.last().unwrap()));
-            self.pos -= consumed as f64;
-            // 保留最后一个样本给下一轮
-            if let Some(last_sample) = samples.last().copied() {
-                self.last = Some(last_sample);
-            }
-        } else if let Some(last_sample) = samples.last().copied() {
-            self.last = Some(last_sample);
-        }
+        // 保存状态：循环退出时 pos >= len-1。下一轮会把本轮最后一个样本
+        // （索引 len-1）放到索引 0，因此位置整体平移 len-1。
+        self.pos -= (samples.len() - 1) as f64;
+        self.last = samples.last().copied();
     }
 }
 
@@ -128,5 +120,41 @@ mod tests {
         let mut output = Vec::new();
         resampler.process(&input, &mut output);
         assert_eq!(output, input);
+    }
+
+    #[test]
+    fn test_resample_streaming_blocks_do_not_stall_or_drift() {
+        for &(rate, block) in &[(48000u32, 512usize), (48000, 1024), (44100, 512), (44100, 1024)] {
+            let mut resampler = LinearResampler::new(rate, 16000);
+            let total = rate as usize * 5;
+            let input: Vec<f32> = (0..total).map(|i| (i as f32 * 0.01).sin()).collect();
+            let mut output = Vec::new();
+            for chunk in input.chunks(block) {
+                resampler.process(chunk, &mut output);
+            }
+            let expected = total as f64 * 16000.0 / rate as f64;
+            assert!(
+                (output.len() as f64 - expected).abs() <= 2.0,
+                "rate={rate} block={block}: got {} expected ~{expected}",
+                output.len()
+            );
+        }
+    }
+
+    #[test]
+    fn test_resample_streaming_matches_one_shot() {
+        let input: Vec<f32> = (0..9600).map(|i| (i as f32 * 0.013).sin()).collect();
+        let mut one = LinearResampler::new(48000, 16000);
+        let mut expected = Vec::new();
+        one.process(&input, &mut expected);
+        let mut streamed = LinearResampler::new(48000, 16000);
+        let mut got = Vec::new();
+        for chunk in input.chunks(1024) {
+            streamed.process(chunk, &mut got);
+        }
+        assert_eq!(got.len(), expected.len());
+        for (a, b) in got.iter().zip(&expected) {
+            assert!((a - b).abs() < 1e-4);
+        }
     }
 }
