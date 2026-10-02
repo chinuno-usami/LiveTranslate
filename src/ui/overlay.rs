@@ -33,6 +33,8 @@ pub struct OverlayConfigPayload {
     pub window_width: u32,
     pub window_height: u32,
     pub click_through: bool,
+    /// false 为仅识别模式
+    pub translate_enabled: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -60,8 +62,8 @@ pub struct LanguagesPayload {
     pub current: String,
 }
 
-impl From<&SubtitleConfig> for OverlayConfigPayload {
-    fn from(value: &SubtitleConfig) -> Self {
+impl OverlayConfigPayload {
+    pub fn new(value: &SubtitleConfig, translate_enabled: bool) -> Self {
         Self {
             font_size: value.font_size,
             text_color: value.text_color.clone(),
@@ -72,6 +74,7 @@ impl From<&SubtitleConfig> for OverlayConfigPayload {
             window_width: value.window_width,
             window_height: value.window_height,
             click_through: value.click_through,
+            translate_enabled,
         }
     }
 }

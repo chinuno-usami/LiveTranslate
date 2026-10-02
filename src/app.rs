@@ -129,9 +129,10 @@ pub async fn start_console(config: AppConfig) -> AppResult<()> {
     let initial_language =
         languages::normalize_for_backend(&config.asr.backend, &configured_language);
     let (_language_tx, language_rx) = watch::channel(initial_language);
+    let (_translate_tx, translate_rx) = watch::channel(config.translate.enabled);
 
     tokio::spawn(async move {
-        if let Err(e) = run_pipeline(config, tx, stop_rx, language_rx).await {
+        if let Err(e) = run_pipeline(config, tx, stop_rx, language_rx, translate_rx).await {
             tracing::error!("Audio processing error: {}", e);
         }
     });
@@ -139,6 +140,9 @@ pub async fn start_console(config: AppConfig) -> AppResult<()> {
     tracing::info!("Console pipeline running. Press Ctrl+C to stop.");
     while let Some(event) = rx.recv().await {
         match event {
+            PipelineEvent::Subtitle(s) if s.translated.is_empty() => {
+                tracing::info!("Subtitle: {}", s.source)
+            }
             PipelineEvent::Subtitle(s) => {
                 tracing::info!("Subtitle: {} => {}", s.source, s.translated)
             }
@@ -158,8 +162,9 @@ async fn send_notice(tx: &mpsc::Sender<PipelineEvent>, last: &mut String, msg: S
     let _ = tx.send(PipelineEvent::Notice(msg)).await;
 }
 
-/// 处理一个音频片段：ASR -> 翻译 -> 去重 -> 发送
+/// 处理一个音频片段：ASR -> 翻译（可关闭）-> 去重 -> 发送
 ///
+/// `translate_enabled = false` 时为仅识别模式，字幕的译文为空串。
 /// 返回 `Ok(false)` 表示接收端已关闭，流水线应结束。
 #[allow(clippy::too_many_arguments)]
 async fn process_segment(
@@ -167,6 +172,7 @@ async fn process_segment(
     sample_rate: u32,
     engine: &AsrEngine,
     translator: &OpenAiClient,
+    translate_enabled: bool,
     processor: &mut SubtitleProcessor,
     tx: &mpsc::Sender<PipelineEvent>,
     last_notice: &mut String,
@@ -182,36 +188,40 @@ async fn process_segment(
 
             tracing::debug!("Recognized text: {}", text);
 
-            match translator.translate(&text).await {
-                Ok(translated) => {
-                    if processor.is_duplicate(&text, &translated) {
-                        tracing::debug!("Duplicate subtitle detected, skipping");
-                    } else {
-                        let (clean_text, clean_trans) =
-                            processor.deduplicate_overlap(&text, &translated);
-
-                        if clean_text.is_empty() {
-                            tracing::debug!("Subtitle empty after overlap removal, skipping");
-                        } else {
-                            processor.record(&text, &translated);
-
-                            if tx
-                                .send(PipelineEvent::Subtitle(Subtitle::new(
-                                    clean_text,
-                                    clean_trans,
-                                )))
-                                .await
-                                .is_err()
-                            {
-                                tracing::warn!("Subtitle receiver dropped, stopping pipeline");
-                                return Ok(false);
-                            }
-                        }
+            let translated = if translate_enabled {
+                match translator.translate(&text).await {
+                    Ok(translated) => translated,
+                    Err(e) => {
+                        tracing::error!("Translation failed: {}", e);
+                        send_notice(tx, last_notice, format!("翻译失败: {e}")).await;
+                        return Ok(true);
                     }
                 }
-                Err(e) => {
-                    tracing::error!("Translation failed: {}", e);
-                    send_notice(tx, last_notice, format!("翻译失败: {e}")).await;
+            } else {
+                String::new()
+            };
+
+            if processor.is_duplicate(&text, &translated) {
+                tracing::debug!("Duplicate subtitle detected, skipping");
+            } else {
+                let (clean_text, clean_trans) = processor.deduplicate_overlap(&text, &translated);
+
+                if clean_text.is_empty() {
+                    tracing::debug!("Subtitle empty after overlap removal, skipping");
+                } else {
+                    processor.record(&text, &translated);
+
+                    if tx
+                        .send(PipelineEvent::Subtitle(Subtitle::new(
+                            clean_text,
+                            clean_trans,
+                        )))
+                        .await
+                        .is_err()
+                    {
+                        tracing::warn!("Subtitle receiver dropped, stopping pipeline");
+                        return Ok(false);
+                    }
                 }
             }
         }
@@ -237,6 +247,7 @@ pub async fn run_pipeline(
     tx: mpsc::Sender<PipelineEvent>,
     mut stop_rx: watch::Receiver<bool>,
     language_rx: watch::Receiver<String>,
+    translate_rx: watch::Receiver<bool>,
 ) -> AppResult<()> {
     tracing::info!("Starting audio pipeline");
 
@@ -244,7 +255,16 @@ pub async fn run_pipeline(
 
     // 配置健全性检查：这些是最常见的“看着在跑但其实没结果”的原因
     let api_key = config.translate.api_key.trim();
-    if api_key.is_empty() || api_key == "YOUR_API_KEY" {
+    let translate_enabled = *translate_rx.borrow();
+    tracing::info!(
+        "Mode: {}",
+        if translate_enabled {
+            "ASR + translate"
+        } else {
+            "ASR only"
+        }
+    );
+    if translate_enabled && (api_key.is_empty() || api_key == "YOUR_API_KEY") {
         send_notice(
             &tx,
             &mut last_notice,
@@ -324,11 +344,14 @@ pub async fn run_pipeline(
         let mut last_notice = String::new();
 
         while let Some(chunk) = utterance_rx.recv().await {
+            // 先取值再 await：watch::Ref 不是 Send，不能跨 await 持有
+            let translate_enabled = *translate_rx.borrow();
             let keep_going = process_segment(
                 &chunk,
                 target_rate,
                 &asr_engine,
                 &translate_client,
+                translate_enabled,
                 &mut subtitle_processor,
                 &worker_tx,
                 &mut last_notice,

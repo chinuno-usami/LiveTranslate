@@ -280,6 +280,11 @@ body {
   transform: translateX(16px);
 }
 
+.switch.disabled {
+  opacity: 0.4;
+  pointer-events: none;
+}
+
 /* ---------- 快捷键弹窗 ---------- */
 
 .modal {

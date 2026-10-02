@@ -306,6 +306,7 @@ mod tests {
 
     fn config(thinking: &str) -> TranslateConfig {
         TranslateConfig {
+            enabled: true,
             base_url: "http://localhost/v1".to_string(),
             api_key: "k".to_string(),
             model: "m".to_string(),

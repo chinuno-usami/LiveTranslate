@@ -88,6 +88,9 @@ fn default_edge_timeout_secs() -> u64 {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TranslateConfig {
+    /// 是否翻译；关闭后为“仅识别”模式，只显示 ASR 原文（面板开关可实时切换）
+    #[serde(default = "default_true")]
+    pub enabled: bool,
     pub base_url: String,
     pub api_key: String,
     pub model: String,
@@ -471,6 +474,7 @@ impl Default for AppConfig {
                 filter_hallucination: true,
             },
             translate: TranslateConfig {
+                enabled: true,
                 base_url: "https://api.openai.com/v1".to_string(),
                 api_key: "YOUR_API_KEY".to_string(),
                 model: "gpt-4o-mini".to_string(),

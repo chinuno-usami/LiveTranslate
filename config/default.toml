@@ -92,6 +92,9 @@ timeout_secs = 15
 # origin = ""
 
 [translate]
+# 是否翻译。false 为“仅识别”模式：不调用翻译接口，只显示 ASR 原文
+# 也可在面板的“翻译”开关里切换，立即生效（无需重启）
+enabled = true
 # OpenAI 兼容 API
 base_url = "https://api.deepseek.com/v1"
 api_key = "YOUR_API_KEY"

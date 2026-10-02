@@ -37,9 +37,12 @@ impl SubtitleProcessor {
             }
         }
 
-        // 检查译文是否与最近一条相同或类似
+        // 检查译文是否与最近一条相同或类似（仅识别模式下译文为空，不参与判断）
         if let Some(last_trans) = self.recent_translations.back() {
-            if Self::similarity(translation, last_trans) > 0.95 {
+            if !translation.is_empty()
+                && !last_trans.is_empty()
+                && Self::similarity(translation, last_trans) > 0.95
+            {
                 return true;
             }
         }
@@ -287,6 +290,14 @@ mod tests {
         let a = "今天我们讨论一下这个项目的进展和问题";
         let b = "今天我们讨论一下那个项目的进度和问题";
         assert!(SubtitleProcessor::similarity(a, b) < 0.95);
+    }
+
+    #[test]
+    fn test_empty_translation_not_duplicate() {
+        let mut p = SubtitleProcessor::new();
+        p.record("hello world", "");
+        assert!(!p.is_duplicate("something else entirely", ""));
+        assert!(p.is_duplicate("hello world", ""));
     }
 
     #[test]

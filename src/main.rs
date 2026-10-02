@@ -89,6 +89,8 @@ pub(crate) struct SharedState {
     show_source: AtomicBool,
     /// 识别语言（面板改动可实时生效，无需重启流水线）
     language_tx: watch::Sender<String>,
+    /// 是否翻译（false 为仅识别模式，面板改动实时生效）
+    translate_tx: watch::Sender<bool>,
 }
 
 impl SharedState {
@@ -110,6 +112,7 @@ impl SharedState {
         let language =
             asr::languages::normalize_for_backend(&config.asr.backend, &configured_language);
         let (language_tx, _) = watch::channel(language);
+        let (translate_tx, _) = watch::channel(config.translate.enabled);
 
         Self {
             config,
@@ -122,6 +125,7 @@ impl SharedState {
             font_size: AtomicU32::new(font_size),
             show_source: AtomicBool::new(show_source),
             language_tx,
+            translate_tx,
         }
     }
 }
@@ -209,6 +213,31 @@ async fn set_show_source(
     Ok(())
 }
 
+/// 切换翻译 / 仅识别模式（立即生效，并写回配置文件）
+#[tauri::command]
+async fn set_translate_enabled(
+    state: State<'_, Arc<SharedState>>,
+    enabled: bool,
+) -> Result<(), String> {
+    // watch::Sender::send 仅在“无接收者”时失败，不影响设置本身
+    let _ = state.translate_tx.send(enabled);
+    persist_setting(
+        state.config_path.as_ref(),
+        "translate",
+        "enabled",
+        &enabled.to_string(),
+    );
+    tracing::info!(
+        "Mode set to: {}",
+        if enabled {
+            "ASR + translate"
+        } else {
+            "ASR only"
+        }
+    );
+    Ok(())
+}
+
 /// 面板上的识别语言候选（按当前后端给出不同的语言码格式）
 #[tauri::command]
 async fn list_languages(
@@ -268,7 +297,10 @@ async fn set_language(state: State<'_, Arc<SharedState>>, code: String) -> Resul
 async fn get_overlay_config(
     state: State<'_, Arc<SharedState>>,
 ) -> Result<OverlayConfigPayload, String> {
-    Ok(OverlayConfigPayload::from(&state.config.subtitle))
+    Ok(OverlayConfigPayload::new(
+        &state.config.subtitle,
+        *state.translate_tx.borrow(),
+    ))
 }
 
 #[tauri::command]
@@ -461,6 +493,7 @@ async fn start_capture_locked(app: AppHandle, state: Arc<SharedState>) -> Result
     let (stop_tx, stop_rx) = watch::channel(false);
     // 语言用独立通道：面板切换可实时生效，不需要重启流水线
     let language_rx = state.language_tx.subscribe();
+    let translate_rx = state.translate_tx.subscribe();
 
     let mut config = state.config.clone();
     {
@@ -477,7 +510,9 @@ async fn start_capture_locked(app: AppHandle, state: Arc<SharedState>) -> Result
 
     let app_for_runner = app.clone();
     let runner = tauri::async_runtime::spawn(async move {
-        if let Err(e) = app::run_pipeline(config, event_tx, stop_rx, language_rx).await {
+        if let Err(e) =
+            app::run_pipeline(config, event_tx, stop_rx, language_rx, translate_rx).await
+        {
             tracing::error!("Audio processing error: {}", e);
             let _ = app_for_runner.emit_all(ERROR_EVENT, e.to_string());
             emit_status(&app_for_runner, false, format!("运行失败: {}", e));
@@ -877,8 +912,10 @@ fn run(args: Args) -> anyhow::Result<()> {
             if let Err(e) = apply_window_config(&window, &config) {
                 tracing::warn!("Failed to apply window config: {e}");
             }
-            if let Err(e) = window.emit(CONFIG_EVENT, OverlayConfigPayload::from(&config.subtitle))
-            {
+            if let Err(e) = window.emit(
+                CONFIG_EVENT,
+                OverlayConfigPayload::new(&config.subtitle, config.translate.enabled),
+            ) {
                 tracing::warn!("Failed to emit config event: {e}");
             }
             if let Err(e) = tray::register_global_shortcuts(&app.handle()) {
@@ -894,6 +931,7 @@ fn run(args: Args) -> anyhow::Result<()> {
             get_overlay_config,
             set_font_size,
             set_show_source,
+            set_translate_enabled,
             list_languages,
             set_language,
             get_status,

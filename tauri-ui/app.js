@@ -15,6 +15,8 @@ const els = {
   fontSlider: document.getElementById('font-slider'),
   fontSizeValue: document.getElementById('font-size-value'),
   sourceToggle: document.getElementById('source-toggle'),
+  sourceToggleLabel: document.getElementById('source-toggle-label'),
+  translateToggle: document.getElementById('translate-toggle'),
   helpBtn: document.getElementById('help-btn'),
   helpModal: document.getElementById('help-modal'),
   helpClose: document.getElementById('help-close'),
@@ -60,6 +62,20 @@ function applyShowSource(enabled) {
   }
 }
 
+/// 应用"翻译"开关；关闭即仅识别模式，此时"原文"开关无意义，置灰
+function applyTranslateEnabled(enabled) {
+  const on = enabled !== false;
+  if (els.translateToggle) {
+    els.translateToggle.checked = on;
+  }
+  if (els.sourceToggle) {
+    els.sourceToggle.disabled = !on;
+  }
+  if (els.sourceToggleLabel) {
+    els.sourceToggleLabel.classList.toggle('disabled', !on);
+  }
+}
+
 function setStatus(running, message) {
   els.statusText.textContent = message;
   els.statusDot.classList.toggle('running', running);
@@ -95,6 +111,7 @@ async function loadInitialConfig() {
   const config = await invoke('get_overlay_config');
   applyFontSize(Number(config.font_size) || 28);
   applyShowSource(config.show_source);
+  applyTranslateEnabled(config.translate_enabled);
   document.documentElement.style.setProperty('--text-color', config.text_color);
   document.documentElement.style.setProperty('--stroke-color', config.stroke_color);
   applyBackground(config.background);
@@ -452,6 +469,19 @@ async function bindActions() {
     }
   });
 
+  // 翻译开关：关闭即仅识别模式，立即生效
+  els.translateToggle.addEventListener('change', async () => {
+    const enabled = els.translateToggle.checked;
+    applyTranslateEnabled(enabled);
+    try {
+      await invoke('set_translate_enabled', { enabled });
+    } catch (error) {
+      console.error('切换翻译失败', error);
+      applyTranslateEnabled(!enabled);
+      setStatus(false, `切换翻译失败: ${error}`);
+    }
+  });
+
   // 快捷键说明弹窗
   els.helpBtn.addEventListener('click', () => {
     els.helpModal.classList.remove('hidden');
@@ -492,6 +522,7 @@ async function bindEvents() {
     const config = event.payload;
     applyFontSize(Number(config.font_size) || 28);
     applyShowSource(config.show_source);
+    applyTranslateEnabled(config.translate_enabled);
     document.documentElement.style.setProperty('--text-color', config.text_color);
     document.documentElement.style.setProperty('--stroke-color', config.stroke_color);
     applyBackground(config.background);

@@ -23,7 +23,13 @@
             <span id="font-size-value" class="ctrl-value">28</span>
           </label>
 
-          <label class="ctrl switch" title="是否在译文上方显示原文">
+          <label class="ctrl switch" title="关闭后为仅识别模式：不调用翻译，只显示识别结果">
+            <input id="translate-toggle" type="checkbox" checked />
+            <span class="switch-track"><span class="switch-thumb"></span></span>
+            <span class="ctrl-label">翻译</span>
+          </label>
+
+          <label id="source-toggle-label" class="ctrl switch" title="是否在译文上方显示原文">
             <input id="source-toggle" type="checkbox" />
             <span class="switch-track"><span class="switch-thumb"></span></span>
             <span class="ctrl-label">原文</span>

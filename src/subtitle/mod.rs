@@ -48,7 +48,10 @@ impl SubtitleState {
         self.history
             .iter()
             .map(|sub| {
-                if self.show_source {
+                // 仅识别模式没有译文，直接显示原文
+                if sub.translated.is_empty() {
+                    sub.source.clone()
+                } else if self.show_source {
                     format!("{}\n{}", sub.source, sub.translated)
                 } else {
                     sub.translated.clone()
