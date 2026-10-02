@@ -187,6 +187,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          # git-cliff 需要完整历史与全部 tag 才能确定版本区间
+          fetch-depth: 0
 
       - name: Download all artifacts
         uses: actions/download-artifact@v4
@@ -218,6 +221,28 @@ jobs:
             exit 1
           fi
 
+      - name: Resolve changelog range
+        id: cliff_args
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          # tag 已指向当前提交（推送 tag 触发）时取该 tag 的区间；
+          # 手动触发且 tag 尚未创建时，把未发布的提交归到该 tag 下
+          if [ "$(git rev-parse -q --verify "refs/tags/${TAG}^{commit}" || true)" = "$(git rev-parse HEAD)" ]; then
+            echo "args=--current --strip header" >> "$GITHUB_OUTPUT"
+          else
+            echo "args=--unreleased --tag ${TAG} --strip header" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Generate release notes
+        id: cliff
+        uses: orhun/git-cliff-action@v4
+        with:
+          config: cliff.toml
+          args: ${{ steps.cliff_args.outputs.args }}
+        env:
+          OUTPUT: RELEASE_NOTES.md
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
@@ -226,6 +251,6 @@ jobs:
           target_commitish: ${{ github.sha }}
           name: LiveTranslate ${{ steps.tag.outputs.tag }}
           files: dist/*
-          generate_release_notes: true
+          body_path: ${{ steps.cliff.outputs.changelog }}
           draft: false
           fail_on_unmatched_files: true

@@ -27,7 +27,31 @@ git push origin v0.1.0
    - Linux → `tar.gz`
    - Windows → `zip`
    - macOS → **`LiveTranslate.app`**（ad-hoc 签名）+ `zip`
-3. 创建 GitHub Release 并上传全部产物
+3. 用 [git-cliff](https://git-cliff.org) 按提交信息生成本版本的 Release 说明
+4. 创建 GitHub Release 并上传全部产物
+
+## Release 说明（更新日志）
+
+Release 页面上的说明由 `cliff.toml` 根据 Conventional Commits 自动生成，无需手写：
+
+| 提交类型 | 分组 |
+|----------|------|
+| `feat` | 新功能 |
+| `fix` | 问题修复 |
+| `perf` | 性能优化 |
+| `refactor` | 重构 |
+| `docs` | 文档 |
+| `chore` / `ci` / `build` / `style` / `test` | 不展示 |
+
+不符合 `type: 描述` 格式的提交不会出现在说明里，提交时请保持这个格式。
+`feat(ui): ...` 这样的 scope 会以粗体前缀显示。
+
+打 tag 前可以在本地预览下一版的说明：
+
+```bash
+# 需先安装 git-cliff（brew install git-cliff 或 cargo install git-cliff）
+git cliff --unreleased --tag v0.1.7 --strip header
+```
 
 ## 手动触发
 
