@@ -9,7 +9,8 @@
 #   "扬声器"        按设备名模糊匹配
 # 注意: 回环采集仅 Windows 支持
 #
-# 也可以直接在浮窗顶部下拉框里切换设备。
+# 旧版本的单源字段：[[audio.sources]] 为空时使用它合成一个默认源。
+# 新版本请优先使用 [[audio.sources]]（设置页的「输入源」表格）。
 device_name = "default"
 # 音频分片时长（秒）
 chunk_seconds = 2.0
@@ -19,6 +20,31 @@ sample_rate = 16000
 channels = 1
 # 音量阈值（0.0 - 1.0），仅在 vad.enabled = false 时生效
 silence_threshold = 0.01
+# 同时采集的输入源上限（防止多路 VAD 把 CPU 打满）
+max_active_sources = 4
+
+# 多输入源：每个源一条，顺序即 UI 展示顺序
+# id: 稳定标识（事件 / OSC / 日志），仅允许字母、数字、下划线、短横线
+# label: 展示名，多源时作为字幕前缀
+# device: 设备 spec，语法同 device_name
+# enabled: 是否参与采集（改动需重启该源）
+# translate: 该源是否翻译（可热切换）
+# language: 覆盖全局识别语言；留空 = 跟随全局
+[[audio.sources]]
+id = "default"
+label = "输入源"
+device = "default"
+enabled = true
+translate = true
+language = ""
+
+[[audio.sources]]
+id = "game"
+label = "游戏声音"
+device = "loopback:0"
+enabled = false
+translate = true
+language = ""
 
 [vad]
 # 是否启用 VAD 分段（推荐开启）
@@ -146,3 +172,78 @@ position_x = 200
 position_y = 760
 always_on_top = true
 click_through = false
+# 多源来源标识策略：
+#   "auto"   同时有 ≥2 个源在跑时自动加前缀（默认）
+#   "always" 始终加
+#   "never"  从不加
+label_sources = "auto"
+
+# ============ 额外输出通道（Full 版） ============
+# 标准版会保留但忽略这两段；换用 Full 版后设置继续生效。
+
+[output.steamvr]
+# 在 SteamVR 头显中显示字幕面板（仅 Windows Full 版）
+enabled = false
+# 锚点：hmd = 跟随头部；world = 固定在世界坐标
+anchor = "hmd"
+# 面板物理宽度（米）
+width_m = 1.6
+# hmd 模式：正前方距离
+distance_m = 1.6
+# hmd 模式：相对视线的高度偏移（负数 = 偏下）
+height_offset_m = -0.28
+# world 模式下的坐标（OpenVR 站立坐标系，单位米）
+world_position = [0.0, 1.3, -1.6]
+# world 模式下的旋转（角度，目前应用绕 Y 轴的偏航）
+world_rotation_deg = [0.0, 0.0, 0.0]
+# 0 = 平面；0.2~0.4 = 轻微曲面
+curvature = 0.0
+# 整块面板不透明度（0-1）
+opacity = 0.92
+# 最多显示条数（与桌面浮窗独立）
+max_lines = 3
+show_source = true
+# 字号，以 1024px 纹理宽为基准
+font_size_px = 34
+# 留空 = 自动使用系统中文字体；也可指定 .ttf/.ttc 路径
+font_path = ""
+# 颜色格式：#RGB / #RRGGBB / #RRGGBBAA
+background = "#0B0F14CC"
+text_color = "#FFFFFF"
+source_color = "#AEB8C4"
+label_color = "#7DD3FC"
+# 最新一行 / 第二行 / 更早行的不透明度（做渐隐）
+line_alphas = [1.0, 0.72, 0.48]
+# >0 时静音 N 秒后淡出（0 = 不自动隐藏）
+hide_on_silence_secs = 0
+# 某些运行环境下 RGBA/BGRA 反了时打开
+swap_red_blue = false
+# SteamVR 未启动时的重连间隔（秒）
+reconnect_interval_secs = 5
+
+[output.osc]
+# 通过 OSC 把字幕发送到 VRChat Chatbox（仅 Full 版）
+enabled = false
+target = "127.0.0.1:9000"
+# 发送内容："translated" | "source" | "both"
+content = "translated"
+# 组包模式：
+#   "rolling" 合并最近多条字幕成一段滚动字幕，超长时丢弃最早的一条（默认）
+#   "latest"  只发送最新一条字幕（旧行为）
+mode = "rolling"
+# rolling 模式保留的最大条数（VRChat 最多显示 9 行；建议 3~5）
+max_lines = 4
+# VRChat Chatbox 上限；按 Unicode 字符截断（含分隔符与来源前缀）
+max_chars = 144
+# 行分隔符："\n" 可读性最好；若客户端过滤换行可改成 " | "
+separator = "\n"
+# 客户端限流：VRChat 约 5 条 / 5 秒，超限可能触发 30s 冷却
+min_interval_ms = 2000
+# 5 秒滑动窗口内最多发送条数
+max_per_window = 4
+# 采集期间发送 /chatbox/typing true
+send_typing = true
+# 额外自定义地址（可选）：发送 (text, source_id, label) 三个 string
+custom_address = ""
+# 把组包结果写日志（调试用）
+debug_log = false

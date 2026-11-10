@@ -1,6 +1,6 @@
 [package]
 name = "livetranslate"
-version = "0.1.6"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.70"
 
@@ -17,6 +17,12 @@ default = ["custom-protocol", "silero-vad"]
 custom-protocol = ["tauri/custom-protocol"]
 # Silero VAD（需要 ONNX Runtime 动态库，缺失时会自动回退到能量 VAD）
 silero-vad = ["dep:ort", "dep:libloading"]
+# VRChat OSC Chatbox 输出（跨平台）
+osc = ["dep:rosc"]
+# SteamVR Overlay 输出（仅 Windows 有真实实现，其它平台为 stub）
+steamvr = ["dep:openvr", "dep:cosmic-text"]
+# Windows Full 包：一次开启 OSC + SteamVR
+extras = ["osc", "steamvr"]
 
 [dependencies]
 # Async runtime
@@ -32,6 +38,11 @@ reqwest = { version = "0.11", features = ["json", "stream", "multipart"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 toml = "0.8"
+toml_edit = "0.22"
+# OSC（仅 extras / osc feature）
+rosc = { version = "0.11", optional = true }
+# SteamVR 文本渲染（仅 steamvr feature；非 Windows 只用于构建 stub 之外的渲染代码）
+cosmic-text = { version = "0.19", optional = true }
 
 # Audio
 cpal = "0.18"
@@ -61,6 +72,7 @@ libloading = { version = "0.8", optional = true }
 
 # Windows-specific
 [target.'cfg(windows)'.dependencies]
+openvr = { version = "0.9", optional = true }
 windows = { version = "0.52", features = [
     "Win32_Media_Audio",
     "Win32_System_Com",

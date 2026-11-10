@@ -4,13 +4,104 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+pub mod profiles;
+pub mod schema;
+pub mod writer;
+
+/// 多源字幕来源标识策略
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum LabelMode {
+    /// 同时有 ≥2 个源在跑时自动加前缀（默认）
+    #[default]
+    Auto,
+    /// 始终加
+    Always,
+    /// 从不加
+    Never,
+}
+
+impl LabelMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LabelMode::Auto => "auto",
+            LabelMode::Always => "always",
+            LabelMode::Never => "never",
+        }
+    }
+}
+
+/// 单个输入源配置
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AudioSourceConfig {
+    /// 稳定 ID（事件 / OSC / 日志使用），仅允许 `[A-Za-z0-9_-]{1,32}`
+    pub id: String,
+    /// 展示名（多源时作为输出前缀）
+    pub label: String,
+    /// 设备 spec，语法与旧 `audio.device_name` 相同
+    pub device: String,
+    /// 是否参与采集（改动需要重启该源）
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// 该源是否翻译（可热切换）
+    #[serde(default = "default_true")]
+    pub translate: bool,
+    /// 可选：覆盖全局识别语言；空 = 跟随全局
+    #[serde(default)]
+    pub language: String,
+}
+
+impl AudioSourceConfig {
+    #[allow(dead_code)]
+    pub fn new(id: impl Into<String>, label: impl Into<String>, device: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            label: label.into(),
+            device: device.into(),
+            enabled: true,
+            translate: true,
+            language: String::new(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AudioConfig {
+    /// 兼容旧版本的单源字段：`sources` 为空时使用它合成一个默认源
+    #[serde(default = "default_device_name")]
     pub device_name: String,
+    #[serde(default = "default_chunk_seconds")]
     pub chunk_seconds: f32,
+    #[serde(default = "default_sample_rate")]
     pub sample_rate: u32,
+    #[serde(default = "default_channels")]
     pub channels: u16,
+    #[serde(default = "default_silence_threshold")]
     pub silence_threshold: f32,
+    /// 同时采集的输入源上限（防止多路 Silero 把 CPU 打满）
+    #[serde(default = "default_max_active_sources")]
+    pub max_active_sources: usize,
+    /// 多输入源：每个源一条，顺序即 UI 展示顺序
+    #[serde(default)]
+    pub sources: Vec<AudioSourceConfig>,
+}
+
+impl AudioConfig {
+    /// 旧配置（只有 `device_name`）会在这里被合成为单源
+    pub fn effective_sources(&self, translate_enabled: bool) -> Vec<AudioSourceConfig> {
+        if self.sources.is_empty() {
+            vec![AudioSourceConfig {
+                id: "default".to_string(),
+                label: "输入源".to_string(),
+                device: self.device_name.clone(),
+                enabled: true,
+                translate: translate_enabled,
+                language: String::new(),
+            }]
+        } else {
+            self.sources.clone()
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -38,10 +129,6 @@ pub struct AsrConfig {
     #[serde(default)]
     pub edge: EdgeAsrConfig,
     /// 过滤音乐/噪声引起的无意义识别输出（默认开启）
-    ///
-    /// 能量型 VAD 无法区分音乐与人声，音乐片段仍会被送去识别，
-    /// 典型结果是 `[Music]`、`♪♪♪`、"感谢观看" 之类的固定幻听文本。
-    /// 开启后会丢弃这些输出，同时避免无谓的翻译请求。
     #[serde(default = "default_true")]
     pub filter_hallucination: bool,
 }
@@ -107,24 +194,9 @@ pub struct TranslateConfig {
     #[serde(default = "default_translate_temperature")]
     pub temperature: f32,
     /// 关闭推理模型“思考”的策略，空字符串表示不处理
-    ///
-    /// - `"reasoning_effort"`：发送 `reasoning_effort = "minimal"`
-    ///   （OpenAI o 系列 / gpt-5 等）
-    /// - `"enable_thinking"`：发送 `enable_thinking = false`（Qwen3 等）
-    /// - `"chat_template"`：发送
-    ///   `chat_template_kwargs = { enable_thinking = false }`
-    ///   （vLLM / SGLang 部署的 Qwen3 等）
-    ///
-    /// 思考会让翻译首字延迟大幅上升，实时字幕场景通常应当关闭。
     #[serde(default)]
     pub disable_thinking: String,
     /// 追加到请求体的自定义字段（最高优先级，会覆盖上面的预设）
-    ///
-    /// 各家关闭思考的字段名不统一，这里留一个通用口子。例如：
-    /// ```toml
-    /// [translate.extra_body]
-    /// reasoning_effort = "none"
-    /// ```
     #[serde(default)]
     pub extra_body: Option<toml::Value>,
 }
@@ -136,13 +208,9 @@ pub struct SubtitleConfig {
     pub text_color: String,
     pub stroke_color: String,
     /// 字幕面板背景（任意 CSS 颜色，含 alpha）
-    /// - `"transparent"`：完全透明，只显示文字
-    /// - `"rgba(8, 10, 14, 0.6)"`：半透明黑，数值越大越不透明
     #[serde(default = "default_panel_background")]
     pub background: String,
     /// 顶部工具栏背景（任意 CSS 颜色，含 alpha）
-    /// - `"transparent"`：完全透明
-    /// - `"rgba(10, 12, 18, 0.42)"`：半透明黑
     #[serde(default = "default_toolbar_background")]
     pub toolbar_background: String,
     pub show_source: bool,
@@ -152,46 +220,35 @@ pub struct SubtitleConfig {
     pub position_y: i32,
     pub always_on_top: bool,
     pub click_through: bool,
+    /// 多源来源标识策略：auto / always / never
+    #[serde(default)]
+    pub label_sources: LabelMode,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VadConfig {
-    /// 是否启用 VAD 分段（关闭则回到固定时长切片）
     #[serde(default = "default_true")]
     pub enabled: bool,
-    /// VAD 算法后端：
-    /// - `energy`：内置能量型（无额外依赖，默认）
-    /// - `silero`：Silero VAD 神经网络（需 ONNX Runtime，能区分音乐与人声）
     #[serde(default = "default_vad_backend")]
     pub backend: String,
-    /// VAD 帧长（毫秒），推荐 20（仅 energy 后端使用）
     #[serde(default = "default_vad_frame_ms")]
     pub frame_ms: u32,
-    /// 判为语音所需的、高于自适应噪声底的余量（dB，仅 energy 后端）
     #[serde(default = "default_vad_margin_db")]
     pub margin_db: f32,
-    /// 噪声底估计所用的分位数（0.0-1.0，仅 energy 后端）
     #[serde(default = "default_vad_noise_percentile")]
     pub noise_percentile: f32,
-    /// Silero 模型路径；留空则使用内嵌模型
     #[serde(default)]
     pub silero_model: Option<String>,
-    /// Silero 判为语音的概率阈值
     #[serde(default = "default_silero_threshold")]
     pub silero_threshold: f32,
-    /// 最短语音时长（短于此的片段被丢弃；起始不再要求连续这么多帧）
     #[serde(default = "default_vad_min_speech_ms")]
     pub min_speech_ms: u32,
-    /// 静音需持续多久才确认说完
     #[serde(default = "default_vad_min_silence_ms")]
     pub min_silence_ms: u32,
-    /// 单个片段最长时长，超过则强制切分（控制延迟）
     #[serde(default = "default_vad_max_speech_ms")]
     pub max_speech_ms: u32,
-    /// 开始前保留的音频，避免吃掉首音素
     #[serde(default = "default_vad_pre_pad_ms")]
     pub pre_pad_ms: u32,
-    /// 结束后保留的音频，避免吃掉尾音素
     #[serde(default = "default_vad_post_pad_ms")]
     pub post_pad_ms: u32,
 }
@@ -215,15 +272,165 @@ impl Default for VadConfig {
     }
 }
 
+/// SteamVR Overlay 输出配置
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SteamVrConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// 锚点：hmd = 跟随头部；world = 固定在世界坐标
+    #[serde(default = "default_anchor")]
+    pub anchor: String,
+    #[serde(default = "default_width_m")]
+    pub width_m: f32,
+    #[serde(default = "default_distance_m")]
+    pub distance_m: f32,
+    #[serde(default = "default_height_offset_m")]
+    pub height_offset_m: f32,
+    #[serde(default)]
+    pub world_position: [f32; 3],
+    #[serde(default)]
+    pub world_rotation_deg: [f32; 3],
+    #[serde(default)]
+    pub curvature: f32,
+    #[serde(default = "default_opacity")]
+    pub opacity: f32,
+    #[serde(default = "default_max_lines")]
+    pub max_lines: usize,
+    #[serde(default = "default_true")]
+    pub show_source: bool,
+    #[serde(default = "default_font_size_px")]
+    pub font_size_px: u32,
+    #[serde(default)]
+    pub font_path: String,
+    #[serde(default = "default_vr_background")]
+    pub background: String,
+    #[serde(default = "default_vr_text_color")]
+    pub text_color: String,
+    #[serde(default = "default_vr_source_color")]
+    pub source_color: String,
+    #[serde(default = "default_vr_label_color")]
+    pub label_color: String,
+    #[serde(default = "default_line_alphas")]
+    pub line_alphas: [f32; 3],
+    #[serde(default)]
+    pub hide_on_silence_secs: u64,
+    #[serde(default)]
+    pub swap_red_blue: bool,
+    #[serde(default = "default_reconnect_interval_secs")]
+    pub reconnect_interval_secs: u64,
+}
+
+/// OSC（VRChat Chatbox）输出配置
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OscConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_osc_target")]
+    pub target: String,
+    /// 发送内容："translated" | "source" | "both"
+    #[serde(default = "default_osc_content")]
+    pub content: String,
+    /// 组包模式："rolling" | "latest"
+    #[serde(default = "default_osc_mode")]
+    pub mode: String,
+    #[serde(default = "default_osc_max_lines")]
+    pub max_lines: usize,
+    #[serde(default = "default_osc_max_chars")]
+    pub max_chars: usize,
+    #[serde(default = "default_osc_separator")]
+    pub separator: String,
+    #[serde(default = "default_osc_min_interval_ms")]
+    pub min_interval_ms: u64,
+    #[serde(default = "default_osc_max_per_window")]
+    pub max_per_window: usize,
+    #[serde(default = "default_true")]
+    pub send_typing: bool,
+    #[serde(default)]
+    pub custom_address: String,
+    #[serde(default)]
+    pub debug_log: bool,
+}
+
+impl Default for SteamVrConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            anchor: default_anchor(),
+            width_m: default_width_m(),
+            distance_m: default_distance_m(),
+            height_offset_m: default_height_offset_m(),
+            world_position: [0.0, 1.3, -1.6],
+            world_rotation_deg: [0.0, 0.0, 0.0],
+            curvature: 0.0,
+            opacity: default_opacity(),
+            max_lines: default_max_lines(),
+            show_source: true,
+            font_size_px: default_font_size_px(),
+            font_path: String::new(),
+            background: default_vr_background(),
+            text_color: default_vr_text_color(),
+            source_color: default_vr_source_color(),
+            label_color: default_vr_label_color(),
+            line_alphas: default_line_alphas(),
+            hide_on_silence_secs: 0,
+            swap_red_blue: false,
+            reconnect_interval_secs: default_reconnect_interval_secs(),
+        }
+    }
+}
+
+impl Default for OscConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            target: default_osc_target(),
+            content: default_osc_content(),
+            mode: default_osc_mode(),
+            max_lines: default_osc_max_lines(),
+            max_chars: default_osc_max_chars(),
+            separator: default_osc_separator(),
+            min_interval_ms: default_osc_min_interval_ms(),
+            max_per_window: default_osc_max_per_window(),
+            send_typing: true,
+            custom_address: String::new(),
+            debug_log: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct OutputConfig {
+    #[serde(default)]
+    pub steamvr: SteamVrConfig,
+    #[serde(default)]
+    pub osc: OscConfig,
+}
+
 fn default_true() -> bool {
     true
 }
+fn default_device_name() -> String {
+    "default".to_string()
+}
+fn default_chunk_seconds() -> f32 {
+    2.0
+}
+fn default_sample_rate() -> u32 {
+    16000
+}
+fn default_channels() -> u16 {
+    1
+}
+fn default_silence_threshold() -> f32 {
+    0.01
+}
+fn default_max_active_sources() -> usize {
+    4
+}
 fn default_panel_background() -> String {
-    // 与 tauri-ui/styles.css 里的 --panel-bg 保持一致
     "rgba(8, 10, 14, 0.28)".to_string()
 }
 fn default_toolbar_background() -> String {
-    // 与 tauri-ui/styles.css 里的 --toolbar-bg 保持一致
     "rgba(10, 12, 18, 0.42)".to_string()
 }
 fn default_vad_frame_ms() -> u32 {
@@ -259,6 +466,69 @@ fn default_vad_pre_pad_ms() -> u32 {
 fn default_vad_post_pad_ms() -> u32 {
     VadConfig::default().post_pad_ms
 }
+fn default_anchor() -> String {
+    "hmd".to_string()
+}
+fn default_width_m() -> f32 {
+    1.6
+}
+fn default_distance_m() -> f32 {
+    1.6
+}
+fn default_height_offset_m() -> f32 {
+    -0.28
+}
+fn default_opacity() -> f32 {
+    0.92
+}
+fn default_max_lines() -> usize {
+    3
+}
+fn default_font_size_px() -> u32 {
+    34
+}
+fn default_vr_background() -> String {
+    "#0B0F14CC".to_string()
+}
+fn default_vr_text_color() -> String {
+    "#FFFFFF".to_string()
+}
+fn default_vr_source_color() -> String {
+    "#AEB8C4".to_string()
+}
+fn default_vr_label_color() -> String {
+    "#7DD3FC".to_string()
+}
+fn default_line_alphas() -> [f32; 3] {
+    [1.0, 0.72, 0.48]
+}
+fn default_reconnect_interval_secs() -> u64 {
+    5
+}
+fn default_osc_target() -> String {
+    "127.0.0.1:9000".to_string()
+}
+fn default_osc_content() -> String {
+    "translated".to_string()
+}
+fn default_osc_mode() -> String {
+    "rolling".to_string()
+}
+fn default_osc_max_lines() -> usize {
+    4
+}
+fn default_osc_max_chars() -> usize {
+    144
+}
+fn default_osc_separator() -> String {
+    "\n".to_string()
+}
+fn default_osc_min_interval_ms() -> u64 {
+    2000
+}
+fn default_osc_max_per_window() -> usize {
+    4
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
@@ -269,6 +539,9 @@ pub struct AppConfig {
     /// VAD 分段配置（旧配置文件没有该段时使用默认值）
     #[serde(default)]
     pub vad: VadConfig,
+    /// 额外输出通道（旧配置文件没有该段时全部关闭）
+    #[serde(default)]
+    pub output: OutputConfig,
 }
 
 impl AppConfig {
@@ -291,10 +564,6 @@ impl AppConfig {
     }
 
     /// 用户级日志目录
-    ///
-    /// - macOS: `~/Library/Application Support/com.chinuno.LiveTranslate/logs`
-    /// - Windows: `%LOCALAPPDATA%\chinuno\LiveTranslate\logs`
-    /// - Linux: `~/.local/share/livetranslate/logs`
     pub fn log_dir() -> AppResult<PathBuf> {
         ProjectDirs::from("com", "chinuno", "LiveTranslate")
             .map(|dirs| dirs.data_local_dir().join("logs"))
@@ -302,14 +571,28 @@ impl AppConfig {
     }
 
     /// 从指定文件读取配置
-    fn from_file(path: &Path) -> AppResult<Self> {
+    pub fn from_file(path: &Path) -> AppResult<Self> {
         let content = fs::read_to_string(path)?;
         Ok(toml::from_str(&content)?)
     }
 
+    /// 从 TOML 文本解析配置
+    pub fn from_str(content: &str) -> AppResult<Self> {
+        Ok(toml::from_str(content)?)
+    }
+
+    /// 序列化为 TOML 文本
+    pub fn to_toml_string(&self) -> AppResult<String> {
+        toml::to_string_pretty(self).map_err(AppError::TomlSerialize)
+    }
+
+    /// 随包发布的默认配置（带完整中文注释，作为设置页 help 的来源）
+    pub const SHIPPED_DEFAULT: &'static str = include_str!("../../config/default.toml");
+
     /// 若目标文件不存在，则写入一份默认配置（并创建父目录）
     ///
-    /// 返回是否实际写入了文件。
+    /// 优先使用随包的 `config/default.toml`（保留注释）；若内容不可解析，
+    /// 回退到 `AppConfig::default()` 的结构化序列化。
     pub fn write_default_if_absent(path: &Path) -> AppResult<bool> {
         if path.exists() {
             return Ok(false);
@@ -317,22 +600,16 @@ impl AppConfig {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        let content =
-            toml::to_string_pretty(&AppConfig::default()).map_err(AppError::TomlSerialize)?;
+        let content = match toml::from_str::<AppConfig>(Self::SHIPPED_DEFAULT) {
+            Ok(_) => Self::SHIPPED_DEFAULT.to_string(),
+            Err(_) => AppConfig::default().to_toml_string()?,
+        };
         fs::write(path, content)?;
         Ok(true)
     }
 
     /// 按优先级解析配置，返回 `(配置, 来源路径)`
-    ///
-    /// 查找顺序：
-    /// 1. `--config` 显式指定
-    /// 2. 可执行文件同级 `config/default.toml`（便携版）
-    /// 3. 当前工作目录 `config/default.toml`（开发/源码运行）
-    /// 4. 用户配置目录（首次运行自动生成默认文件）
-    /// 5. 内置默认值
     pub fn resolve(explicit: Option<PathBuf>) -> AppResult<(Self, Option<PathBuf>)> {
-        // 1. 显式指定：找不到就直接报错，避免静默用错配置
         if let Some(path) = explicit {
             if !path.exists() {
                 return Err(AppError::Config(format!(
@@ -345,7 +622,6 @@ impl AppConfig {
             return Ok((cfg, Some(path)));
         }
 
-        // 2. 可执行文件同级（Windows 便携包 / 解压即用）
         if let Ok(exe) = std::env::current_exe() {
             if let Some(dir) = exe.parent() {
                 let p = dir.join("config").join("default.toml");
@@ -357,7 +633,6 @@ impl AppConfig {
             }
         }
 
-        // 3. 当前工作目录（开发模式）
         let cwd_path = PathBuf::from("config/default.toml");
         if cwd_path.exists() {
             let cfg = Self::from_file(&cwd_path)?;
@@ -365,7 +640,6 @@ impl AppConfig {
             return Ok((cfg, Some(cwd_path)));
         }
 
-        // 4. 用户配置目录（打包后的 .app / exe 走这里）
         if let Ok(user_path) = Self::user_config_path() {
             if user_path.exists() {
                 let cfg = Self::from_file(&user_path)?;
@@ -379,7 +653,8 @@ impl AppConfig {
                         "Created default config at: {} (请填入翻译 API Key)",
                         user_path.display()
                     );
-                    return Ok((AppConfig::default(), Some(user_path)));
+                    let cfg = Self::from_file(&user_path).unwrap_or_default();
+                    return Ok((cfg, Some(user_path)));
                 }
                 Ok(false) => {}
                 Err(e) => {
@@ -392,12 +667,11 @@ impl AppConfig {
             }
         }
 
-        // 5. 内置默认
         let hint = Self::user_config_path()
             .map(|p| p.display().to_string())
             .unwrap_or_else(|_| "<unknown>".to_string());
         tracing::warn!(
-            "No config file found; using built-in defaults (translation api_key is a placeholder). \
+            "No config file found; using built-in defaults. \
              Create one at: {}",
             hint
         );
@@ -420,21 +694,147 @@ impl AppConfig {
         c
     }
 
+    /// 校验配置（保存设置前调用）
+    pub fn validate(&self) -> Result<(), String> {
+        let mut errors: Vec<String> = Vec::new();
+        let sources = self.audio.effective_sources(self.translate.enabled);
+
+        let mut ids = std::collections::HashSet::new();
+        let mut devices = std::collections::HashSet::new();
+
+        for (index, source) in sources.iter().enumerate() {
+            let label = format!("输入源 #{}", index + 1);
+            if source.id.is_empty() || source.id.len() > 32 {
+                errors.push(format!("{label}: id 必须为 1–32 个字符"));
+            } else if !source
+                .id
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+            {
+                errors.push(format!(
+                    "{label}: id「{}」只能包含字母、数字、下划线和短横线",
+                    source.id
+                ));
+            }
+            if !ids.insert(source.id.clone()) {
+                errors.push(format!("{label}: id「{}」重复", source.id));
+            }
+            if source.label.trim().is_empty() {
+                errors.push(format!("{label}: 展示名不能为空"));
+            }
+            if source.enabled && source.device.trim().is_empty() {
+                errors.push(format!("{label}: 启用中的输入源必须指定设备"));
+            }
+            if !self.audio.sources.is_empty()
+                && source.enabled
+                && !source.device.trim().is_empty()
+                && !devices.insert(source.device.clone())
+            {
+                errors.push(format!(
+                    "{label}: 设备「{}」已被其它启用中的输入源占用",
+                    source.device
+                ));
+            }
+        }
+
+        if self.audio.max_active_sources == 0 || self.audio.max_active_sources > 8 {
+            errors.push("audio.max_active_sources 必须在 1–8 之间".to_string());
+        }
+        if self.audio.sample_rate < 8000 || self.audio.sample_rate > 48000 {
+            errors.push("audio.sample_rate 必须在 8000–48000 之间".to_string());
+        }
+
+        let vr = &self.output.steamvr;
+        if !matches!(vr.anchor.as_str(), "hmd" | "world") {
+            errors.push("output.steamvr.anchor 只能是 hmd 或 world".to_string());
+        }
+        check_range(&mut errors, "output.steamvr.opacity", vr.opacity, 0.0, 1.0);
+        check_range(
+            &mut errors,
+            "output.steamvr.curvature",
+            vr.curvature,
+            0.0,
+            1.0,
+        );
+        check_range(&mut errors, "output.steamvr.width_m", vr.width_m, 0.3, 5.0);
+        check_range(
+            &mut errors,
+            "output.steamvr.distance_m",
+            vr.distance_m,
+            0.2,
+            10.0,
+        );
+        check_range(
+            &mut errors,
+            "output.steamvr.height_offset_m",
+            vr.height_offset_m,
+            -2.0,
+            2.0,
+        );
+        if !(1..=8).contains(&vr.max_lines) {
+            errors.push("output.steamvr.max_lines 必须在 1–8 之间".to_string());
+        }
+        if !(12..=96).contains(&vr.font_size_px) {
+            errors.push("output.steamvr.font_size_px 必须在 12–96 之间".to_string());
+        }
+        for (key, color) in [
+            ("background", &vr.background),
+            ("text_color", &vr.text_color),
+            ("source_color", &vr.source_color),
+            ("label_color", &vr.label_color),
+        ] {
+            if !is_hex_color(color) {
+                errors.push(format!(
+                    "output.steamvr.{key} 必须是 #RGB / #RRGGBB / #RRGGBBAA"
+                ));
+            }
+        }
+
+        let osc = &self.output.osc;
+        if !matches!(osc.mode.as_str(), "rolling" | "latest") {
+            errors.push("output.osc.mode 只能是 rolling 或 latest".to_string());
+        }
+        if !matches!(osc.content.as_str(), "translated" | "source" | "both") {
+            errors.push("output.osc.content 只能是 translated / source / both".to_string());
+        }
+        if !(1..=9).contains(&osc.max_lines) {
+            errors.push("output.osc.max_lines 必须在 1–9 之间".to_string());
+        }
+        if osc.max_chars < 8 || osc.max_chars > 144 {
+            errors.push("output.osc.max_chars 必须在 8–144 之间".to_string());
+        }
+        if osc.min_interval_ms < 200 || osc.min_interval_ms > 10_000 {
+            errors.push("output.osc.min_interval_ms 必须在 200–10000 之间".to_string());
+        }
+        if !(1..=10).contains(&osc.max_per_window) {
+            errors.push("output.osc.max_per_window 必须在 1–10 之间".to_string());
+        }
+        let sep_len = osc.separator.chars().count();
+        if sep_len == 0 || sep_len > 4 {
+            errors.push("output.osc.separator 必须是 1–4 个字符".to_string());
+        }
+        if parse_target(&osc.target).is_none() {
+            errors.push("output.osc.target 必须是合法的 host:port".to_string());
+        }
+
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors.join("\n"))
+        }
+    }
+
     /// 就地修改配置文件里的单个键值（**保留注释与原有排版**）
-    ///
-    /// 不直接重写整个文件，因为那会丢失用户在配置里写的注释。
+    #[allow(dead_code)]
     pub fn update_value_in_file(
         path: &Path,
         section: &str,
         key: &str,
         value: &str,
     ) -> AppResult<()> {
-        // 多个命令（异步线程 + 主线程）可能同时写配置，串行化读改写
         static WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
         let _guard = WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
-        // 读取失败（非 UTF-8、被占用等）必须报错：若当成空文件，
-        // 写回时只剩一个键值，会抹掉用户整个配置（包括 API Key）
         let original = match fs::read_to_string(path) {
             Ok(s) => s,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
@@ -442,10 +842,7 @@ impl AppConfig {
         };
         let updated = patch_toml(&original, section, key, value);
         if updated != original {
-            // 先写临时文件再 rename，避免中途崩溃/并发读看到截断的文件
-            let tmp = path.with_extension("toml.tmp");
-            fs::write(&tmp, updated)?;
-            fs::rename(&tmp, path)?;
+            writer::write_atomic(path, &updated).map_err(AppError::Config)?;
         }
         Ok(())
     }
@@ -455,11 +852,13 @@ impl Default for AppConfig {
     fn default() -> Self {
         Self {
             audio: AudioConfig {
-                device_name: "default".to_string(),
-                chunk_seconds: 2.0,
-                sample_rate: 16000,
-                channels: 1,
-                silence_threshold: 0.01,
+                device_name: default_device_name(),
+                chunk_seconds: default_chunk_seconds(),
+                sample_rate: default_sample_rate(),
+                channels: default_channels(),
+                silence_threshold: default_silence_threshold(),
+                max_active_sources: default_max_active_sources(),
+                sources: Vec::new(),
             },
             asr: AsrConfig {
                 backend: "whisper".to_string(),
@@ -502,18 +901,45 @@ impl Default for AppConfig {
                 position_y: 760,
                 always_on_top: true,
                 click_through: false,
+                label_sources: LabelMode::Auto,
             },
             vad: VadConfig::default(),
+            output: OutputConfig::default(),
         }
     }
 }
 
+fn check_range(errors: &mut Vec<String>, name: &str, value: f32, min: f32, max: f32) {
+    if !value.is_finite() || value < min || value > max {
+        errors.push(format!("{name} 必须在 {min}–{max} 之间"));
+    }
+}
+
+/// `#RGB` / `#RRGGBB` / `#RRGGBBAA`
+pub fn is_hex_color(value: &str) -> bool {
+    let Some(rest) = value.strip_prefix('#') else {
+        return false;
+    };
+    matches!(rest.len(), 3 | 6 | 8) && rest.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+/// 解析 `host:port`，返回 `(host, port)`
+pub fn parse_target(value: &str) -> Option<(String, u16)> {
+    let (host, port) = value.rsplit_once(':')?;
+    if host.is_empty() || host.contains(char::is_whitespace) {
+        return None;
+    }
+    let port: u16 = port.parse().ok()?;
+    if port == 0 {
+        return None;
+    }
+    Some((host.to_string(), port))
+}
+
 /// 在 TOML 文本中就地修改 `[section]` 下的 `key = value`
 ///
-/// 保留其余内容（包括注释与空行）。
-/// - 找到 section 且找到 key：替换该行
-/// - 找到 section 但没找到 key：插入到 section 末尾
-/// - 整个 section 不存在：在文件末尾追加
+/// 保留其余内容（包括注释与空行）。结构化写入请优先使用 [`writer::apply_changes`]。
+#[allow(dead_code)]
 fn patch_toml(content: &str, section: &str, key: &str, value: &str) -> String {
     let section_header = format!("[{section}]");
     let mut lines: Vec<String> = content.lines().map(|s| s.to_string()).collect();
@@ -587,14 +1013,10 @@ mod tests {
     fn write_default_creates_file_once() {
         let path = temp_config_path("write-default");
 
-        // 首次应写入
         assert!(AppConfig::write_default_if_absent(&path).unwrap());
         assert!(path.exists());
-
-        // 已存在则不覆盖
         assert!(!AppConfig::write_default_if_absent(&path).unwrap());
 
-        // 写出的文件必须能解析回 AppConfig
         let cfg = AppConfig::from_file(&path).unwrap();
         assert_eq!(cfg.translate.target_language, "zh-CN");
         assert_eq!(cfg.audio.sample_rate, 16000);
@@ -655,7 +1077,6 @@ mod tests {
 
     #[test]
     fn asr_api_key_is_optional_and_backward_compatible() {
-        // 旧配置文件（没有 api_key / auth_header）必须仍能解析
         let old = r#"
             base_url = "http://127.0.0.1:8765"
             model = "whisper-1"
@@ -667,7 +1088,6 @@ mod tests {
         assert_eq!(cfg.api_key, None);
         assert_eq!(cfg.auth_header, None);
 
-        // 带 token 的配置
         let with_key = r#"
             base_url = "https://api.example.com"
             model = "whisper-1"
@@ -680,5 +1100,84 @@ mod tests {
         let cfg: AsrConfig = toml::from_str(with_key).unwrap();
         assert_eq!(cfg.api_key.as_deref(), Some("sk-test"));
         assert_eq!(cfg.auth_header.as_deref(), Some("api-key"));
+    }
+
+    #[test]
+    fn old_config_synthesizes_single_source() {
+        let toml = AppConfig::default().to_toml_string().unwrap();
+        let mut value: toml::Value = toml::from_str(&toml).unwrap();
+        // 模拟 v0.1.6 配置：没有 sources / output / label_sources / max_active_sources
+        let audio = value.get_mut("audio").unwrap().as_table_mut().unwrap();
+        audio.remove("sources");
+        audio.remove("max_active_sources");
+        audio.insert(
+            "device_name".into(),
+            toml::Value::String("mic:1".to_string()),
+        );
+        value.as_table_mut().unwrap().remove("output");
+        let subtitle = value.get_mut("subtitle").unwrap().as_table_mut().unwrap();
+        subtitle.remove("label_sources");
+
+        let cfg: AppConfig = toml::from_str(&toml::to_string(&value).unwrap()).unwrap();
+        let sources = cfg.audio.effective_sources(cfg.translate.enabled);
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].id, "default");
+        assert_eq!(sources[0].device, "mic:1");
+        assert!(sources[0].translate);
+        assert!(!cfg.output.osc.enabled);
+        assert!(!cfg.output.steamvr.enabled);
+        assert_eq!(cfg.subtitle.label_sources, LabelMode::Auto);
+    }
+
+    #[test]
+    fn validation_rejects_duplicate_ids_and_devices() {
+        let mut cfg = AppConfig::default();
+        cfg.audio.sources = vec![
+            AudioSourceConfig {
+                id: "mic".into(),
+                label: "麦".into(),
+                device: "mic:0".into(),
+                ..AudioSourceConfig::new("mic", "麦", "mic:0")
+            },
+            AudioSourceConfig {
+                id: "mic".into(),
+                label: "麦2".into(),
+                device: "mic:0".into(),
+                ..AudioSourceConfig::new("mic", "麦2", "mic:0")
+            },
+        ];
+        let err = cfg.validate().unwrap_err();
+        assert!(err.contains("重复"));
+        assert!(err.contains("设备"));
+    }
+
+    #[test]
+    fn validation_accepts_defaults() {
+        AppConfig::default().validate().unwrap();
+    }
+
+    #[test]
+    fn shipped_default_toml_parses_and_validates() {
+        let cfg: AppConfig = toml::from_str(include_str!("../../config/default.toml")).unwrap();
+        cfg.validate().unwrap();
+        assert_eq!(cfg.audio.sources.len(), 2);
+        assert!(!cfg.audio.sources[1].enabled);
+        assert_eq!(cfg.subtitle.label_sources, LabelMode::Auto);
+        assert_eq!(cfg.output.osc.mode, "rolling");
+        assert_eq!(cfg.output.osc.max_lines, 4);
+    }
+
+    #[test]
+    fn color_and_target_parsing() {
+        assert!(is_hex_color("#FFF"));
+        assert!(is_hex_color("#FFFFFF"));
+        assert!(is_hex_color("#FFFFFF00"));
+        assert!(!is_hex_color("rgba(0,0,0,0.5)"));
+        assert_eq!(
+            parse_target("127.0.0.1:9000"),
+            Some(("127.0.0.1".to_string(), 9000))
+        );
+        assert!(parse_target("127.0.0.1").is_none());
+        assert!(parse_target("host:notaport").is_none());
     }
 }
