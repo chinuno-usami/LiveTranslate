@@ -55,6 +55,22 @@
         "skipTaskbar": true,
         "visible": true,
         "focus": true
+      },
+      {
+        "label": "settings",
+        "url": "settings.html",
+        "title": "LiveTranslate 设置",
+        "width": 960,
+        "height": 720,
+        "minWidth": 760,
+        "minHeight": 560,
+        "resizable": true,
+        "decorations": true,
+        "transparent": false,
+        "alwaysOnTop": false,
+        "skipTaskbar": false,
+        "visible": false,
+        "center": true
       }
     ]
   }

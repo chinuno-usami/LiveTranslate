@@ -1,0 +1,392 @@
+:root {
+  --bg: #0d1117;
+  --panel: #151b23;
+  --panel-2: #1b232d;
+  --border: #2a3440;
+  --text: #e6edf3;
+  --muted: #8b98a5;
+  --accent: #38bdf8;
+  --danger: #f87171;
+  --ok: #34d399;
+  color-scheme: dark;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  height: 100%;
+  background: var(--bg);
+  color: var(--text);
+  font-family: "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
+  font-size: 13px;
+}
+
+body {
+  display: flex;
+  flex-direction: column;
+}
+
+.topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 10px;
+  padding: 10px 16px;
+  background: var(--panel);
+  border-bottom: 1px solid var(--border);
+}
+
+.profile-bar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.profile-title {
+  color: var(--muted);
+  margin-right: 2px;
+}
+
+.profile-select {
+  min-width: 160px;
+}
+
+.top-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.search {
+  width: 190px;
+}
+
+input,
+select,
+textarea,
+button {
+  font: inherit;
+  color: var(--text);
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 5px 8px;
+  outline: none;
+}
+
+input:focus,
+select:focus,
+textarea:focus {
+  border-color: var(--accent);
+}
+
+input[type="checkbox"] {
+  width: 16px;
+  height: 16px;
+  accent-color: var(--accent);
+  padding: 0;
+}
+
+textarea {
+  width: 100%;
+  resize: vertical;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.btn {
+  cursor: pointer;
+  background: #212a35;
+  white-space: nowrap;
+}
+
+.btn:hover {
+  background: #2a3542;
+}
+
+.btn.primary {
+  background: #0b6bcb;
+  border-color: #0b6bcb;
+}
+
+.btn.primary:hover {
+  background: #1280ee;
+}
+
+.btn.small {
+  padding: 3px 8px;
+  font-size: 12px;
+}
+
+.btn.danger {
+  color: var(--danger);
+}
+
+.btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.hint {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 16px;
+  background: #1c2a3a;
+  border-bottom: 1px solid #29405a;
+  color: #cfe8ff;
+}
+
+.banner.error {
+  background: #3a1c1c;
+  border-color: #5a2929;
+  color: #ffd7d7;
+}
+
+.hidden {
+  display: none !important;
+}
+
+.layout {
+  flex: 1;
+  display: flex;
+  min-height: 0;
+}
+
+.group-nav {
+  width: 190px;
+  flex: none;
+  overflow: auto;
+  padding: 10px 8px;
+  background: var(--panel);
+  border-right: 1px solid var(--border);
+}
+
+.nav-item {
+  display: block;
+  width: 100%;
+  text-align: left;
+  padding: 8px 10px;
+  margin-bottom: 2px;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+}
+
+.nav-item:hover {
+  background: var(--panel-2);
+  color: var(--text);
+}
+
+.nav-item.active {
+  background: #1d2b3a;
+  color: var(--accent);
+}
+
+.group-content {
+  flex: 1;
+  overflow: auto;
+  padding: 22px 28px 60px;
+}
+
+.group-header h2 {
+  margin: 0 0 4px;
+  font-size: 18px;
+  font-weight: 600;
+}
+
+.group-header p {
+  margin: 0 0 18px;
+  color: var(--muted);
+}
+
+.field {
+  display: grid;
+  grid-template-columns: minmax(180px, 240px) minmax(0, 1fr);
+  gap: 12px;
+  align-items: start;
+  padding: 10px 0;
+  border-bottom: 1px solid rgba(42, 52, 64, 0.55);
+}
+
+.field-label {
+  padding-top: 4px;
+}
+
+.field-label .label {
+  display: block;
+  font-weight: 500;
+}
+
+.field-label .help {
+  display: block;
+  margin-top: 3px;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.45;
+  white-space: pre-wrap;
+}
+
+.field-control {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.field-control input[type="text"],
+.field-control input[type="number"],
+.field-control input[type="password"],
+.field-control select {
+  min-width: 220px;
+  max-width: 100%;
+}
+
+.field-control textarea {
+  min-height: 72px;
+}
+
+.field-control .value-preview {
+  width: 26px;
+  height: 26px;
+  border-radius: 5px;
+  border: 1px solid var(--border);
+  flex: none;
+}
+
+.field.advanced-hidden {
+  display: none;
+}
+
+.restart-tag {
+  display: inline-block;
+  margin-left: 6px;
+  padding: 0 6px;
+  border-radius: 999px;
+  font-size: 10px;
+  color: #ffd28a;
+  border: 1px solid #5a4a24;
+  background: #2a2416;
+}
+
+details.advanced {
+  margin-top: 18px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 6px 12px 12px;
+  background: rgba(21, 27, 35, 0.6);
+}
+
+details.advanced > summary {
+  cursor: pointer;
+  padding: 6px 0;
+  color: var(--muted);
+}
+
+.section-disabled {
+  opacity: 0.55;
+}
+
+.capability-note {
+  margin-bottom: 14px;
+  padding: 10px 12px;
+  border-radius: 8px;
+  border: 1px solid #5a4a24;
+  background: #241f15;
+  color: #ffd28a;
+}
+
+/* 输入源表格 */
+.sources-table {
+  width: 100%;
+  border-collapse: collapse;
+  margin-bottom: 12px;
+}
+
+.sources-table th,
+.sources-table td {
+  padding: 6px 6px;
+  border-bottom: 1px solid var(--border);
+  text-align: left;
+  vertical-align: middle;
+}
+
+.sources-table th {
+  color: var(--muted);
+  font-weight: 500;
+  font-size: 11px;
+}
+
+.sources-table input[type="text"],
+.sources-table select {
+  width: 100%;
+  min-width: 90px;
+}
+
+.sources-table .col-small {
+  width: 56px;
+  text-align: center;
+}
+
+.icon-btn {
+  padding: 2px 6px;
+  font-size: 12px;
+}
+
+.sources-actions {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 18px;
+}
+
+.sources-error {
+  color: var(--danger);
+  font-size: 12px;
+  min-height: 18px;
+  margin-bottom: 8px;
+}
+
+.raw-editor {
+  min-height: 60vh;
+}
+
+.raw-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.statusbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 6px 16px;
+  border-top: 1px solid var(--border);
+  background: var(--panel);
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.statusbar .ok {
+  color: var(--ok);
+}
+
+.statusbar .err {
+  color: var(--danger);
+}

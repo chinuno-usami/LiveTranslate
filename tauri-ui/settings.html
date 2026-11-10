@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>LiveTranslate 设置</title>
+    <link rel="stylesheet" href="./settings.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="profile-bar">
+        <span class="profile-title">配置档</span>
+        <select id="profile-select" class="profile-select"></select>
+        <button id="profile-new" class="btn small">新建</button>
+        <button id="profile-dup" class="btn small">复制</button>
+        <button id="profile-rename" class="btn small">重命名</button>
+        <button id="profile-delete" class="btn small danger">删除</button>
+        <button id="profile-open" class="btn small">打开目录</button>
+        <span id="profile-reason" class="hint"></span>
+      </div>
+      <div class="top-actions">
+        <input id="search" class="search" type="search" placeholder="搜索设置项…" />
+        <button id="reload-btn" class="btn">重新加载</button>
+        <button id="cancel-btn" class="btn">取消</button>
+        <button id="save-btn" class="btn primary">保存</button>
+      </div>
+    </header>
+
+    <div id="restart-banner" class="banner hidden">
+      <span>部分修改需要重启采集后生效。</span>
+      <button id="restart-btn" class="btn small">立即重启采集</button>
+    </div>
+    <div id="error-banner" class="banner error hidden"></div>
+
+    <div class="layout">
+      <nav id="group-nav" class="group-nav"></nav>
+      <main id="group-content" class="group-content"></main>
+    </div>
+
+    <footer class="statusbar">
+      <span id="save-status">加载中…</span>
+      <span id="config-path" class="hint"></span>
+    </footer>
+
+    <script src="./settings.js"></script>
+  </body>
+</html>
