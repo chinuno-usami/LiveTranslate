@@ -151,11 +151,14 @@ pub async fn start_console(config: AppConfig) -> AppResult<()> {
         .effective_sources(config.translate.enabled)
         .into_iter()
         .filter(|s| s.enabled)
-        .take(config.audio.max_active_sources.max(1))
         .collect();
-    sources.dedup_by(|a, b| a.device == b.device);
+    // 按设备去重（与 GUI 的 HashSet 语义一致；dedup_by 只能去掉相邻重复）
+    let mut seen_devices = std::collections::HashSet::new();
+    sources.retain(|s| s.device.trim().is_empty() || seen_devices.insert(s.device.clone()));
+    sources.truncate(config.audio.max_active_sources.max(1));
 
     let outputs = OutputManager::new(&config.output);
+    outputs.set_capture_active(true);
     let history_limit = config
         .subtitle
         .max_lines
@@ -335,7 +338,32 @@ async fn process_segment(
 }
 
 /// 单个输入源的完整流水线
+///
+/// 外层包一层：不管内部是正常结束、提前 `?` 返回还是错误，
+/// 都会补发一条 `running: false`，否则 UI 会永远停在“采集中”。
 pub async fn run_source(
+    base: AppConfig,
+    source: SourceContext,
+    tx: mpsc::Sender<PipelineEvent>,
+    stop_rx: watch::Receiver<bool>,
+) -> AppResult<()> {
+    let source_id = source.id.clone();
+    let result = run_source_inner(base, source, tx.clone(), stop_rx).await;
+    let message = match &result {
+        Ok(()) => "已停止".to_string(),
+        Err(e) => format!("已停止: {e}"),
+    };
+    let _ = tx
+        .send(PipelineEvent::SourceState {
+            source_id,
+            running: false,
+            message,
+        })
+        .await;
+    result
+}
+
+async fn run_source_inner(
     base: AppConfig,
     source: SourceContext,
     tx: mpsc::Sender<PipelineEvent>,
@@ -379,13 +407,7 @@ pub async fn run_source(
     {
         Ok(capture) => capture,
         Err(e) => {
-            let _ = tx
-                .send(PipelineEvent::SourceState {
-                    source_id: source.id.clone(),
-                    running: false,
-                    message: format!("打开设备失败: {e}"),
-                })
-                .await;
+            // 结束状态由 `run_source` 统一补发（带真实原因）
             return Err(e);
         }
     };
@@ -458,7 +480,7 @@ pub async fn run_source(
 
         while let Some(chunk) = utterance_rx.recv().await {
             let translate_enabled = *translate_rx.borrow();
-            let keep_going = process_segment(
+            let keep_going = match process_segment(
                 &chunk,
                 target_rate,
                 &worker_source_id,
@@ -472,7 +494,19 @@ pub async fn run_source(
                 filter_hallucination,
             )
             .await
-            .unwrap_or(true);
+            {
+                Ok(keep) => keep,
+                Err(e) => {
+                    tracing::error!("[{worker_label}] 片段处理失败: {e}");
+                    let _ = worker_tx
+                        .send(PipelineEvent::Notice {
+                            source_id: Some(worker_source_id.clone()),
+                            message: format!("处理失败: {e}"),
+                        })
+                        .await;
+                    true
+                }
+            };
 
             if !keep_going {
                 break;
@@ -509,7 +543,7 @@ pub async fn run_source(
                 segmenter.push(&resampled);
 
                 pushed_chunks += 1;
-                if pushed_chunks % 500 == 0 {
+                if pushed_chunks.is_multiple_of(500) {
                     if let Segmenter::Vad(vad) = &mut segmenter {
                         if let Some(floor) = vad.noise_floor_db() {
                             tracing::debug!(
@@ -570,13 +604,6 @@ pub async fn run_source(
     }
 
     audio_capture.stop();
-    let _ = tx
-        .send(PipelineEvent::SourceState {
-            source_id: source.id.clone(),
-            running: false,
-            message: "已停止".to_string(),
-        })
-        .await;
     tracing::info!("[{}] Audio pipeline stopped", source.label);
     Ok(())
 }

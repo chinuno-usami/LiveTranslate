@@ -10,6 +10,8 @@ pub const CONFIG_EVENT: &str = "config://subtitle";
 pub const ERROR_EVENT: &str = "error://message";
 pub const NOTICE_EVENT: &str = "notice://message";
 pub const CLICK_THROUGH_EVENT: &str = "click-through://update";
+/// 设置窗口被显示（它只会 hide，前端需要据此重新拉取配置）
+pub const SETTINGS_SHOWN_EVENT: &str = "settings://shown";
 
 #[derive(Debug, Clone, Serialize)]
 pub struct SubtitleEntryPayload {
