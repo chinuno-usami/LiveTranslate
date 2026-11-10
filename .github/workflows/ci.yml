@@ -71,3 +71,32 @@ jobs:
 
       - name: cargo test
         run: cargo test --all-targets
+
+      # ---- v0.2 双构建风味校验 ----
+
+      - name: cargo check (osc, Linux/macOS)
+        if: runner.os != 'Windows'
+        run: cargo check --all-targets --features osc
+
+      - name: cargo check (extras / Full)
+        if: runner.os == 'Windows'
+        run: cargo check --all-targets --features extras
+
+      - name: cargo clippy (extras / Full)
+        if: runner.os == 'Windows'
+        run: cargo clippy --all-targets --features extras -- -D warnings
+
+      - name: cargo test (extras / Full)
+        if: runner.os == 'Windows'
+        run: cargo test --all-targets --features extras
+
+      # 标准包不能链接可选依赖（rosc / openvr / cosmic-text）
+      - name: standard build excludes optional deps
+        shell: bash
+        run: |
+          set -euo pipefail
+          if cargo tree --features custom-protocol | grep -E 'rosc|openvr|cosmic-text'; then
+            echo "::error::standard build must not link optional output dependencies"
+            exit 1
+          fi
+          echo "ok: standard dependency tree is clean"
