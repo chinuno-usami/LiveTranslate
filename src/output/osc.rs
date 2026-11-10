@@ -220,7 +220,7 @@ fn now_ms() -> u64 {
 mod imp {
     use super::*;
     use rosc::{OscMessage, OscPacket, OscType};
-    use std::net::UdpSocket;
+    use std::net::{SocketAddr, UdpSocket};
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::{Arc, Mutex};
     use std::thread::JoinHandle;
@@ -234,6 +234,22 @@ mod imp {
         stop: AtomicBool,
         /// 最近一次字幕活动时间（epoch ms），用于 typing 指示
         activity_ms: AtomicU64,
+        /// 配置变更后请求清空去重状态（否则停止再开启时相同文本永不发送）
+        reset_dedup: AtomicBool,
+    }
+
+    impl Shared {
+        fn config(&self) -> OscConfig {
+            self.config
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
+        }
+
+        fn set_status_message(&self, message: String) {
+            let mut status = self.status.lock().unwrap_or_else(|e| e.into_inner());
+            status.message = message;
+        }
     }
 
     pub struct OscSink {
@@ -258,35 +274,52 @@ mod imp {
                 }),
                 stop: AtomicBool::new(false),
                 activity_ms: AtomicU64::new(0),
+                reset_dedup: AtomicBool::new(false),
             });
 
             let thread_shared = shared.clone();
-            let handle = std::thread::Builder::new()
+            match std::thread::Builder::new()
                 .name("osc-output".to_string())
                 .spawn(move || run(thread_shared))
-                .ok();
-
-            Self {
-                shared,
-                handle: Mutex::new(handle),
+            {
+                Ok(handle) => Self {
+                    shared,
+                    handle: Mutex::new(Some(handle)),
+                },
+                Err(e) => {
+                    shared.set_status_message(format!("无法启动 OSC 线程: {e}"));
+                    Self {
+                        shared,
+                        handle: Mutex::new(None),
+                    }
+                }
             }
         }
 
         pub fn apply_config(&self, config: &OscConfig) {
-            if let Ok(mut cfg) = self.shared.config.lock() {
-                *cfg = config.clone();
+            let previous = self.shared.config();
+            {
+                let mut current = self.shared.config.lock().unwrap_or_else(|e| e.into_inner());
+                *current = config.clone();
             }
-            if let Ok(mut status) = self.shared.status.lock() {
-                status.enabled = config.enabled;
-                if !config.enabled {
-                    status.message = "未启用".to_string();
-                }
+            if previous.target != config.target
+                || previous.content != config.content
+                || previous.separator != config.separator
+                || previous.mode != config.mode
+                || previous.enabled != config.enabled
+            {
+                self.shared.reset_dedup.store(true, Ordering::SeqCst);
+            }
+            let mut status = self.shared.status.lock().unwrap_or_else(|e| e.into_inner());
+            status.enabled = config.enabled;
+            if !config.enabled {
+                status.message = "未启用".to_string();
             }
         }
 
         /// 传入完整字幕快照；内部覆盖旧快照，限流期间只保留最新结果
         pub fn publish(&self, snapshot: &[DisplayLine]) {
-            if let Ok(mut pending) = self.shared.pending.lock() {
+            if let Ok(mut pending) = self.shared.pending.try_lock() {
                 *pending = Some(snapshot.to_vec());
             }
             self.shared.activity_ms.store(now_ms(), Ordering::SeqCst);
@@ -295,6 +328,7 @@ mod imp {
         pub fn set_active(&self, active: bool) {
             if !active {
                 self.shared.activity_ms.store(0, Ordering::SeqCst);
+                self.shared.reset_dedup.store(true, Ordering::SeqCst);
                 if let Ok(mut pending) = self.shared.pending.lock() {
                     *pending = Some(Vec::new());
                 }
@@ -305,8 +339,8 @@ mod imp {
             self.shared
                 .status
                 .lock()
-                .map(|s| s.clone())
-                .unwrap_or_default()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
         }
 
         pub fn shutdown(&self) {
@@ -319,11 +353,25 @@ mod imp {
         }
     }
 
+    /// 把 `host:port` 解析一次缓存起来，避免每个 UDP 包都做一次 DNS 查询
+    fn resolve_target(target: &str) -> Result<SocketAddr, String> {
+        use std::net::ToSocketAddrs;
+        let trimmed = target.trim();
+        if trimmed.is_empty() {
+            return Err("目标地址为空".to_string());
+        }
+        trimmed
+            .to_socket_addrs()
+            .map_err(|e| format!("解析 {trimmed} 失败: {e}"))?
+            .next()
+            .ok_or_else(|| format!("解析 {trimmed} 得不到地址"))
+    }
+
     fn run(shared: Arc<Shared>) {
         let socket = match UdpSocket::bind("0.0.0.0:0") {
             Ok(socket) => socket,
             Err(e) => {
-                set_message(&shared, format!("无法创建 UDP socket: {e}"));
+                shared.set_status_message(format!("无法创建 UDP socket: {e}"));
                 return;
             }
         };
@@ -336,23 +384,32 @@ mod imp {
         let mut sent_at: VecDeque<Instant> = VecDeque::new();
         let mut typing = false;
         let mut last_typing_sent: Option<Instant> = None;
+        // 解析好的目标地址（配置变更时重解析，避免每包 DNS）
+        let mut target: Option<SocketAddr> = None;
 
         loop {
             if shared.stop.load(Ordering::SeqCst) {
                 if typing {
-                    let _ = send_typing(&socket, &shared, false);
+                    if let Some(addr) = target {
+                        let _ = send_typing(&socket, addr, false);
+                    }
                 }
                 break;
             }
 
-            let config = match shared.config.lock() {
-                Ok(cfg) => cfg.clone(),
-                Err(_) => break,
-            };
+            let config = shared.config();
+
+            if shared.reset_dedup.swap(false, Ordering::SeqCst) {
+                last_sent_text = None;
+                pending_text = None;
+                history.clear();
+            }
 
             if !config.enabled {
                 if typing {
-                    let _ = send_typing(&socket, &shared, false);
+                    if let Some(addr) = target {
+                        let _ = send_typing(&socket, addr, false);
+                    }
                     typing = false;
                 }
                 std::thread::sleep(Duration::from_millis(100));
@@ -361,8 +418,14 @@ mod imp {
 
             let opts = PackOptions::from_config(&config);
 
-            if let Ok(mut pending) = shared.pending.lock() {
-                if let Some(snapshot) = pending.take() {
+            // 锁只覆盖 take()：后面的格式化/组包不持有锁
+            let snapshot = shared
+                .pending
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take();
+            if let Some(snapshot) = snapshot {
+                {
                     // 重新构建历史（快照已经按浮窗 max_lines 裁剪）
                     history.clear();
                     for line in &snapshot {
@@ -399,9 +462,19 @@ mod imp {
                 let throttle_ok = last_typing_sent
                     .map(|t| t.elapsed() >= Duration::from_millis(500))
                     .unwrap_or(true);
-                if throttle_ok && send_typing(&socket, &shared, want_typing).is_ok() {
-                    typing = want_typing;
-                    last_typing_sent = Some(Instant::now());
+                if throttle_ok {
+                    if target.is_none() {
+                        match resolve_target(&config.target) {
+                            Ok(addr) => target = Some(addr),
+                            Err(e) => shared.set_status_message(format!("OSC 目标无效: {e}")),
+                        }
+                    }
+                    if let Some(addr) = target {
+                        if send_typing(&socket, addr, want_typing).is_ok() {
+                            typing = want_typing;
+                            last_typing_sent = Some(Instant::now());
+                        }
+                    }
                 }
             }
 
@@ -414,7 +487,17 @@ mod imp {
             let window_ok = has_window_quota(&sent_at, config.max_per_window.max(1));
 
             if let (Some(text), true, true) = (pending_text.clone(), interval_ok, window_ok) {
-                match send_chatbox(&socket, &config, &text) {
+                if target.is_none() {
+                    match resolve_target(&config.target) {
+                        Ok(addr) => target = Some(addr),
+                        Err(e) => shared.set_status_message(format!("OSC 目标无效: {e}")),
+                    }
+                }
+                let send_result = match target {
+                    Some(addr) => send_chatbox(&socket, addr, &text),
+                    None => Err("目标地址无效".to_string()),
+                };
+                match send_result {
                     Ok(()) => {
                         last_sent_text = Some(text.clone());
                         pending_text = None;
@@ -423,24 +506,26 @@ mod imp {
                         if config.debug_log {
                             tracing::info!("OSC chatbox => {:?}", text);
                         }
-                        if let Ok(mut status) = shared.status.lock() {
+                        {
+                            let mut status =
+                                shared.status.lock().unwrap_or_else(|e| e.into_inner());
                             status.enabled = true;
                             status.last_sent_ms = now_ms();
                             status.message = format!("已发送 {} 字符", text.chars().count());
                         }
-                        if !config.custom_address.trim().is_empty() {
-                            if let Some((source_id, label)) = &latest_meta {
-                                let _ = send_custom(
-                                    &socket,
-                                    &config.custom_address,
-                                    &text,
-                                    source_id,
-                                    label,
-                                );
+                        let custom = config.custom_address.trim();
+                        if !custom.is_empty() {
+                            if let (Some((source_id, label)), Ok(addr)) =
+                                (&latest_meta, resolve_target(custom))
+                            {
+                                if let Err(e) = send_custom(&socket, addr, &text, source_id, label)
+                                {
+                                    shared.set_status_message(format!("自定义地址发送失败: {e}"));
+                                }
                             }
                         }
                     }
-                    Err(e) => set_message(&shared, format!("OSC 发送失败: {e}")),
+                    Err(e) => shared.set_status_message(format!("OSC 发送失败: {e}")),
                 }
             }
 
@@ -448,18 +533,11 @@ mod imp {
         }
     }
 
-    fn set_message(shared: &Shared, message: String) {
-        if let Ok(mut status) = shared.status.lock() {
-            status.enabled = true;
-            status.message = message;
-        }
-    }
-
     fn packet_bytes(packet: OscPacket) -> Result<Vec<u8>, String> {
         rosc::encoder::encode(&packet).map_err(|e| format!("OSC 编码失败: {e}"))
     }
 
-    fn send_chatbox(socket: &UdpSocket, config: &OscConfig, text: &str) -> Result<(), String> {
+    fn send_chatbox(socket: &UdpSocket, target: SocketAddr, text: &str) -> Result<(), String> {
         let packet = OscPacket::Message(OscMessage {
             addr: "/chatbox/input".to_string(),
             args: vec![
@@ -470,30 +548,26 @@ mod imp {
         });
         let bytes = packet_bytes(packet)?;
         socket
-            .send_to(&bytes, config.target.trim())
+            .send_to(&bytes, target)
             .map(|_| ())
             .map_err(|e| e.to_string())
     }
 
-    fn send_typing(socket: &UdpSocket, shared: &Shared, typing: bool) -> Result<(), String> {
-        let target = match shared.config.lock() {
-            Ok(cfg) => cfg.target.clone(),
-            Err(_) => return Err("配置锁失效".to_string()),
-        };
+    fn send_typing(socket: &UdpSocket, target: SocketAddr, typing: bool) -> Result<(), String> {
         let packet = OscPacket::Message(OscMessage {
             addr: "/chatbox/typing".to_string(),
             args: vec![OscType::Bool(typing)],
         });
         let bytes = packet_bytes(packet)?;
         socket
-            .send_to(&bytes, target.trim())
+            .send_to(&bytes, target)
             .map(|_| ())
             .map_err(|e| e.to_string())
     }
 
     fn send_custom(
         socket: &UdpSocket,
-        target: &str,
+        target: SocketAddr,
         text: &str,
         source_id: &str,
         label: &str,
@@ -508,7 +582,7 @@ mod imp {
         });
         let bytes = packet_bytes(packet)?;
         socket
-            .send_to(&bytes, target.trim())
+            .send_to(&bytes, target)
             .map(|_| ())
             .map_err(|e| e.to_string())
     }

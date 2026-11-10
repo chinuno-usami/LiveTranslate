@@ -105,23 +105,18 @@ impl SteamVrSink {
     }
 
     pub fn publish(&self, lines: &[DisplayLine]) {
-        if let Ok(mut current) = self.shared.lines.lock() {
+        // 33ms 的 VR 线程可能正拿着这把锁，这里不能无限等待热路径
+        if let Ok(mut current) = self.shared.lines.try_lock() {
             *current = lines.to_vec();
         }
         if !lines.is_empty() {
-            if let Ok(mut last) = self.shared.last_activity.lock() {
-                *last = Instant::now();
-            }
+            *lock(&self.shared.last_activity) = Instant::now();
         }
         self.shared.revision.fetch_add(1, Ordering::SeqCst);
     }
 
     pub fn status(&self) -> SteamVrStatus {
-        self.shared
-            .status
-            .lock()
-            .map(|s| s.clone())
-            .unwrap_or_default()
+        lock(&self.shared.status).clone()
     }
 
     pub fn shutdown(&mut self) {
@@ -135,11 +130,15 @@ impl Drop for SteamVrSink {
     }
 }
 
+/// 锁中毒时取回内部值：VR 线程里一次 panic 不该让输出永久失效
+fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 fn set_status(shared: &Shared, connected: bool, message: impl Into<String>) {
-    if let Ok(mut status) = shared.status.lock() {
-        status.connected = connected;
-        status.message = message.into();
-    }
+    let mut status = lock(&shared.status);
+    status.connected = connected;
+    status.message = message.into();
 }
 
 fn run(shared: Arc<Shared>) {
@@ -147,14 +146,11 @@ fn run(shared: Arc<Shared>) {
         if shared.stop.load(Ordering::SeqCst) {
             break;
         }
-        let interval = shared
-            .config
-            .lock()
-            .map(|c| c.reconnect_interval_secs.max(1))
-            .unwrap_or(5);
+        let interval = lock(&shared.config).reconnect_interval_secs.max(1);
 
         let result = catch_unwind(AssertUnwindSafe(|| session(&shared)));
         if shared.stop.load(Ordering::SeqCst) {
+            // 主动停止：不要再写“已断开”，否则会覆盖刚设置的“未启用”
             break;
         }
         match result {
@@ -199,11 +195,7 @@ fn session(shared: &Arc<Shared>) -> Result<(), String> {
             return Ok(());
         }
 
-        let config = shared
-            .config
-            .lock()
-            .map(|c| c.clone())
-            .map_err(|_| "配置锁失效".to_string())?;
+        let config = lock(&shared.config).clone();
         let revision = shared.revision.load(Ordering::SeqCst);
 
         if revision != last_revision {
@@ -212,11 +204,7 @@ fn session(shared: &Arc<Shared>) -> Result<(), String> {
             let _ = overlay.set_width(handle, config.width_m.clamp(0.3, 5.0));
             let _ = overlay.set_curvature(handle, config.curvature.clamp(0.0, 1.0));
 
-            let lines = shared
-                .lines
-                .lock()
-                .map(|l| l.clone())
-                .map_err(|_| "字幕锁失效".to_string())?;
+            let lines = lock(&shared.lines).clone();
 
             if lines.is_empty() {
                 // 淡出后隐藏（由下面的动画循环在 opacity 接近 0 时隐藏）
@@ -224,15 +212,32 @@ fn session(shared: &Arc<Shared>) -> Result<(), String> {
             } else {
                 let rendered = catch_unwind(AssertUnwindSafe(|| renderer.render(&lines, &config)))
                     .map_err(|_| "渲染字幕时发生异常".to_string())?;
-                let aspect = rendered.width as f32 / rendered.height.max(1) as f32;
-                let _ = overlay.set_texel_aspect(handle, aspect);
-                overlay
-                    .set_raw_data(handle, &rendered.rgba, rendered.width, rendered.height, 4)
-                    .map_err(|e| format!("上传纹理失败: {e:?}"))?;
-                if let Err(e) = overlay.set_visibility(handle, true) {
-                    return Err(format!("显示 Overlay 失败: {e:?}"));
+                // texel aspect 保持默认 1.0（方形 texel），面板高度由纹理宽高自动推导；
+                // 传整幅纹理的宽高比会让面板被压扁且随行数抖动。
+                match overlay.set_raw_data(
+                    handle,
+                    &rendered.rgba,
+                    rendered.width,
+                    rendered.height,
+                    4,
+                ) {
+                    Ok(()) => {
+                        // 单帧上传失败（尺寸超限 / SteamVR 瞬时忙）不该拆掉整个会话，
+                        // 跳过这一帧、保留上一帧纹理即可
+                        if let Err(e) = overlay.set_visibility(handle, true) {
+                            tracing::warn!("显示 Overlay 失败: {e:?}");
+                        }
+                        target_opacity = config.opacity.clamp(0.0, 1.0);
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "上传纹理失败（{}x{}）: {e:?}",
+                            rendered.width,
+                            rendered.height
+                        );
+                        set_status(shared, true, format!("上传纹理失败: {e:?}"));
+                    }
                 }
-                target_opacity = config.opacity.clamp(0.0, 1.0);
             }
         }
 
@@ -242,11 +247,8 @@ fn session(shared: &Arc<Shared>) -> Result<(), String> {
         last_animate = now;
         // 静音一段时间后淡出（新字幕会重新点亮）
         if config.hide_on_silence_secs > 0 {
-            let silent = shared
-                .last_activity
-                .lock()
-                .map(|t| t.elapsed().as_secs() >= config.hide_on_silence_secs)
-                .unwrap_or(false);
+            let silent =
+                lock(&shared.last_activity).elapsed().as_secs() >= config.hide_on_silence_secs;
             if silent {
                 target_opacity = 0.0;
             }

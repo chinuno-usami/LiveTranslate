@@ -47,6 +47,10 @@ impl OutputManager {
 
     /// 发布一份完整字幕快照（按时间从旧到新）
     pub fn publish(&self, snapshot: &[DisplayLine]) {
+        // 停止后迟到的快照不要再进入输出，否则重新开启时会立刻发出旧内容
+        if !self.capture_active.load(Ordering::SeqCst) {
+            return;
+        }
         self.steamvr.publish(snapshot);
         self.osc.publish(snapshot);
     }
@@ -76,5 +80,21 @@ impl OutputManager {
     pub fn shutdown(&self) {
         self.steamvr.shutdown();
         self.osc.shutdown();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 风味本身是否真的被编进去（CI 靠它把“双构建”钉住，而不是只 grep 依赖树）
+    #[test]
+    fn capabilities_follow_features() {
+        let (steamvr, osc) = capabilities();
+        assert_eq!(osc, cfg!(feature = "osc"));
+        assert_eq!(
+            steamvr,
+            cfg!(all(feature = "steamvr", target_os = "windows"))
+        );
     }
 }

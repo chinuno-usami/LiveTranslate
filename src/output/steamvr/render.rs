@@ -6,6 +6,11 @@ use crate::subtitle::DisplayLine;
 use cosmic_text::{Attrs, Buffer, Color, Family, FontSystem, Metrics, Shaping, SwashCache, Weight};
 
 pub const CANVAS_WIDTH: usize = 1024;
+/// OpenVR 对纹理尺寸有隐式上限，且整帧 CPU 光栅开销随高度线性增长。
+/// 超长字幕（ASR/翻译输出长度不可控）必须被夹住，否则会 OOM 或上传失败。
+const MAX_CANVAS_HEIGHT: usize = 2048;
+/// 单条字幕参与排版的字符上限（超出部分用 … 截断）
+const MAX_LINE_CHARS: usize = 400;
 const PADDING: f32 = 28.0;
 const RADIUS: f32 = 24.0;
 
@@ -130,6 +135,8 @@ impl Renderer {
             if body.trim().is_empty() {
                 continue;
             }
+            let body = clip_chars(body, MAX_LINE_CHARS);
+            let source_text = clip_chars(&line.source, MAX_LINE_CHARS);
 
             let source_buffer = if config.show_source
                 && !line.source.trim().is_empty()
@@ -139,7 +146,7 @@ impl Renderer {
                     Buffer::new(font_system, Metrics::new(source_size, source_size * 1.35));
                 buffer.set_size(Some(content_width), None);
                 let attrs = build_attrs(&family, with_alpha(source_color, alpha * 0.85));
-                buffer.set_text(&line.source, &attrs, Shaping::Advanced, None);
+                buffer.set_text(&source_text, &attrs, Shaping::Advanced, None);
                 buffer.shape_until_scroll(font_system, false);
                 Some(buffer)
             } else {
@@ -166,7 +173,7 @@ impl Renderer {
                     None,
                 );
             } else {
-                buffer.set_text(body, &body_attrs, Shaping::Advanced, None);
+                buffer.set_text(&body, &body_attrs, Shaping::Advanced, None);
             }
             buffer.shape_until_scroll(font_system, false);
 
@@ -187,7 +194,7 @@ impl Renderer {
             .sum::<f32>()
             + block_gap * blocks.len().saturating_sub(1) as f32;
         let total_height = (content_height + PADDING * 2.0).max(PADDING * 2.0 + translated_size);
-        let height = total_height.ceil() as usize;
+        let height = (total_height.ceil() as usize).clamp(1, MAX_CANVAS_HEIGHT);
         let mut canvas = vec![0u8; CANVAS_WIDTH * height * 4];
 
         // 背景面板（圆角 + 1px 内描边）
@@ -270,6 +277,17 @@ fn build_attrs<'a>(family: &'a Option<String>, color: Color) -> Attrs<'a> {
             Some(name) => Family::Name(name.as_str()),
             None => Family::SansSerif,
         })
+}
+
+/// 按字符截断，超长时保留头部并加 `…`（避免把单条字幕排成几十行）
+fn clip_chars(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        text.to_string()
+    } else {
+        let mut out: String = text.chars().take(max.saturating_sub(1)).collect();
+        out.push('…');
+        out
+    }
 }
 
 fn buffer_height(buffer: &Buffer) -> f32 {
