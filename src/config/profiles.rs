@@ -88,6 +88,11 @@ fn profile_path(config_path: &Path, name: &str) -> PathBuf {
     profiles_dir(config_path).join(format!("{name}.toml"))
 }
 
+/// 随包默认配置（带注释），用于新建配置档 / 首次迁移的快照
+fn seed_text() -> String {
+    AppConfig::SHIPPED_DEFAULT.to_string()
+}
+
 /// 首次启用时做非破坏性迁移：创建 profiles/ 与 default 快照
 pub fn ensure_initialized(config_path: &Path) -> Result<(), String> {
     let dir = profiles_dir(config_path);
@@ -97,9 +102,9 @@ pub fn ensure_initialized(config_path: &Path) -> Result<(), String> {
     if !default_path.exists() {
         let text = match fs::read_to_string(config_path) {
             Ok(text) => text,
-            Err(_) => AppConfig::default()
-                .to_toml_string()
-                .map_err(|e| format!("生成默认配置失败: {e}"))?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => seed_text(),
+            // 权限 / 编码错误不要退化成“文件不存在”，否则会静默生成无注释默认档
+            Err(e) => return Err(format!("读取当前配置失败: {e}")),
         };
         writer::write_atomic(&default_path, &text)?;
     }
@@ -208,7 +213,11 @@ pub fn list_status(config_path: Option<&Path>) -> ProfilesStatus {
                     cfg.validate().map_err(crate::error::AppError::Config)?;
                     Ok(cfg)
                 }) {
-                    Ok(_) => (true, None),
+                    Ok(_) => match validate_name(&name) {
+                        // 名字非法的手写文件：列出来但明确标记不可操作
+                        Ok(()) => (true, None),
+                        Err(e) => (false, Some(e)),
+                    },
                     Err(e) => (false, Some(e.to_string())),
                 },
                 Err(e) => (false, Some(e.to_string())),
@@ -255,9 +264,7 @@ pub fn create(config_path: &Path, name: &str, copy_from: Option<&Path>) -> Resul
     }
     let text = match copy_from {
         Some(source) => fs::read_to_string(source).map_err(|e| format!("读取源配置失败: {e}"))?,
-        None => AppConfig::default()
-            .to_toml_string()
-            .map_err(|e| format!("生成默认配置失败: {e}"))?,
+        None => seed_text(),
     };
     validated_text(&text)?;
     writer::write_atomic(&target, &text)
@@ -288,7 +295,11 @@ pub fn rename(config_path: &Path, old: &str, new: &str) -> Result<(), String> {
     }
     fs::rename(&source, &target).map_err(|e| format!("重命名失败: {e}"))?;
     if read_active(config_path).as_deref() == Some(old) {
-        write_active(config_path, new)?;
+        if let Err(e) = write_active(config_path, new) {
+            // 回滚重命名，避免 active 指向不存在的配置档
+            let _ = fs::rename(&target, &source);
+            return Err(e);
+        }
     }
     Ok(())
 }
@@ -296,6 +307,9 @@ pub fn rename(config_path: &Path, old: &str, new: &str) -> Result<(), String> {
 pub fn delete(config_path: &Path, name: &str) -> Result<(), String> {
     validate_name(name)?;
     ensure_initialized(config_path)?;
+    if name == DEFAULT_PROFILE {
+        return Err("不能删除 default 配置档".to_string());
+    }
     let active = read_active(config_path);
     if active.as_deref() == Some(name) {
         return Err("不能删除当前激活的配置档，请先切换到其它配置档".to_string());
@@ -317,6 +331,24 @@ pub fn switch(config_path: &Path, name: &str) -> Result<String, String> {
     }
     let text = fs::read_to_string(&path).map_err(|e| format!("读取配置档失败: {e}"))?;
     validated_text(&text)?;
+    Ok(text)
+}
+
+/// 切换配置档：先写 `profiles.toml`，再替换权威的 `config.toml`。
+///
+/// 顺序是刻意的：`write_active` 失败时文件完全没动；
+/// `config.toml` 写入失败时回滚 active。这样两者不会长期不一致。
+pub fn switch_to(config_path: &Path, name: &str) -> Result<String, String> {
+    let text = switch(config_path, name)?;
+    let previous = read_active(config_path);
+    write_active(config_path, name)?;
+    writer::backup(config_path)?;
+    if let Err(e) = writer::write_atomic(config_path, &text) {
+        if let Some(previous) = previous {
+            let _ = write_active(config_path, &previous);
+        }
+        return Err(e);
+    }
     Ok(text)
 }
 
@@ -376,6 +408,37 @@ mod tests {
         create(&config, "vr", None).unwrap();
         write_active(&config, "vr").unwrap();
         assert!(delete(&config, "vr").is_err());
+        let _ = fs::remove_dir_all(config.parent().unwrap());
+    }
+
+    #[test]
+    fn cannot_delete_default_profile() {
+        let config = setup("delete-default");
+        fs::write(&config, AppConfig::default().to_toml_string().unwrap()).unwrap();
+        ensure_initialized(&config).unwrap();
+        assert!(delete(&config, DEFAULT_PROFILE).is_err());
+        let _ = fs::remove_dir_all(config.parent().unwrap());
+    }
+
+    #[test]
+    fn switch_to_updates_active_and_config_together() {
+        let config = setup("switch-to");
+        fs::write(&config, AppConfig::default().to_toml_string().unwrap()).unwrap();
+        create(&config, "vr", None).unwrap();
+
+        let text = switch_to(&config, "vr").unwrap();
+        assert_eq!(read_active(&config).as_deref(), Some("vr"));
+        assert_eq!(fs::read_to_string(&config).unwrap(), text);
+        let _ = fs::remove_dir_all(config.parent().unwrap());
+    }
+
+    #[test]
+    fn new_profile_uses_shipped_default_with_comments() {
+        let config = setup("seed");
+        fs::write(&config, AppConfig::default().to_toml_string().unwrap()).unwrap();
+        create(&config, "fresh", None).unwrap();
+        let text = fs::read_to_string(profile_path(&config, "fresh")).unwrap();
+        assert!(text.contains('#'), "新建配置档应保留注释: {text}");
         let _ = fs::remove_dir_all(config.parent().unwrap());
     }
 

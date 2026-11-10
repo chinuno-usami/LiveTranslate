@@ -604,6 +604,12 @@ pub fn build(config: &AppConfig) -> SettingsSchema {
                     "世界旋转（度）",
                     "三个数：x, y, z。",
                 ),
+                float_adv(
+                    config,
+                    "output.steamvr.line_alphas[]",
+                    "逐行不透明度",
+                    "三个数（0–1）：最新一行到更早行的淡出系数。",
+                ),
             ],
         },
         SettingsGroup {

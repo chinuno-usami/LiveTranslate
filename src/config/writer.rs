@@ -1,13 +1,29 @@
 //! 配置写入层：使用 `toml_edit` 定点修改，保留注释与排版。
 //!
-//! 所有写文件操作都：备份 → 写临时文件 → 原子替换 → 重新解析校验；
-//! 校验失败时回滚，避免把用户配置写坏。
+//! 所有写文件操作都：校验 → 备份 → 写临时文件 → 原子替换；
+//! 校验失败时文件不会被改动，避免把用户配置写坏。
+//! 进程内写入用全局锁串行化，临时文件名包含 pid 与序号。
 
 use crate::config::{AppConfig, AudioSourceConfig};
 use serde_json::Value as JsonValue;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 use toml_edit::{Array, ArrayOfTables, DocumentMut, InlineTable, Item, Table, Value};
+
+/// 进程内写配置的串行化锁。
+///
+/// 配置写入是「读 → 改 → 备份 → 落盘」的复合操作，而 Tauri 命令在 tokio
+/// 多线程运行时上并发执行。没有这把锁时两个写入者会共用临时文件并互相覆盖。
+static WRITE_LOCK: Mutex<()> = Mutex::new(());
+
+/// 临时文件名去重计数（保证并发写入者不会撞名）
+static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+fn lock_writes() -> std::sync::MutexGuard<'static, ()> {
+    WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 /// 读取配置文本（文件不存在时返回空串）
 pub fn read_text(path: &Path) -> Result<String, String> {
@@ -18,15 +34,48 @@ pub fn read_text(path: &Path) -> Result<String, String> {
     }
 }
 
+fn tmp_path_for(path: &Path) -> PathBuf {
+    let seq = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let file_name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "config".to_string());
+    let tmp_name = format!(".{file_name}.{}-{seq}.tmp", std::process::id());
+    match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent.join(tmp_name),
+        _ => PathBuf::from(tmp_name),
+    }
+}
+
 /// 原子写入：先写同目录临时文件，再 rename 覆盖
+///
+/// 保留原文件权限位（配置文件里有 api_key，用户可能已 `chmod 600`）。
 pub fn write_atomic(path: &Path, content: &str) -> Result<(), String> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| format!("无效路径: {}", path.display()))?;
-    fs::create_dir_all(parent).map_err(|e| format!("创建目录失败: {e}"))?;
-    let tmp = path.with_extension("toml.tmp");
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent).map_err(|e| format!("创建目录失败: {e}"))?;
+        }
+    }
+    let tmp = tmp_path_for(path);
     fs::write(&tmp, content).map_err(|e| format!("写入临时文件失败: {e}"))?;
-    fs::rename(&tmp, path).map_err(|e| format!("替换配置文件失败: {e}"))?;
+    // 新建文件默认走 umask（通常 0644）；原文件存在时沿用其权限，
+    // 否则收紧到 0600（配置里有 api_key）
+    match fs::metadata(path) {
+        Ok(meta) => {
+            let _ = fs::set_permissions(&tmp, meta.permissions());
+        }
+        Err(_) => {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600));
+            }
+        }
+    }
+    if let Err(e) = fs::rename(&tmp, path) {
+        let _ = fs::remove_file(&tmp);
+        return Err(format!("替换配置文件失败: {e}"));
+    }
     Ok(())
 }
 
@@ -44,8 +93,10 @@ pub fn backup(path: &Path) -> Result<Option<PathBuf>, String> {
 
 /// 应用一批 `(dotted.path, json value)` 修改，并校验结果。
 ///
-/// 失败时回滚到修改前的内容。返回解析后的新配置。
+/// 先校验、后落盘：校验失败时文件一个字节也不会变。
+/// 写入成功后重新解析得到的配置会返回给调用方，避免调用方再自己拼一份。
 pub fn apply_changes(path: &Path, changes: &[(String, JsonValue)]) -> Result<AppConfig, String> {
+    let _guard = lock_writes();
     let original = read_text(path)?;
     let mut doc: DocumentMut = if original.trim().is_empty() {
         AppConfig::default()
@@ -84,36 +135,60 @@ pub fn apply_changes(path: &Path, changes: &[(String, JsonValue)]) -> Result<App
     }
 
     let updated = doc.to_string();
-    // 保留一份修改前的备份，便于手动回滚
+    // 先校验，再落盘：非法值不进入写入路径
+    let cfg = AppConfig::from_str(&updated).map_err(|e| format!("写入的配置无效，未写盘: {e}"))?;
+    cfg.validate()
+        .map_err(|e| format!("写入的配置无效，未写盘: {e}"))?;
+    // 回读一致性校验：捕获拼错/不存在的配置项（serde 会默默忽略未知键）
+    for (dotted, value) in changes {
+        verify_change_applied(&cfg, dotted, value)?;
+    }
+
     backup(path)?;
     write_atomic(path, &updated)?;
+    Ok(cfg)
+}
 
-    match AppConfig::from_str(&updated).and_then(|cfg| {
-        cfg.validate().map_err(crate::error::AppError::Config)?;
-        Ok(cfg)
-    }) {
-        Ok(cfg) => Ok(cfg),
-        Err(e) => {
-            // 回滚：保持旧文件不变，避免非法值落盘后下次无法启动
-            if original.is_empty() {
-                let _ = fs::remove_file(path);
-            } else {
-                let _ = write_atomic(path, &original);
-            }
-            Err(format!("写入的配置无效，已回滚: {e}"))
+/// 确认某个改动真的落到了结构体里（而不是被 serde 当作未知键丢掉）
+fn verify_change_applied(cfg: &AppConfig, dotted: &str, value: &JsonValue) -> Result<(), String> {
+    // 这两项在写入时会被重写成结构化形态，取值语义不同，跳过比对
+    if dotted == "audio.sources" || dotted == "translate.extra_body" {
+        return Ok(());
+    }
+    let actual = crate::config::schema::get_value(cfg, dotted)
+        .ok_or_else(|| format!("未知配置项: {dotted}"))?;
+    if json_equivalent(&actual, value) {
+        Ok(())
+    } else {
+        Err(format!(
+            "配置项 {dotted} 写入后值不一致（期望 {value}，实际 {actual}）"
+        ))
+    }
+}
+
+fn json_equivalent(a: &JsonValue, b: &JsonValue) -> bool {
+    match (a, b) {
+        (JsonValue::Number(x), JsonValue::Number(y)) => match (x.as_f64(), y.as_f64()) {
+            (Some(x), Some(y)) => (x - y).abs() < 1e-9,
+            _ => x == y,
+        },
+        (JsonValue::Array(x), JsonValue::Array(y)) => {
+            x.len() == y.len() && x.iter().zip(y.iter()).all(|(x, y)| json_equivalent(x, y))
         }
+        (JsonValue::Object(x), JsonValue::Object(y)) => {
+            x.len() == y.len()
+                && x.iter()
+                    .all(|(k, v)| y.get(k).map(|w| json_equivalent(v, w)).unwrap_or(false))
+        }
+        _ => a == b,
     }
 }
 
 /// 直接写入整份 TOML 文本（原始编辑器使用），校验失败不落盘
 pub fn save_raw(path: &Path, text: &str) -> Result<AppConfig, String> {
+    let _guard = lock_writes();
     let cfg = AppConfig::from_str(text).map_err(|e| format!("TOML 解析失败: {e}"))?;
-    cfg.validate().map_err(|e| {
-        crate::error::AppError::Config(e)
-            .to_string()
-            .trim_start_matches("配置错误: ")
-            .to_string()
-    })?;
+    cfg.validate()?;
     backup(path)?;
     write_atomic(path, text)?;
     Ok(cfg)
@@ -172,8 +247,21 @@ fn set_path(doc: &mut DocumentMut, dotted: &str, mut item: Item) -> Result<(), S
         let entry = table
             .get_mut(part)
             .ok_or_else(|| format!("无法创建配置段 {part}"))?;
-        if !entry.is_table() {
-            *entry = Item::Table(Table::new());
+        // 内联表（`section = { k = v }`）展开为标准表，保留已有键；
+        // 数组表无法定点下钻，直接报错而不是默默清空。
+        match entry {
+            Item::Table(_) => {}
+            Item::Value(Value::InlineTable(inline)) => {
+                let mut expanded = Table::new();
+                for (key, value) in inline.iter() {
+                    expanded.insert(key, Item::Value(value.clone()));
+                }
+                *entry = Item::Table(expanded);
+            }
+            Item::ArrayOfTables(_) => {
+                return Err(format!("配置段 {part} 是数组表，不支持定点修改"));
+            }
+            _ => *entry = Item::Table(Table::new()),
         }
         table = entry
             .as_table_mut()
@@ -355,9 +443,44 @@ mod tests {
         let before = fs::read_to_string(&path).unwrap();
         let err =
             apply_changes(&path, &[("output.osc.min_interval_ms".into(), json!(1))]).unwrap_err();
-        assert!(err.contains("回滚") || err.contains("校验"));
+        assert!(err.contains("未写盘"), "实际错误: {err}");
         let after = fs::read_to_string(&path).unwrap();
         assert_eq!(before, after);
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn unknown_path_is_rejected() {
+        // serde 会默默忽略未知键，写入层必须自己拦住拼错的配置项
+        let path = temp_path("unknown");
+        seed(&path);
+        let before = fs::read_to_string(&path).unwrap();
+        let err = apply_changes(&path, &[("subtitle.fontsize".into(), json!(40))]).unwrap_err();
+        assert!(err.contains("未知配置项"), "实际错误: {err}");
+        assert_eq!(fs::read_to_string(&path).unwrap(), before, "文件不应被改动");
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn inline_table_is_expanded_not_cleared() {
+        // 用户手写的内联表：下钻修改子键时不能把同段其它键静默清掉
+        let path = temp_path("inline");
+        seed(&path);
+        let text = fs::read_to_string(&path).unwrap();
+        let text = text.replacen(
+            "[translate]\n",
+            "[translate]\nextra_body = { thinking = { type = \"disabled\" }, keep = 1 }\n",
+            1,
+        );
+        fs::write(&path, &text).unwrap();
+
+        let cfg = apply_changes(&path, &[("translate.extra_body.keep".into(), json!(2))]).unwrap();
+        let extra = cfg.translate.extra_body.expect("extra_body 应保留");
+        assert_eq!(extra.get("keep").and_then(|v| v.as_integer()), Some(2));
+        assert!(
+            extra.get("thinking").is_some(),
+            "内联表的其它键不能被清掉: {extra:?}"
+        );
         let _ = fs::remove_dir_all(path.parent().unwrap());
     }
 
@@ -468,6 +591,30 @@ mod tests {
         write_atomic(&path, &AppConfig::default().to_toml_string().unwrap()).unwrap();
         let cfg = AppConfig::from_file(&path).unwrap();
         cfg.validate().unwrap();
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// `[audio]` 段里同时有 `[[audio.sources]]` 时，新增的标量键必须落在
+    /// 段头之后、数组表之前，否则会被当成最后一个输入源的字段。
+    #[test]
+    fn scalar_key_stays_out_of_array_of_tables() {
+        let path = temp_path("ordering");
+        let sources = vec![AudioSourceConfig::new("mic", "麦克风", "mic:0")];
+        apply_changes(
+            &path,
+            &[(
+                "audio.sources".into(),
+                serde_json::to_value(&sources).unwrap(),
+            )],
+        )
+        .unwrap();
+        let cfg =
+            apply_changes(&path, &[("audio.device_name".into(), json!("speaker:1"))]).unwrap();
+        assert_eq!(cfg.audio.device_name, "speaker:1");
+        let text = fs::read_to_string(&path).unwrap();
+        let key = text.find("device_name").expect("应写入 device_name");
+        let array = text.find("[[audio.sources]]").expect("应保留数组表");
+        assert!(key < array, "device_name 落在了数组表之后:\n{text}");
         let _ = fs::remove_dir_all(path.parent().unwrap());
     }
 }

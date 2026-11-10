@@ -286,7 +286,7 @@ pub struct SteamVrConfig {
     pub distance_m: f32,
     #[serde(default = "default_height_offset_m")]
     pub height_offset_m: f32,
-    #[serde(default)]
+    #[serde(default = "default_world_position")]
     pub world_position: [f32; 3],
     #[serde(default)]
     pub world_rotation_deg: [f32; 3],
@@ -359,7 +359,7 @@ impl Default for SteamVrConfig {
             width_m: default_width_m(),
             distance_m: default_distance_m(),
             height_offset_m: default_height_offset_m(),
-            world_position: [0.0, 1.3, -1.6],
+            world_position: default_world_position(),
             world_rotation_deg: [0.0, 0.0, 0.0],
             curvature: 0.0,
             opacity: default_opacity(),
@@ -502,6 +502,9 @@ fn default_vr_label_color() -> String {
 fn default_line_alphas() -> [f32; 3] {
     [1.0, 0.72, 0.48]
 }
+fn default_world_position() -> [f32; 3] {
+    [0.0, 1.3, -1.6]
+}
 fn default_reconnect_interval_secs() -> u64 {
     5
 }
@@ -572,8 +575,10 @@ impl AppConfig {
 
     /// 从指定文件读取配置
     pub fn from_file(path: &Path) -> AppResult<Self> {
-        let content = fs::read_to_string(path)?;
-        Ok(toml::from_str(&content)?)
+        let content = fs::read_to_string(path)
+            .map_err(|e| AppError::Config(format!("读取 {} 失败: {e}", path.display())))?;
+        toml::from_str(&content)
+            .map_err(|e| AppError::Config(format!("解析 {} 失败: {e}", path.display())))
     }
 
     /// 从 TOML 文本解析配置
@@ -604,8 +609,25 @@ impl AppConfig {
             Ok(_) => Self::SHIPPED_DEFAULT.to_string(),
             Err(_) => AppConfig::default().to_toml_string()?,
         };
-        fs::write(path, content)?;
+        // 文件里有 api_key，尽量不留其他用户可读的窗口
+        write_private(path, &content)?;
         Ok(true)
+    }
+
+    /// 用户配置损坏时的收尾：把坏文件改名保留，返回备份路径
+    ///
+    /// 不直接删除：用户手工编辑错一个引号是可恢复的，不能当成“配置不存在”。
+    fn quarantine(path: &Path) -> Option<PathBuf> {
+        let mut target = path.as_os_str().to_os_string();
+        target.push(format!(".bad-{}", std::process::id()));
+        let target = PathBuf::from(target);
+        match fs::rename(path, &target) {
+            Ok(()) => Some(target),
+            Err(e) => {
+                tracing::error!("无法隔离损坏的配置文件 {}: {e}", path.display());
+                None
+            }
+        }
     }
 
     /// 按优先级解析配置，返回 `(配置, 来源路径)`
@@ -642,9 +664,28 @@ impl AppConfig {
 
         if let Ok(user_path) = Self::user_config_path() {
             if user_path.exists() {
-                let cfg = Self::from_file(&user_path)?;
-                tracing::info!("Loaded config from: {}", user_path.display());
-                return Ok((cfg, Some(user_path)));
+                match Self::from_file(&user_path) {
+                    Ok(cfg) => {
+                        tracing::info!("Loaded config from: {}", user_path.display());
+                        return Ok((cfg, Some(user_path)));
+                    }
+                    Err(e) => {
+                        // 保留坏文件（用户可手动修复），并继续用配置路径运行，
+                        // 否则配置档功能会静默消失、下次保存会覆盖原文件。
+                        tracing::error!("配置 {} 无法加载: {e}", user_path.display());
+                        if let Some(bad) = Self::quarantine(&user_path) {
+                            tracing::error!(
+                                "已将损坏的配置改名为 {}，本次使用内置默认配置",
+                                bad.display()
+                            );
+                        }
+                        let cfg = match Self::write_default_if_absent(&user_path) {
+                            Ok(true) => Self::from_file(&user_path).unwrap_or_default(),
+                            _ => AppConfig::default(),
+                        };
+                        return Ok((cfg, Some(user_path)));
+                    }
+                }
             }
 
             match Self::write_default_if_absent(&user_path) {
@@ -691,6 +732,10 @@ impl AppConfig {
         c.translate.api_key = mask(&c.translate.api_key);
         c.asr.api_key = c.asr.api_key.as_deref().map(mask);
         c.asr.edge.trusted_client_token = c.asr.edge.trusted_client_token.as_deref().map(mask);
+        // extra_body 是任意请求体字段（网关场景常把 token 放这里），整体扱掉
+        if c.translate.extra_body.is_some() {
+            c.translate.extra_body = None;
+        }
         c
     }
 
@@ -743,6 +788,81 @@ impl AppConfig {
         if self.audio.sample_rate < 8000 || self.audio.sample_rate > 48000 {
             errors.push("audio.sample_rate 必须在 8000–48000 之间".to_string());
         }
+        if !(1..=2).contains(&self.audio.channels) {
+            errors.push("audio.channels 必须在 1–2 之间".to_string());
+        }
+        check_range(
+            &mut errors,
+            "audio.chunk_seconds",
+            self.audio.chunk_seconds,
+            0.5,
+            10.0,
+        );
+        check_range(
+            &mut errors,
+            "audio.silence_threshold",
+            self.audio.silence_threshold,
+            0.0,
+            1.0,
+        );
+
+        // 字幕（桌面浮窗）
+        if !(1..=10).contains(&self.subtitle.max_lines) {
+            errors.push("subtitle.max_lines 必须在 1–10 之间".to_string());
+        }
+        if !(12..=72).contains(&self.subtitle.font_size) {
+            errors.push("subtitle.font_size 必须在 12–72 之间".to_string());
+        }
+        if self.subtitle.window_width < 160 || self.subtitle.window_width > 7680 {
+            errors.push("subtitle.window_width 必须在 160–7680 之间".to_string());
+        }
+        if self.subtitle.window_height < 80 || self.subtitle.window_height > 4320 {
+            errors.push("subtitle.window_height 必须在 80–4320 之间".to_string());
+        }
+
+        // VAD
+        if !matches!(self.vad.backend.as_str(), "energy" | "silero") {
+            errors.push("vad.backend 只能是 energy 或 silero".to_string());
+        }
+        if !(10..=100).contains(&self.vad.frame_ms) {
+            errors.push("vad.frame_ms 必须在 10–100 之间".to_string());
+        }
+        check_range(&mut errors, "vad.margin_db", self.vad.margin_db, 0.0, 40.0);
+        check_range(
+            &mut errors,
+            "vad.noise_percentile",
+            self.vad.noise_percentile,
+            0.0,
+            1.0,
+        );
+        check_range(
+            &mut errors,
+            "vad.silero_threshold",
+            self.vad.silero_threshold,
+            0.0,
+            1.0,
+        );
+        if self.vad.min_speech_ms > self.vad.max_speech_ms {
+            errors.push("vad.min_speech_ms 不能大于 vad.max_speech_ms".to_string());
+        }
+        if self.vad.max_speech_ms < 500 || self.vad.max_speech_ms > 30_000 {
+            errors.push("vad.max_speech_ms 必须在 500–30000 之间".to_string());
+        }
+        if self.vad.min_silence_ms < 50 || self.vad.min_silence_ms > 5_000 {
+            errors.push("vad.min_silence_ms 必须在 50–5000 之间".to_string());
+        }
+
+        // 翻译
+        if self.translate.timeout_secs < 3 || self.translate.timeout_secs > 300 {
+            errors.push("translate.timeout_secs 必须在 3–300 之间".to_string());
+        }
+        check_range(
+            &mut errors,
+            "translate.temperature",
+            self.translate.temperature,
+            0.0,
+            2.0,
+        );
 
         let vr = &self.output.steamvr;
         if !matches!(vr.anchor.as_str(), "hmd" | "world") {
@@ -776,6 +896,22 @@ impl AppConfig {
         }
         if !(12..=96).contains(&vr.font_size_px) {
             errors.push("output.steamvr.font_size_px 必须在 12–96 之间".to_string());
+        }
+        for (index, value) in vr.line_alphas.iter().enumerate() {
+            check_range(
+                &mut errors,
+                &format!("output.steamvr.line_alphas[{index}]"),
+                *value,
+                0.0,
+                1.0,
+            );
+        }
+        for (index, value) in vr.world_position.iter().enumerate() {
+            if !value.is_finite() {
+                errors.push(format!(
+                    "output.steamvr.world_position[{index}] 必须是有限值"
+                ));
+            }
         }
         for (key, color) in [
             ("background", &vr.background),
@@ -822,29 +958,6 @@ impl AppConfig {
         } else {
             Err(errors.join("\n"))
         }
-    }
-
-    /// 就地修改配置文件里的单个键值（**保留注释与原有排版**）
-    #[allow(dead_code)]
-    pub fn update_value_in_file(
-        path: &Path,
-        section: &str,
-        key: &str,
-        value: &str,
-    ) -> AppResult<()> {
-        static WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _guard = WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-
-        let original = match fs::read_to_string(path) {
-            Ok(s) => s,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
-            Err(e) => return Err(e.into()),
-        };
-        let updated = patch_toml(&original, section, key, value);
-        if updated != original {
-            writer::write_atomic(path, &updated).map_err(AppError::Config)?;
-        }
-        Ok(())
     }
 }
 
@@ -909,6 +1022,22 @@ impl Default for AppConfig {
     }
 }
 
+/// 创建/覆盖文件，并尽量收紧权限（配置里有 api_key）
+fn write_private(path: &Path, content: &str) -> AppResult<()> {
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    use std::io::Write;
+    file.write_all(content.as_bytes())?;
+    file.flush()?;
+    Ok(())
+}
+
 fn check_range(errors: &mut Vec<String>, name: &str, value: f32, min: f32, max: f32) {
     if !value.is_finite() || value < min || value > max {
         errors.push(format!("{name} 必须在 {min}–{max} 之间"));
@@ -934,69 +1063,6 @@ pub fn parse_target(value: &str) -> Option<(String, u16)> {
         return None;
     }
     Some((host.to_string(), port))
-}
-
-/// 在 TOML 文本中就地修改 `[section]` 下的 `key = value`
-///
-/// 保留其余内容（包括注释与空行）。结构化写入请优先使用 [`writer::apply_changes`]。
-#[allow(dead_code)]
-fn patch_toml(content: &str, section: &str, key: &str, value: &str) -> String {
-    let section_header = format!("[{section}]");
-    let mut lines: Vec<String> = content.lines().map(|s| s.to_string()).collect();
-
-    let mut section_start: Option<usize> = None;
-    let mut section_end = lines.len();
-
-    for (i, line) in lines.iter().enumerate() {
-        let trimmed = line.trim();
-        if trimmed.starts_with('[') && trimmed.ends_with(']') {
-            if trimmed == section_header {
-                section_start = Some(i);
-            } else if section_start.is_some() {
-                section_end = i;
-                break;
-            }
-        }
-    }
-
-    let trailing_newline = content.ends_with('\n');
-    let join = |lines: Vec<String>| {
-        let mut s = lines.join("\n");
-        if trailing_newline {
-            s.push('\n');
-        }
-        s
-    };
-
-    if let Some(start) = section_start {
-        for (i, line) in lines.iter().enumerate().take(section_end).skip(start + 1) {
-            let indent_len = line.len() - line.trim_start().len();
-            let trimmed = line.trim_start();
-            let matches_key = trimmed
-                .strip_prefix(key)
-                .map(|rest| rest.trim_start().starts_with('='))
-                .unwrap_or(false);
-
-            if matches_key {
-                let indent = &line[..indent_len];
-                lines[i] = format!("{indent}{key} = {value}");
-                return join(lines);
-            }
-        }
-
-        lines.insert(section_end, format!("{key} = {value}"));
-        return join(lines);
-    }
-
-    let mut out = content.to_string();
-    if !out.is_empty() && !out.ends_with('\n') {
-        out.push('\n');
-    }
-    if !out.is_empty() {
-        out.push('\n');
-    }
-    out.push_str(&format!("[{section}]\n{key} = {value}\n"));
-    out
 }
 
 #[cfg(test)]
@@ -1028,45 +1094,6 @@ mod tests {
     fn user_config_path_is_toml_file() {
         let path = AppConfig::user_config_path().unwrap();
         assert_eq!(path.file_name().unwrap(), "config.toml");
-    }
-
-    #[test]
-    fn patch_toml_replaces_existing_key_and_keeps_comments() {
-        let src = "# 顶部注释\n\n[subtitle]\n# 字号注释\nfont_size = 28\nmax_lines = 3\n";
-        let out = patch_toml(src, "subtitle", "font_size", "40");
-        assert!(out.contains("# 顶部注释"), "注释应保留");
-        assert!(out.contains("# 字号注释"), "行内注释应保留");
-        assert!(out.contains("font_size = 40"), "值应被替换");
-        assert!(out.contains("max_lines = 3"), "其他键不应变动");
-        assert!(!out.contains("font_size = 28"));
-    }
-
-    #[test]
-    fn patch_toml_inserts_missing_key_inside_section() {
-        let src = "[subtitle]\nfont_size = 28\n\n[other]\nkey = 1\n";
-        let out = patch_toml(src, "subtitle", "show_source", "true");
-        let subtitle_part = out.split("[other]").next().unwrap();
-        assert!(
-            subtitle_part.contains("show_source = true"),
-            "应插入到 subtitle 段内"
-        );
-        assert!(out.contains("[other]\nkey = 1"), "其他段不应受影响");
-    }
-
-    #[test]
-    fn patch_toml_appends_missing_section() {
-        let out = patch_toml("[audio]\nchunk_seconds = 2.0\n", "vad", "enabled", "true");
-        assert!(out.contains("[vad]"));
-        assert!(out.contains("enabled = true"));
-        assert!(out.contains("[audio]"));
-    }
-
-    #[test]
-    fn patch_toml_does_not_confuse_prefix_keys() {
-        let src = "[subtitle]\nfont_size_extra = 1\n";
-        let out = patch_toml(src, "subtitle", "font_size", "40");
-        assert!(out.contains("font_size_extra = 1"), "不应误改前缀相同的键");
-        assert!(out.contains("font_size = 40"));
     }
 
     #[test]
