@@ -8,6 +8,7 @@ pub fn create_system_tray() -> SystemTray {
     let start = CustomMenuItem::new("start".to_string(), "开始");
     let stop = CustomMenuItem::new("stop".to_string(), "停止");
     let through = CustomMenuItem::new("through".to_string(), "切换点击穿透");
+    let settings = CustomMenuItem::new("settings".to_string(), "设置…");
     let config_dir = CustomMenuItem::new("config_dir".to_string(), "打开配置目录");
     let quit = CustomMenuItem::new("quit".to_string(), "退出");
 
@@ -17,6 +18,7 @@ pub fn create_system_tray() -> SystemTray {
         .add_item(stop)
         .add_native_item(SystemTrayMenuItem::Separator)
         .add_item(through)
+        .add_item(settings)
         .add_item(config_dir)
         .add_native_item(SystemTrayMenuItem::Separator)
         .add_item(quit);
@@ -43,6 +45,9 @@ pub fn handle_system_tray_event(app: &AppHandle, event: SystemTrayEvent) {
             "through" => {
                 // 关闭点击穿透的唯一可靠入口：穿透开启后窗口不再接收鼠标事件
                 crate::toggle_click_through(app);
+            }
+            "settings" => {
+                crate::open_settings_window(app);
             }
             "config_dir" => {
                 if let Err(e) = crate::open_config_dir() {
@@ -104,6 +109,11 @@ pub fn register_global_shortcuts(app: &AppHandle) -> tauri::Result<()> {
     let app_handle = app.clone();
     manager.register("CmdOrCtrl+Alt+T", move || {
         crate::toggle_click_through(&app_handle);
+    })?;
+
+    let app_handle = app.clone();
+    manager.register("CmdOrCtrl+Alt+Comma", move || {
+        crate::open_settings_window(&app_handle);
     })?;
 
     let app_handle = app.clone();

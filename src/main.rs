@@ -5,23 +5,27 @@ mod asr;
 mod audio;
 mod config;
 mod error;
+mod output;
 mod subtitle;
 mod translate;
 mod tray;
 mod ui;
 
 use clap::Parser;
-use config::AppConfig;
+use config::{profiles, schema, writer, AppConfig, AudioSourceConfig};
+use output::OutputManager;
+use serde::Deserialize;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use subtitle::SubtitleState;
 use tauri::{AppHandle, LogicalPosition, LogicalSize, Manager, State, Window};
 use tokio::sync::{mpsc, watch, Mutex};
 use tracing_subscriber::EnvFilter;
 use ui::{
-    OverlayConfigPayload, StatusPayload, SubtitlePayload, CLICK_THROUGH_EVENT, CONFIG_EVENT,
-    ERROR_EVENT, NOTICE_EVENT, STATUS_EVENT, SUBTITLE_EVENT,
+    ActiveSourcePayload, CapabilitiesPayload, OverlayConfigPayload, SaveResult, SourceStatusItem,
+    SourcesPayload, StatusPayload, SubtitlePayload, CLICK_THROUGH_EVENT, CONFIG_EVENT, ERROR_EVENT,
+    NOTICE_EVENT, OUTPUT_STATUS_EVENT, SOURCE_STATUS_EVENT, STATUS_EVENT, SUBTITLE_EVENT,
 };
 
 #[derive(Parser, Debug)]
@@ -32,28 +36,23 @@ struct Args {
     #[arg(short, long)]
     config: Option<PathBuf>,
 
-    /// List available audio devices
     #[arg(short, long)]
     list_devices: bool,
 
-    /// List models offered by the configured translation / ASR services
     #[arg(long)]
     list_models: bool,
 
-    /// Run in console mode instead of overlay window
     #[arg(long)]
     console: bool,
 
-    /// Log level (trace, debug, info, warn, error)
-    #[arg(short, long, default_value = "info")]
+    #[arg(long, default_value = "info")]
     log_level: String,
 }
 
 struct PipelineControl {
-    /// 流水线世代号，用于避免旧任务的清理逻辑覆盖新流水线
     generation: u64,
     stop_tx: Option<watch::Sender<bool>>,
-    runner: Option<tauri::async_runtime::JoinHandle<()>>,
+    supervisor: Option<tauri::async_runtime::JoinHandle<()>>,
     forwarder: Option<tauri::async_runtime::JoinHandle<()>>,
 }
 
@@ -62,7 +61,7 @@ impl PipelineControl {
         Self {
             generation: 0,
             stop_tx: None,
-            runner: None,
+            supervisor: None,
             forwarder: None,
         }
     }
@@ -72,182 +71,821 @@ impl PipelineControl {
     }
 }
 
-pub(crate) struct SharedState {
-    config: AppConfig,
-    /// 配置文件路径（用于把 UI 上的修改写回）
-    config_path: Option<PathBuf>,
-    current_device: Mutex<String>,
-    subtitle_state: Mutex<SubtitleState>,
-    pipeline: Mutex<PipelineControl>,
-    /// 串行化启动/停止/切换设备，避免并发启动产生无法停止的孤儿流水线
-    lifecycle: Mutex<()>,
-    /// 当前窗口是否处于点击穿透（托盘/快捷键需要读写它）
-    pub(crate) click_through: AtomicBool,
-    /// 当前字号（面板滑块可调）
-    font_size: AtomicU32,
-    /// 是否显示原文
-    show_source: AtomicBool,
-    /// 识别语言（面板改动可实时生效，无需重启流水线）
-    language_tx: watch::Sender<String>,
-    /// 是否翻译（false 为仅识别模式，面板改动实时生效）
+/// 每个输入源的运行时句柄
+struct SourceRuntime {
+    id: String,
+    label: String,
+    device: String,
+    enabled: bool,
+    running: bool,
+    message: String,
+    /// 该源的识别语言覆盖；空 = 跟随全局
+    language_override: String,
     translate_tx: watch::Sender<bool>,
+    /// 保活接收端：没有接收者时 `watch::Sender::send` 会失败
+    translate_rx: watch::Receiver<bool>,
+    language_tx: watch::Sender<String>,
+    _language_rx: watch::Receiver<String>,
 }
 
-impl SharedState {
-    fn new(config: AppConfig, config_path: Option<PathBuf>) -> Self {
-        let subtitle_state =
-            SubtitleState::new(config.subtitle.max_lines, config.subtitle.show_source);
-
-        let device = config.audio.device_name.clone();
-        let click_through = config.subtitle.click_through;
-        let font_size = config.subtitle.font_size;
-        let show_source = config.subtitle.show_source;
-
-        // 两个后端的语言字段不同，先取出再按后端归一化
-        let configured_language = if asr::languages::is_edge_backend(&config.asr.backend) {
-            config.asr.edge.language.clone()
-        } else {
-            config.asr.language.clone()
-        };
-        let language =
-            asr::languages::normalize_for_backend(&config.asr.backend, &configured_language);
-        let (language_tx, _) = watch::channel(language);
-        let (translate_tx, _) = watch::channel(config.translate.enabled);
-
+impl SourceRuntime {
+    fn new(source: &AudioSourceConfig, translate_enabled: bool, language: String) -> Self {
+        let (translate_tx, translate_rx) = watch::channel(source.translate && translate_enabled);
+        let (language_tx, language_rx) = watch::channel(language);
         Self {
-            config,
-            config_path,
-            current_device: Mutex::new(device),
-            subtitle_state: Mutex::new(subtitle_state),
-            pipeline: Mutex::new(PipelineControl::new()),
-            lifecycle: Mutex::new(()),
-            click_through: AtomicBool::new(click_through),
-            font_size: AtomicU32::new(font_size),
-            show_source: AtomicBool::new(show_source),
-            language_tx,
+            id: source.id.clone(),
+            label: source.label.clone(),
+            device: source.device.clone(),
+            enabled: source.enabled,
+            running: false,
+            message: if source.enabled {
+                "未启动".to_string()
+            } else {
+                "已停用".to_string()
+            },
+            language_override: source.language.clone(),
             translate_tx,
+            translate_rx,
+            language_tx,
+            _language_rx: language_rx,
+        }
+    }
+
+    fn translate_enabled(&self) -> bool {
+        *self.translate_rx.borrow()
+    }
+
+    fn context(&self) -> app::SourceContext {
+        app::SourceContext {
+            id: self.id.clone(),
+            label: self.label.clone(),
+            device: self.device.clone(),
+            language: self.language_tx.subscribe(),
+            translate: self.translate_tx.subscribe(),
         }
     }
 }
 
+struct SourceRegistry {
+    runtimes: Vec<SourceRuntime>,
+}
+
+impl SourceRegistry {
+    fn from_config(config: &AppConfig) -> Self {
+        let global_language = global_language(config);
+        let runtimes = config
+            .audio
+            .effective_sources(config.translate.enabled)
+            .iter()
+            .map(|source| {
+                let language = if source.language.trim().is_empty() {
+                    global_language.clone()
+                } else {
+                    asr::languages::normalize_for_backend(&config.asr.backend, &source.language)
+                };
+                SourceRuntime::new(source, config.translate.enabled, language)
+            })
+            .collect();
+        Self { runtimes }
+    }
+
+    /// 配置热更新：同步源列表、翻译开关、语言，不重启流水线
+    fn sync_config(&mut self, config: &AppConfig) {
+        let global_language = global_language(config);
+        let effective = config.audio.effective_sources(config.translate.enabled);
+        let ids: Vec<String> = effective.iter().map(|s| s.id.clone()).collect();
+
+        for source in &effective {
+            let language = if source.language.trim().is_empty() {
+                global_language.clone()
+            } else {
+                asr::languages::normalize_for_backend(&config.asr.backend, &source.language)
+            };
+            if let Some(runtime) = self.runtimes.iter_mut().find(|r| r.id == source.id) {
+                runtime.label = source.label.clone();
+                runtime.device = source.device.clone();
+                runtime.enabled = source.enabled;
+                if !runtime.running {
+                    runtime.message = if source.enabled {
+                        "未启动".to_string()
+                    } else {
+                        "已停用".to_string()
+                    };
+                }
+                runtime.language_override = source.language.clone();
+                let _ = runtime
+                    .translate_tx
+                    .send(source.translate && config.translate.enabled);
+                let _ = runtime.language_tx.send(language);
+            } else {
+                self.runtimes.push(SourceRuntime::new(
+                    source,
+                    config.translate.enabled,
+                    language,
+                ));
+            }
+        }
+
+        self.runtimes.retain(|r| ids.contains(&r.id));
+        // 保持配置顺序
+        self.runtimes
+            .sort_by_key(|r| ids.iter().position(|id| id == &r.id).unwrap_or(usize::MAX));
+    }
+
+    fn set_translate(&mut self, id: &str, enabled: bool) -> bool {
+        if let Some(runtime) = self.runtimes.iter_mut().find(|r| r.id == id) {
+            let _ = runtime.translate_tx.send(enabled);
+            return true;
+        }
+        false
+    }
+
+    fn set_translate_all(&mut self, enabled: bool) {
+        for runtime in &mut self.runtimes {
+            let _ = runtime.translate_tx.send(enabled);
+        }
+    }
+
+    fn set_language(&mut self, config: &AppConfig, language: &str) {
+        let global = asr::languages::normalize_for_backend(&config.asr.backend, language);
+        for runtime in &mut self.runtimes {
+            let value = if runtime.language_override.trim().is_empty() {
+                global.clone()
+            } else {
+                asr::languages::normalize_for_backend(
+                    &config.asr.backend,
+                    &runtime.language_override,
+                )
+            };
+            let _ = runtime.language_tx.send(value);
+        }
+    }
+
+    fn set_running(&mut self, id: &str, running: bool, message: impl Into<String>) {
+        if let Some(runtime) = self.runtimes.iter_mut().find(|r| r.id == id) {
+            runtime.running = running;
+            runtime.message = message.into();
+        }
+    }
+
+    fn mark_all_stopped(&mut self) {
+        for runtime in &mut self.runtimes {
+            runtime.running = false;
+            if runtime.enabled {
+                runtime.message = "已停止".to_string();
+            }
+        }
+    }
+
+    fn active_labels(&self) -> Vec<String> {
+        self.runtimes
+            .iter()
+            .filter(|r| r.running)
+            .map(|r| r.label.clone())
+            .collect()
+    }
+
+    fn active_sources_payload(&self) -> Vec<ActiveSourcePayload> {
+        self.runtimes
+            .iter()
+            .filter(|r| r.running)
+            .map(|r| ActiveSourcePayload {
+                id: r.id.clone(),
+                label: r.label.clone(),
+                translate: r.translate_enabled(),
+            })
+            .collect()
+    }
+
+    fn running_count(&self) -> usize {
+        self.runtimes.iter().filter(|r| r.running).count()
+    }
+
+    fn status_items(&self) -> Vec<SourceStatusItem> {
+        self.runtimes
+            .iter()
+            .map(|r| SourceStatusItem {
+                id: r.id.clone(),
+                label: r.label.clone(),
+                running: r.running,
+                enabled: r.enabled,
+                translate: r.translate_enabled(),
+                device: r.device.clone(),
+                message: r.message.clone(),
+            })
+            .collect()
+    }
+}
+
+pub(crate) struct SharedState {
+    /// 由只读改为 RwLock：设置页保存后立即生效
+    config: RwLock<AppConfig>,
+    config_path: RwLock<Option<PathBuf>>,
+    subtitle_state: Mutex<SubtitleState>,
+    pipeline: Mutex<PipelineControl>,
+    /// 串行化启动/停止/切换配置档
+    lifecycle: Mutex<()>,
+    sources: Mutex<SourceRegistry>,
+    pub(crate) outputs: Arc<OutputManager>,
+    pub(crate) click_through: AtomicBool,
+    font_size: AtomicU32,
+    show_source: AtomicBool,
+    /// 全局语言
+    language_tx: watch::Sender<String>,
+    _language_rx: watch::Receiver<String>,
+    /// 全局翻译开关
+    translate_tx: watch::Sender<bool>,
+    _translate_rx: watch::Receiver<bool>,
+}
+
+/// 字幕历史保留上限：桌面浮窗与 SteamVR 的 max_lines 独立，取较大者
+fn history_limit(config: &AppConfig) -> usize {
+    config
+        .subtitle
+        .max_lines
+        .max(config.output.steamvr.max_lines)
+        .max(config.output.osc.max_lines)
+        .max(1)
+}
+
+fn desktop_entries(
+    mut entries: Vec<subtitle::DisplayLine>,
+    config: &AppConfig,
+) -> Vec<subtitle::DisplayLine> {
+    let limit = config.subtitle.max_lines.max(1);
+    if entries.len() > limit {
+        entries.drain(..entries.len() - limit);
+    }
+    entries
+}
+
+fn global_language(config: &AppConfig) -> String {
+    let configured = if asr::languages::is_edge_backend(&config.asr.backend) {
+        config.asr.edge.language.clone()
+    } else {
+        config.asr.language.clone()
+    };
+    asr::languages::normalize_for_backend(&config.asr.backend, &configured)
+}
+
+impl SharedState {
+    fn new(config: AppConfig, config_path: Option<PathBuf>) -> Self {
+        let subtitle_state = SubtitleState::new(
+            history_limit(&config),
+            config.subtitle.show_source,
+            config.subtitle.label_sources,
+        );
+        let click_through = config.subtitle.click_through;
+        let font_size = config.subtitle.font_size;
+        let show_source = config.subtitle.show_source;
+        let language = global_language(&config);
+        let (language_tx, language_rx) = watch::channel(language);
+        let (translate_tx, translate_rx) = watch::channel(config.translate.enabled);
+        let outputs = OutputManager::new(&config.output);
+        let sources = SourceRegistry::from_config(&config);
+
+        Self {
+            config: RwLock::new(config),
+            config_path: RwLock::new(config_path),
+            subtitle_state: Mutex::new(subtitle_state),
+            pipeline: Mutex::new(PipelineControl::new()),
+            lifecycle: Mutex::new(()),
+            sources: Mutex::new(sources),
+            outputs,
+            click_through: AtomicBool::new(click_through),
+            font_size: AtomicU32::new(font_size),
+            show_source: AtomicBool::new(show_source),
+            language_tx,
+            _language_rx: language_rx,
+            translate_tx,
+            _translate_rx: translate_rx,
+        }
+    }
+
+    fn config(&self) -> AppConfig {
+        self.config
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    fn set_config(&self, config: AppConfig) {
+        *self.config.write().unwrap_or_else(|e| e.into_inner()) = config;
+    }
+
+    fn config_path(&self) -> Option<PathBuf> {
+        self.config_path
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    fn set_config_path(&self, path: Option<PathBuf>) {
+        *self.config_path.write().unwrap_or_else(|e| e.into_inner()) = path;
+    }
+}
+
 /// 切换窗口点击穿透，并同步到前端与托盘
-///
-/// 点击穿透开启后窗口不再接收鼠标事件，因此托盘菜单与全局快捷键
-/// 是关闭穿透的唯一入口。
 pub(crate) fn toggle_click_through(app: &AppHandle) {
     let state = app.state::<Arc<SharedState>>();
     let new_value = !state.click_through.load(Ordering::SeqCst);
     apply_click_through(app, new_value);
 }
 
-/// 设置窗口点击穿透为指定值
 pub(crate) fn apply_click_through(app: &AppHandle, enabled: bool) {
     let state = app.state::<Arc<SharedState>>();
     state.click_through.store(enabled, Ordering::SeqCst);
-
     if let Some(window) = app.get_window("main") {
         if let Err(e) = window.set_ignore_cursor_events(enabled) {
             tracing::warn!("Failed to set ignore cursor events: {}", e);
         }
     }
-
     let _ = app.emit_all(CLICK_THROUGH_EVENT, enabled);
     tracing::info!("Click-through set to: {}", enabled);
 }
 
-/// 把 UI 上的修改写回配置文件（保留注释）
-fn persist_setting(config_path: Option<&PathBuf>, section: &str, key: &str, value: &str) {
-    let Some(path) = config_path else {
-        tracing::debug!("No config file to persist {section}.{key}");
+pub(crate) fn open_settings_window(app: &AppHandle) {
+    match app.get_window("settings") {
+        Some(window) => {
+            let _ = window.show();
+            let _ = window.unminimize();
+            let _ = window.set_focus();
+        }
+        None => tracing::warn!("Settings window not found in tauri.conf.json"),
+    }
+}
+
+/// 确保有可写的配置文件（内置默认配置时首次保存到用户目录）
+fn ensure_config_path(state: &SharedState) -> Result<PathBuf, String> {
+    if let Some(path) = state.config_path() {
+        return Ok(path);
+    }
+    let path = AppConfig::user_config_path().map_err(|e| e.to_string())?;
+    AppConfig::write_default_if_absent(&path).map_err(|e| e.to_string())?;
+    state.set_config_path(Some(path.clone()));
+    Ok(path)
+}
+
+/// 把单个配置项写回文件（尽量保留注释）
+fn persist_json(state: &SharedState, path: &str, value: serde_json::Value) {
+    let config_path = match ensure_config_path(state) {
+        Ok(path) => path,
+        Err(e) => {
+            tracing::warn!("No config file to persist {path}: {e}");
+            return;
+        }
+    };
+    if let Err(e) = writer::apply_changes(&config_path, &[(path.to_string(), value)]) {
+        tracing::warn!("Failed to persist {path}: {e}");
+    } else {
+        mirror_profile(state);
+    }
+}
+
+fn persist_value(state: &SharedState, section: &str, key: &str, value: serde_json::Value) {
+    persist_json(state, &format!("{section}.{key}"), value);
+}
+
+fn persist_sources(state: &SharedState, config: &AppConfig) {
+    let config_path = match ensure_config_path(state) {
+        Ok(path) => path,
+        Err(e) => {
+            tracing::warn!("No config file to persist audio.sources: {e}");
+            return;
+        }
+    };
+    let sources = serde_json::to_value(&config.audio.sources).unwrap_or_default();
+    if let Err(e) = writer::apply_changes(&config_path, &[("audio.sources".to_string(), sources)]) {
+        tracing::warn!("Failed to persist audio.sources: {e}");
+    }
+}
+
+fn mirror_profile(state: &SharedState) {
+    let Some(config_path) = state.config_path() else {
         return;
     };
-    match AppConfig::update_value_in_file(path, section, key, value) {
-        Ok(()) => tracing::info!("Persisted [{section}] {key} = {value}"),
-        Err(e) => tracing::warn!("Failed to persist [{section}] {key}: {e}"),
+    let (enabled, _) = profiles::profiles_enabled(Some(&config_path));
+    if !enabled {
+        return;
+    }
+    let active = profiles::read_active(&config_path).unwrap_or_else(|| "default".to_string());
+    let text = match std::fs::read_to_string(&config_path) {
+        Ok(text) => text,
+        Err(_) => return,
+    };
+    if let Err(e) = profiles::mirror(&config_path, &active, &text) {
+        tracing::warn!("Failed to mirror profile {active}: {e}");
     }
 }
 
-/// 调整字幕字号（面板滑块）
-#[tauri::command]
-async fn set_font_size(state: State<'_, Arc<SharedState>>, size: u32) -> Result<(), String> {
-    // 与前端滑块范围（tauri-ui/app.js MIN_FONT/MAX_FONT）保持一致
-    let size = size.clamp(12, 72);
-    state.font_size.store(size, Ordering::SeqCst);
-    persist_setting(
-        state.config_path.as_ref(),
-        "subtitle",
-        "font_size",
-        &size.to_string(),
+fn emit_config(app: &AppHandle, config: &AppConfig) {
+    let _ = app.emit_all(
+        CONFIG_EVENT,
+        OverlayConfigPayload::new(&config.subtitle, config.translate.enabled),
     );
-    Ok(())
 }
 
-/// 切换是否显示原文，并立即重绘当前字幕
-#[tauri::command]
-async fn set_show_source(
-    app: AppHandle,
-    state: State<'_, Arc<SharedState>>,
-    enabled: bool,
-) -> Result<(), String> {
-    state.show_source.store(enabled, Ordering::SeqCst);
+fn emit_output_status(app: &AppHandle, state: &SharedState) {
+    let _ = app.emit_all(OUTPUT_STATUS_EVENT, state.outputs.status());
+}
 
+async fn emit_source_status(app: &AppHandle, state: &SharedState) {
+    let registry = state.sources.lock().await;
+    let _ = app.emit_all(
+        SOURCE_STATUS_EVENT,
+        SourcesPayload {
+            sources: registry.status_items(),
+            max_active_sources: state.config().audio.max_active_sources,
+        },
+    );
+}
+
+fn emit_status(app: &AppHandle, running: bool, message: impl Into<String>) {
+    let _ = app.emit_all(
+        STATUS_EVENT,
+        StatusPayload {
+            running,
+            message: message.into(),
+        },
+    );
+}
+
+fn emit_subtitle_reset(app: &AppHandle) {
+    let _ = app.emit_all(SUBTITLE_EVENT, SubtitlePayload::empty());
+}
+
+async fn emit_subtitle(app: &AppHandle, state: &SharedState) {
+    let registry = state.sources.lock().await;
+    let active = registry.active_sources_payload();
+    drop(registry);
+    let subtitle_state = state.subtitle_state.lock().await;
+    let entries = subtitle_state.display_lines();
+    let _ = app.emit_all(SUBTITLE_EVENT, SubtitlePayload::new(&entries, active));
+}
+
+/// 应用热更新字段（样式 / 输出 / 翻译开关 / 语言 / 窗口属性）
+async fn apply_hot_config(app: &AppHandle, state: &SharedState, old: &AppConfig, new: &AppConfig) {
+    // 字幕状态
     {
         let mut subtitle_state = state.subtitle_state.lock().await;
-        subtitle_state.set_show_source(enabled);
+        subtitle_state.set_max_lines(history_limit(new));
+        subtitle_state.set_show_source(new.subtitle.show_source);
+        subtitle_state.set_label_mode(new.subtitle.label_sources);
+    }
+    state
+        .font_size
+        .store(new.subtitle.font_size, Ordering::SeqCst);
+    state
+        .show_source
+        .store(new.subtitle.show_source, Ordering::SeqCst);
 
-        let payload = SubtitlePayload {
-            source: String::new(),
-            translated: String::new(),
-            lines: subtitle_state.get_all(),
-            text: subtitle_state.get_text(),
-        };
-        let _ = app.emit_all(SUBTITLE_EVENT, payload);
+    // 输出
+    state.outputs.apply_config(&new.output);
+
+    // 翻译开关 / 语言
+    let _ = state.translate_tx.send(new.translate.enabled);
+    {
+        let mut registry = state.sources.lock().await;
+        registry.sync_config(new);
+        if !new.translate.enabled {
+            registry.set_translate_all(false);
+        }
+    }
+    if old.asr.language != new.asr.language || old.asr.edge.language != new.asr.edge.language {
+        let language = global_language(new);
+        let _ = state.language_tx.send(language.clone());
+        let mut registry = state.sources.lock().await;
+        registry.set_language(new, &language);
     }
 
-    persist_setting(
-        state.config_path.as_ref(),
-        "subtitle",
-        "show_source",
-        &enabled.to_string(),
-    );
-    Ok(())
-}
-
-/// 切换翻译 / 仅识别模式（立即生效，并写回配置文件）
-#[tauri::command]
-async fn set_translate_enabled(
-    state: State<'_, Arc<SharedState>>,
-    enabled: bool,
-) -> Result<(), String> {
-    // watch::Sender::send 仅在“无接收者”时失败，不影响设置本身
-    let _ = state.translate_tx.send(enabled);
-    persist_setting(
-        state.config_path.as_ref(),
-        "translate",
-        "enabled",
-        &enabled.to_string(),
-    );
-    tracing::info!(
-        "Mode set to: {}",
-        if enabled {
-            "ASR + translate"
-        } else {
-            "ASR only"
+    // 窗口属性
+    if let Some(window) = app.get_window("main") {
+        if old.subtitle.always_on_top != new.subtitle.always_on_top {
+            let _ = window.set_always_on_top(new.subtitle.always_on_top);
         }
-    );
+        if old.subtitle.click_through != new.subtitle.click_through {
+            apply_click_through(app, new.subtitle.click_through);
+        }
+        if old.subtitle.window_width != new.subtitle.window_width
+            || old.subtitle.window_height != new.subtitle.window_height
+            || old.subtitle.position_x != new.subtitle.position_x
+            || old.subtitle.position_y != new.subtitle.position_y
+        {
+            if let Err(e) = apply_window_config(&window, new) {
+                tracing::warn!("Failed to apply window config: {e}");
+            }
+        }
+    }
+
+    emit_config(app, new);
+    emit_subtitle(app, state).await;
+    emit_source_status(app, state).await;
+    emit_output_status(app, state);
+}
+
+// ---------------- 配置档辅助 ----------------
+
+fn profiles_status(state: &SharedState) -> profiles::ProfilesStatus {
+    profiles::list_status(state.config_path().as_deref())
+}
+
+// ---------------- 生命周期 ----------------
+
+async fn start_capture_impl(app: AppHandle, state: Arc<SharedState>) -> Result<(), String> {
+    let _lifecycle = state.lifecycle.lock().await;
+    start_capture_locked(app, state.clone()).await
+}
+
+async fn start_capture_locked(app: AppHandle, state: Arc<SharedState>) -> Result<(), String> {
+    {
+        let pipeline = state.pipeline.lock().await;
+        if pipeline.is_running() {
+            emit_status(&app, true, "字幕采集中");
+            return Ok(());
+        }
+    }
+
+    let config = state.config();
+    {
+        let mut subtitle_state = state.subtitle_state.lock().await;
+        subtitle_state.clear();
+    }
+    emit_subtitle_reset(&app);
+
+    // 计算本次要启动的源（并发上限 + 设备去重）
+    let mut contexts = Vec::new();
+    let mut skipped: Vec<(String, String)> = Vec::new();
+    {
+        let mut registry = state.sources.lock().await;
+        registry.sync_config(&config);
+        let max = config.audio.max_active_sources.max(1);
+        let mut used_devices = std::collections::HashSet::new();
+        for runtime in &mut registry.runtimes {
+            if !runtime.enabled {
+                runtime.running = false;
+                runtime.message = "已停用".to_string();
+                continue;
+            }
+            if contexts.len() >= max {
+                runtime.running = false;
+                runtime.message = format!("超出并发上限（{max}），未启动");
+                skipped.push((runtime.id.clone(), runtime.message.clone()));
+                continue;
+            }
+            if !runtime.device.trim().is_empty() && !used_devices.insert(runtime.device.clone()) {
+                runtime.running = false;
+                runtime.message = "设备重复，已跳过".to_string();
+                skipped.push((runtime.id.clone(), runtime.message.clone()));
+                continue;
+            }
+            runtime.running = true;
+            runtime.message = "启动中".to_string();
+            contexts.push(runtime.context());
+        }
+        let labels = registry.active_labels();
+        let mut subtitle_state = state.subtitle_state.lock().await;
+        subtitle_state.set_active_labels(labels);
+    }
+
+    if contexts.is_empty() {
+        emit_status(&app, false, "没有可用的输入源");
+        emit_source_status(&app, &state).await;
+        return Ok(());
+    }
+
+    // 并发上限 / 重复设备 / Silero CPU 提示
+    if !skipped.is_empty() {
+        let message = skipped
+            .iter()
+            .map(|(id, reason)| format!("{id}: {reason}"))
+            .collect::<Vec<_>>()
+            .join("；");
+        let _ = app.emit_all(NOTICE_EVENT, format!("部分输入源未启动 — {message}"));
+    }
+    if config.vad.enabled && config.vad.backend == "silero" && contexts.len() > 2 {
+        let _ = app.emit_all(
+            NOTICE_EVENT,
+            format!(
+                "已启用 {} 个 Silero VAD 输入源，CPU 占用可能较高；可降低 max_active_sources",
+                contexts.len()
+            ),
+        );
+    }
+
+    state.outputs.set_capture_active(true);
+    let active_count = contexts.len();
+
+    let (event_tx, mut event_rx): (
+        mpsc::Sender<app::PipelineEvent>,
+        mpsc::Receiver<app::PipelineEvent>,
+    ) = mpsc::channel(128);
+    let (stop_tx, stop_rx) = watch::channel(false);
+
+    emit_status(&app, true, format!("{active_count} 源采集中"));
+    emit_source_status(&app, &state).await;
+
+    let mut pipeline = state.pipeline.lock().await;
+    pipeline.generation = pipeline.generation.wrapping_add(1);
+    let generation = pipeline.generation;
+
+    let app_for_runner = app.clone();
+    let supervisor = tauri::async_runtime::spawn(async move {
+        let mut handles = Vec::new();
+        for context in contexts {
+            let source_config = config.clone();
+            let source_tx = event_tx.clone();
+            let source_stop = stop_rx.clone();
+            let app = app_for_runner.clone();
+            handles.push(tauri::async_runtime::spawn(async move {
+                if let Err(e) =
+                    app::run_source(source_config, context, source_tx, source_stop).await
+                {
+                    tracing::error!("Audio processing error: {}", e);
+                    let _ = app.emit_all(ERROR_EVENT, e.to_string());
+                }
+            }));
+        }
+        drop(event_tx);
+        for handle in handles {
+            let _ = handle.await;
+        }
+    });
+
+    let app_for_forwarder = app.clone();
+    let state_for_forwarder = state.clone();
+    let forwarder = tauri::async_runtime::spawn(async move {
+        while let Some(event) = event_rx.recv().await {
+            match event {
+                app::PipelineEvent::Subtitle(line) => {
+                    // 锁顺序统一为 sources -> subtitle，避免与 SourceState 分支互相等待
+                    let (labels, active) = {
+                        let registry = state_for_forwarder.sources.lock().await;
+                        (registry.active_labels(), registry.active_sources_payload())
+                    };
+                    let display = {
+                        let mut subtitle_state = state_for_forwarder.subtitle_state.lock().await;
+                        subtitle_state.set_active_labels(labels);
+                        subtitle_state.push(line);
+                        subtitle_state.display_lines()
+                    };
+                    let config = state_for_forwarder.config();
+                    let desktop = desktop_entries(display.clone(), &config);
+                    let payload = SubtitlePayload::new(&desktop, active);
+                    state_for_forwarder.outputs.publish(&display);
+                    let _ = app_for_forwarder.emit_all(SUBTITLE_EVENT, payload);
+                }
+                app::PipelineEvent::Notice { source_id, message } => {
+                    let label = {
+                        let registry = state_for_forwarder.sources.lock().await;
+                        source_id
+                            .as_ref()
+                            .and_then(|id| registry.runtimes.iter().find(|r| &r.id == id))
+                            .map(|r| r.label.clone())
+                    };
+                    let text = match label {
+                        Some(label) => format!("[{label}] {message}"),
+                        None => message,
+                    };
+                    let _ = app_for_forwarder.emit_all(NOTICE_EVENT, text);
+                }
+                app::PipelineEvent::SourceState {
+                    source_id,
+                    running,
+                    message,
+                } => {
+                    {
+                        let mut registry = state_for_forwarder.sources.lock().await;
+                        registry.set_running(&source_id, running, message.clone());
+                        let labels = registry.active_labels();
+                        let mut subtitle_state = state_for_forwarder.subtitle_state.lock().await;
+                        subtitle_state.set_active_labels(labels);
+                    }
+                    emit_source_status(&app_for_forwarder, &state_for_forwarder).await;
+                }
+            }
+        }
+
+        // 仅当仍是当前世代时才清理
+        let mut pipeline = state_for_forwarder.pipeline.lock().await;
+        if pipeline.generation == generation {
+            let mut registry = state_for_forwarder.sources.lock().await;
+            registry.mark_all_stopped();
+            drop(registry);
+            state_for_forwarder.outputs.set_capture_active(false);
+            emit_status(&app_for_forwarder, false, "字幕流已停止");
+            pipeline.stop_tx = None;
+            pipeline.supervisor = None;
+            pipeline.forwarder = None;
+            drop(pipeline);
+            emit_source_status(&app_for_forwarder, &state_for_forwarder).await;
+            emit_output_status(&app_for_forwarder, &state_for_forwarder);
+        }
+    });
+
+    pipeline.stop_tx = Some(stop_tx);
+    pipeline.supervisor = Some(supervisor);
+    pipeline.forwarder = Some(forwarder);
+    emit_output_status(&app, &state);
     Ok(())
 }
 
-/// 面板上的识别语言候选（按当前后端给出不同的语言码格式）
+async fn stop_capture_impl(app: AppHandle, state: Arc<SharedState>) -> Result<(), String> {
+    let _lifecycle = state.lifecycle.lock().await;
+    stop_capture_locked(app, state.clone()).await
+}
+
+async fn stop_capture_locked(app: AppHandle, state: Arc<SharedState>) -> Result<(), String> {
+    let (stop_tx, supervisor, forwarder) = {
+        let mut pipeline = state.pipeline.lock().await;
+        (
+            pipeline.stop_tx.take(),
+            pipeline.supervisor.take(),
+            pipeline.forwarder.take(),
+        )
+    };
+
+    if let Some(stop_tx) = stop_tx {
+        let _ = stop_tx.send(true);
+    }
+    if let Some(supervisor) = supervisor {
+        if tokio::time::timeout(std::time::Duration::from_secs(8), supervisor)
+            .await
+            .is_err()
+        {
+            tracing::warn!("Source supervisor did not stop in time");
+        }
+    }
+    if let Some(forwarder) = forwarder {
+        forwarder.abort();
+    }
+
+    {
+        let mut registry = state.sources.lock().await;
+        registry.mark_all_stopped();
+    }
+    {
+        let mut subtitle_state = state.subtitle_state.lock().await;
+        subtitle_state.clear();
+    }
+    state.outputs.set_capture_active(false);
+
+    emit_subtitle_reset(&app);
+    emit_status(&app, false, "已停止");
+    emit_source_status(&app, &state).await;
+    emit_output_status(&app, &state);
+    Ok(())
+}
+
+async fn restart_capture_impl(app: AppHandle, state: Arc<SharedState>) -> Result<(), String> {
+    let _lifecycle = state.lifecycle.lock().await;
+    stop_capture_locked(app.clone(), state.clone()).await?;
+    start_capture_locked(app, state.clone()).await
+}
+
+// ---------------- 前端命令：查询 ----------------
+
+#[tauri::command]
+async fn get_overlay_config(
+    state: State<'_, Arc<SharedState>>,
+) -> Result<OverlayConfigPayload, String> {
+    let config = state.config();
+    Ok(OverlayConfigPayload::new(
+        &config.subtitle,
+        config.translate.enabled,
+    ))
+}
+
+#[tauri::command]
+async fn get_status(state: State<'_, Arc<SharedState>>) -> Result<StatusPayload, String> {
+    let pipeline = state.pipeline.lock().await;
+    let running = pipeline.is_running();
+    drop(pipeline);
+    if !running {
+        return Ok(StatusPayload {
+            running: false,
+            message: "未启动".to_string(),
+        });
+    }
+    let registry = state.sources.lock().await;
+    let count = registry.running_count();
+    Ok(StatusPayload {
+        running: true,
+        message: match count {
+            0 => "正在启动".to_string(),
+            1 => "字幕采集中".to_string(),
+            n => format!("{n} 源采集中"),
+        },
+    })
+}
+
 #[tauri::command]
 async fn list_languages(
     state: State<'_, Arc<SharedState>>,
 ) -> Result<ui::LanguagesPayload, String> {
-    let backend = state.config.asr.backend.clone();
+    let config = state.config();
     let current = state.language_tx.borrow().clone();
-
     Ok(ui::LanguagesPayload {
-        options: asr::languages::options_for_backend(&backend)
+        options: asr::languages::options_for_backend(&config.asr.backend)
             .into_iter()
             .map(|item| ui::LanguageOptionPayload {
                 code: item.code,
@@ -258,70 +896,18 @@ async fn list_languages(
     })
 }
 
-/// 切换识别语言（立即生效，并写回配置文件）
-#[tauri::command]
-async fn set_language(state: State<'_, Arc<SharedState>>, code: String) -> Result<(), String> {
-    let backend = state.config.asr.backend.clone();
-    let normalized = asr::languages::normalize_for_backend(&backend, &code);
-    // 值会写回 TOML，只接受语言代码常见字符，防止换行/引号注入破坏配置
-    if normalized.is_empty()
-        || normalized.len() > 32
-        || !normalized
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-    {
-        return Err(format!("非法语言代码: {code}"));
-    }
-
-    // watch::Sender::send 仅在“无接收者”时失败，不影响设置本身
-    let _ = state.language_tx.send(normalized.clone());
-
-    // 两个后端的语言字段位置不同
-    let (section, key) = if asr::languages::is_edge_backend(&backend) {
-        ("asr.edge", "language")
-    } else {
-        ("asr", "language")
-    };
-    persist_setting(
-        state.config_path.as_ref(),
-        section,
-        key,
-        &format!("\"{}\"", normalized),
-    );
-
-    tracing::info!("ASR language set to: {}", normalized);
-    Ok(())
-}
-
-#[tauri::command]
-async fn get_overlay_config(
-    state: State<'_, Arc<SharedState>>,
-) -> Result<OverlayConfigPayload, String> {
-    Ok(OverlayConfigPayload::new(
-        &state.config.subtitle,
-        *state.translate_tx.borrow(),
-    ))
-}
-
-#[tauri::command]
-async fn get_status(state: State<'_, Arc<SharedState>>) -> Result<StatusPayload, String> {
-    let pipeline = state.pipeline.lock().await;
-    Ok(StatusPayload {
-        running: pipeline.is_running(),
-        message: if pipeline.is_running() {
-            "字幕采集中".to_string()
-        } else {
-            "未启动".to_string()
-        },
-    })
-}
-
 #[tauri::command]
 async fn list_devices_command(
     state: State<'_, Arc<SharedState>>,
 ) -> Result<ui::DevicesPayload, String> {
     let devices = audio::capture::AudioCapture::list_devices().map_err(|e| e.to_string())?;
-    let current = state.current_device.lock().await.clone();
+    let config = state.config();
+    let current = config
+        .audio
+        .effective_sources(config.translate.enabled)
+        .first()
+        .map(|s| s.device.clone())
+        .unwrap_or_default();
     Ok(ui::DevicesPayload {
         devices: devices
             .into_iter()
@@ -336,35 +922,743 @@ async fn list_devices_command(
 }
 
 #[tauri::command]
+async fn list_sources(state: State<'_, Arc<SharedState>>) -> Result<SourcesPayload, String> {
+    let registry = state.sources.lock().await;
+    Ok(SourcesPayload {
+        sources: registry.status_items(),
+        max_active_sources: state.config().audio.max_active_sources,
+    })
+}
+
+#[tauri::command]
+async fn get_sources_config(
+    state: State<'_, Arc<SharedState>>,
+) -> Result<serde_json::Value, String> {
+    let config = state.config();
+    Ok(serde_json::json!({
+        "sources": config.audio.effective_sources(config.translate.enabled),
+        "max_active_sources": config.audio.max_active_sources,
+    }))
+}
+
+#[tauri::command]
+async fn get_output_status(
+    state: State<'_, Arc<SharedState>>,
+) -> Result<output::OutputStatusPayload, String> {
+    Ok(state.outputs.status())
+}
+
+#[tauri::command]
+async fn get_capabilities() -> Result<CapabilitiesPayload, String> {
+    let (steamvr, osc) = output::capabilities();
+    Ok(CapabilitiesPayload { steamvr, osc })
+}
+
+#[tauri::command]
+async fn get_settings_schema(
+    state: State<'_, Arc<SharedState>>,
+) -> Result<schema::SettingsSchema, String> {
+    Ok(schema::build(&state.config()))
+}
+
+#[tauri::command]
+async fn get_config_raw(state: State<'_, Arc<SharedState>>) -> Result<serde_json::Value, String> {
+    let path = state.config_path();
+    let text = match &path {
+        Some(path) => writer::read_text(path)?,
+        None => String::new(),
+    };
+    Ok(serde_json::json!({
+        "path": path.map(|p| p.display().to_string()),
+        "text": text,
+    }))
+}
+
+#[tauri::command]
+async fn get_profiles(
+    state: State<'_, Arc<SharedState>>,
+) -> Result<profiles::ProfilesStatus, String> {
+    Ok(profiles_status(&state))
+}
+
+// ---------------- 前端命令：面板热更新 ----------------
+
+#[tauri::command]
+async fn set_font_size(
+    app: AppHandle,
+    state: State<'_, Arc<SharedState>>,
+    size: u32,
+) -> Result<(), String> {
+    let size = size.clamp(12, 72);
+    state.font_size.store(size, Ordering::SeqCst);
+    let mut config = state.config();
+    config.subtitle.font_size = size;
+    state.set_config(config.clone());
+    persist_value(&state, "subtitle", "font_size", size.into());
+    emit_config(&app, &config);
+    Ok(())
+}
+
+#[tauri::command]
+async fn set_show_source(
+    app: AppHandle,
+    state: State<'_, Arc<SharedState>>,
+    enabled: bool,
+) -> Result<(), String> {
+    state.show_source.store(enabled, Ordering::SeqCst);
+    {
+        let mut subtitle_state = state.subtitle_state.lock().await;
+        subtitle_state.set_show_source(enabled);
+    }
+    let mut config = state.config();
+    config.subtitle.show_source = enabled;
+    state.set_config(config.clone());
+    persist_value(&state, "subtitle", "show_source", enabled.into());
+    emit_config(&app, &config);
+    emit_subtitle(&app, &state).await;
+    Ok(())
+}
+
+#[tauri::command]
+async fn set_translate_enabled(
+    app: AppHandle,
+    state: State<'_, Arc<SharedState>>,
+    enabled: bool,
+) -> Result<(), String> {
+    let _ = state.translate_tx.send(enabled);
+    {
+        let mut registry = state.sources.lock().await;
+        registry.set_translate_all(enabled);
+    }
+    let mut config = state.config();
+    config.translate.enabled = enabled;
+    state.set_config(config.clone());
+    persist_value(&state, "translate", "enabled", enabled.into());
+    emit_config(&app, &config);
+    emit_source_status(&app, &state).await;
+    tracing::info!(
+        "Mode set to: {}",
+        if enabled {
+            "ASR + translate"
+        } else {
+            "ASR only"
+        }
+    );
+    Ok(())
+}
+
+#[tauri::command]
+async fn set_language(
+    app: AppHandle,
+    state: State<'_, Arc<SharedState>>,
+    code: String,
+) -> Result<(), String> {
+    let mut config = state.config();
+    let normalized = asr::languages::normalize_for_backend(&config.asr.backend, &code);
+    if normalized.is_empty()
+        || normalized.len() > 32
+        || !normalized
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return Err(format!("非法语言代码: {code}"));
+    }
+
+    let _ = state.language_tx.send(normalized.clone());
+    {
+        let mut registry = state.sources.lock().await;
+        registry.set_language(&config, &normalized);
+    }
+
+    let (section, key) = if asr::languages::is_edge_backend(&config.asr.backend) {
+        ("asr.edge", "language")
+    } else {
+        ("asr", "language")
+    };
+    persist_value(&state, section, key, normalized.clone().into());
+
+    if asr::languages::is_edge_backend(&config.asr.backend) {
+        config.asr.edge.language = normalized.clone();
+    } else {
+        config.asr.language = normalized.clone();
+    }
+    state.set_config(config.clone());
+    emit_config(&app, &config);
+    tracing::info!("ASR language set to: {}", normalized);
+    Ok(())
+}
+
+#[tauri::command]
 async fn set_device(
     app: AppHandle,
     state: State<'_, Arc<SharedState>>,
     spec: String,
 ) -> Result<(), String> {
-    let state = state.inner().clone();
-    let _lifecycle = state.lifecycle.lock().await;
-    let was_running = {
-        let pipeline = state.pipeline.lock().await;
-        pipeline.is_running()
+    let mut config = state.config();
+    if config.audio.sources.is_empty() {
+        config.audio.sources = config.audio.effective_sources(config.translate.enabled);
+    }
+    if let Some(first) = config.audio.sources.first_mut() {
+        first.device = spec.clone();
+    } else {
+        config.audio.device_name = spec.clone();
+    }
+    config.audio.device_name = spec.clone();
+    state.set_config(config.clone());
+    persist_value(&state, "audio", "device_name", spec.clone().into());
+    persist_sources(&state, &config);
+    mirror_profile(&state);
+    restart_capture_impl(app, state.inner().clone()).await
+}
+
+#[tauri::command]
+async fn set_source_translate(
+    app: AppHandle,
+    state: State<'_, Arc<SharedState>>,
+    id: String,
+    enabled: bool,
+) -> Result<(), String> {
+    let mut config = state.config();
+    if config.audio.sources.is_empty() {
+        config.audio.sources = config.audio.effective_sources(config.translate.enabled);
+    }
+    let Some(source) = config.audio.sources.iter_mut().find(|s| s.id == id) else {
+        return Err(format!("输入源不存在: {id}"));
     };
-
-    // 运行中先停止，切换设备后再启动
-    if was_running {
-        stop_capture_locked(app.clone(), state.clone()).await?;
-    }
-
+    source.translate = enabled;
+    state.set_config(config.clone());
+    persist_sources(&state, &config);
+    mirror_profile(&state);
     {
-        let mut current = state.current_device.lock().await;
-        *current = spec.clone();
+        let mut registry = state.sources.lock().await;
+        registry.sync_config(&config);
+        registry.set_translate(&id, enabled && config.translate.enabled);
     }
-
-    if was_running {
-        start_capture_locked(app.clone(), state.clone()).await?;
-    }
-
-    emit_status(&app, was_running, format!("设备已切换: {}", spec));
+    emit_source_status(&app, &state).await;
     Ok(())
 }
+
+async fn mutate_sources<F>(app: AppHandle, state: Arc<SharedState>, mutate: F) -> Result<(), String>
+where
+    F: FnOnce(&mut AppConfig) -> Result<(), String>,
+{
+    let _lifecycle = state.lifecycle.lock().await;
+    let was_running = state.pipeline.lock().await.is_running();
+
+    let mut config = state.config();
+    if config.audio.sources.is_empty() {
+        config.audio.sources = config.audio.effective_sources(config.translate.enabled);
+    }
+    mutate(&mut config)?;
+    config.validate()?;
+    state.set_config(config.clone());
+    persist_sources(&state, &config);
+    mirror_profile(&state);
+    {
+        let mut registry = state.sources.lock().await;
+        registry.sync_config(&config);
+    }
+
+    if was_running {
+        stop_capture_locked(app.clone(), state.clone()).await?;
+        start_capture_locked(app.clone(), state.clone()).await?;
+    } else {
+        emit_source_status(&app, &state).await;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+async fn set_source_enabled(
+    app: AppHandle,
+    state: State<'_, Arc<SharedState>>,
+    id: String,
+    enabled: bool,
+) -> Result<(), String> {
+    let inner = state.inner().clone();
+    mutate_sources(app, inner, |config| {
+        let source = config
+            .audio
+            .sources
+            .iter_mut()
+            .find(|s| s.id == id)
+            .ok_or_else(|| format!("输入源不存在: {id}"))?;
+        source.enabled = enabled;
+        Ok(())
+    })
+    .await
+}
+
+#[tauri::command]
+async fn set_source_device(
+    app: AppHandle,
+    state: State<'_, Arc<SharedState>>,
+    id: String,
+    spec: String,
+) -> Result<(), String> {
+    let inner = state.inner().clone();
+    mutate_sources(app, inner, |config| {
+        let source = config
+            .audio
+            .sources
+            .iter_mut()
+            .find(|s| s.id == id)
+            .ok_or_else(|| format!("输入源不存在: {id}"))?;
+        source.device = spec;
+        Ok(())
+    })
+    .await
+}
+
+#[tauri::command]
+async fn add_source(
+    app: AppHandle,
+    state: State<'_, Arc<SharedState>>,
+    source: AudioSourceConfig,
+) -> Result<(), String> {
+    let inner = state.inner().clone();
+    mutate_sources(app, inner, |config| {
+        if config.audio.sources.iter().any(|s| s.id == source.id) {
+            return Err(format!("输入源 id 重复: {}", source.id));
+        }
+        config.audio.sources.push(source);
+        Ok(())
+    })
+    .await
+}
+
+#[tauri::command]
+async fn update_source(
+    app: AppHandle,
+    state: State<'_, Arc<SharedState>>,
+    source: AudioSourceConfig,
+) -> Result<(), String> {
+    let inner = state.inner().clone();
+    mutate_sources(app, inner, |config| {
+        let item = config
+            .audio
+            .sources
+            .iter_mut()
+            .find(|s| s.id == source.id)
+            .ok_or_else(|| format!("输入源不存在: {}", source.id))?;
+        *item = source;
+        Ok(())
+    })
+    .await
+}
+
+#[tauri::command]
+async fn remove_source(
+    app: AppHandle,
+    state: State<'_, Arc<SharedState>>,
+    id: String,
+) -> Result<(), String> {
+    let inner = state.inner().clone();
+    mutate_sources(app, inner, |config| {
+        let before = config.audio.sources.len();
+        config.audio.sources.retain(|s| s.id != id);
+        if config.audio.sources.len() == before {
+            return Err(format!("输入源不存在: {id}"));
+        }
+        Ok(())
+    })
+    .await
+}
+
+#[tauri::command]
+async fn reorder_sources(
+    app: AppHandle,
+    state: State<'_, Arc<SharedState>>,
+    ids: Vec<String>,
+) -> Result<(), String> {
+    let inner = state.inner().clone();
+    mutate_sources(app, inner, |config| {
+        let mut ordered = Vec::with_capacity(config.audio.sources.len());
+        for id in &ids {
+            if let Some(pos) = config.audio.sources.iter().position(|s| &s.id == id) {
+                ordered.push(config.audio.sources.remove(pos));
+            }
+        }
+        ordered.append(&mut config.audio.sources);
+        config.audio.sources = ordered;
+        Ok(())
+    })
+    .await
+}
+
+#[tauri::command]
+async fn set_output_enabled(
+    app: AppHandle,
+    state: State<'_, Arc<SharedState>>,
+    kind: String,
+    enabled: bool,
+) -> Result<(), String> {
+    let (cap_steamvr, cap_osc) = output::capabilities();
+    if enabled && ((kind == "steamvr" && !cap_steamvr) || (kind == "osc" && !cap_osc)) {
+        return Err("当前构建未包含该输出，请下载 Full 版".to_string());
+    }
+
+    let mut config = state.config();
+    match kind.as_str() {
+        "steamvr" => config.output.steamvr.enabled = enabled,
+        "osc" => config.output.osc.enabled = enabled,
+        other => return Err(format!("未知输出类型: {other}")),
+    }
+    config.validate()?;
+    state.set_config(config.clone());
+    let path = match kind.as_str() {
+        "steamvr" => "output.steamvr.enabled",
+        _ => "output.osc.enabled",
+    };
+    persist_value(
+        &state,
+        &path[..path.rfind('.').unwrap()],
+        "enabled",
+        enabled.into(),
+    );
+    mirror_profile(&state);
+    state.outputs.apply_config(&config.output);
+    emit_output_status(&app, &state);
+    Ok(())
+}
+
+// ---------------- 设置页保存 ----------------
+
+#[derive(Debug, Deserialize)]
+struct SettingChange {
+    path: String,
+    value: serde_json::Value,
+}
+
+fn apply_settings_changes(
+    config: &mut AppConfig,
+    changes: &[SettingChange],
+) -> Result<bool, String> {
+    let (cap_steamvr, cap_osc) = output::capabilities();
+    let mut restart = false;
+    for change in changes {
+        if !cap_steamvr && change.path.starts_with("output.steamvr.") {
+            return Err("当前构建为标准版，未包含 SteamVR 支持，请下载 Full 版".to_string());
+        }
+        if !cap_osc && change.path.starts_with("output.osc.") {
+            return Err("当前构建为标准版，未包含 OSC 支持，请下载 Full 版".to_string());
+        }
+        if change.path == "audio.sources" {
+            config.audio.sources = serde_json::from_value(change.value.clone())
+                .map_err(|e| format!("解析输入源失败: {e}"))?;
+            restart = true;
+            continue;
+        }
+        restart |= schema::apply_change(config, &change.path, &change.value)?;
+    }
+    Ok(restart)
+}
+
+async fn write_config_changes(
+    state: &SharedState,
+    changes: &[SettingChange],
+    config: &AppConfig,
+) -> Result<(), String> {
+    let path = ensure_config_path(state)?;
+
+    let payload: Vec<(String, serde_json::Value)> = changes
+        .iter()
+        .map(|c| (c.path.trim_end_matches("[]").to_string(), c.value.clone()))
+        .collect();
+    // writer 内部会重新解析并校验，失败时回滚
+    writer::apply_changes(&path, &payload)?;
+    let _ = config;
+    mirror_profile(state);
+    Ok(())
+}
+
+#[tauri::command]
+async fn save_settings(
+    app: AppHandle,
+    state: State<'_, Arc<SharedState>>,
+    changes: Vec<SettingChange>,
+) -> Result<SaveResult, String> {
+    let old = state.config();
+    let mut new = old.clone();
+    let restart = apply_settings_changes(&mut new, &changes)?;
+    new.validate()?;
+
+    write_config_changes(&state, &changes, &new).await?;
+    state.set_config(new.clone());
+    apply_hot_config(&app, &state, &old, &new).await;
+
+    if restart {
+        let running = state.pipeline.lock().await.is_running();
+        if running {
+            restart_capture_impl(app.clone(), state.inner().clone()).await?;
+        }
+    }
+
+    tracing::info!(
+        "Settings saved ({} changes, restart={restart})",
+        changes.len()
+    );
+    Ok(SaveResult {
+        applied: changes.len(),
+        restart_required: restart,
+        message: if restart {
+            "已保存；部分修改需要重启采集后生效".to_string()
+        } else {
+            "已保存并立即生效".to_string()
+        },
+    })
+}
+
+/// 实时预览（不写文件、不改变持久配置）
+#[tauri::command]
+async fn preview_settings(
+    app: AppHandle,
+    state: State<'_, Arc<SharedState>>,
+    changes: Vec<SettingChange>,
+) -> Result<(), String> {
+    let mut preview = state.config();
+    apply_settings_changes(&mut preview, &changes)?;
+    state.outputs.apply_config(&preview.output);
+    {
+        let mut subtitle_state = state.subtitle_state.lock().await;
+        subtitle_state.set_max_lines(history_limit(&preview));
+        subtitle_state.set_show_source(preview.subtitle.show_source);
+        subtitle_state.set_label_mode(preview.subtitle.label_sources);
+    }
+    let _ = app.emit_all(
+        CONFIG_EVENT,
+        OverlayConfigPayload::new(&preview.subtitle, preview.translate.enabled),
+    );
+    emit_subtitle(&app, &state).await;
+    emit_output_status(&app, &state);
+    Ok(())
+}
+
+#[tauri::command]
+async fn cancel_preview(app: AppHandle, state: State<'_, Arc<SharedState>>) -> Result<(), String> {
+    let config = state.config();
+    state.outputs.apply_config(&config.output);
+    {
+        let mut subtitle_state = state.subtitle_state.lock().await;
+        subtitle_state.set_max_lines(history_limit(&config));
+        subtitle_state.set_show_source(config.subtitle.show_source);
+        subtitle_state.set_label_mode(config.subtitle.label_sources);
+    }
+    emit_config(&app, &config);
+    emit_subtitle(&app, &state).await;
+    emit_output_status(&app, &state);
+    Ok(())
+}
+
+#[tauri::command]
+async fn save_config_raw(
+    app: AppHandle,
+    state: State<'_, Arc<SharedState>>,
+    text: String,
+) -> Result<SaveResult, String> {
+    let old = state.config();
+    let path = ensure_config_path(state.inner())?;
+    // 先解析/校验能力，避免非法或不可用的配置落盘
+    let parsed = AppConfig::from_str(&text).map_err(|e| e.to_string())?;
+    parsed.validate()?;
+    let (cap_steamvr, cap_osc) = output::capabilities();
+    if !cap_steamvr && parsed.output.steamvr.enabled {
+        return Err("当前构建为标准版，未包含 SteamVR 支持，请下载 Full 版".to_string());
+    }
+    if !cap_osc && parsed.output.osc.enabled {
+        return Err("当前构建为标准版，未包含 OSC 支持，请下载 Full 版".to_string());
+    }
+    let new = writer::save_raw(&path, &text)?;
+    state.set_config(new.clone());
+    {
+        let mut registry = state.sources.lock().await;
+        registry.sync_config(&new);
+    }
+    mirror_profile(&state);
+    apply_hot_config(&app, &state, &old, &new).await;
+
+    let running = state.pipeline.lock().await.is_running();
+    if running {
+        restart_capture_impl(app.clone(), state.inner().clone()).await?;
+    }
+    Ok(SaveResult {
+        applied: 1,
+        restart_required: true,
+        message: "原始配置已保存并校验通过".to_string(),
+    })
+}
+
+#[tauri::command]
+async fn reload_config(
+    app: AppHandle,
+    state: State<'_, Arc<SharedState>>,
+) -> Result<SaveResult, String> {
+    let path = state
+        .config_path()
+        .ok_or_else(|| "当前没有配置文件".to_string())?;
+    let new = AppConfig::from_file(&path).map_err(|e| e.to_string())?;
+    new.validate()?;
+    let old = state.config();
+    state.set_config(new.clone());
+    {
+        let mut registry = state.sources.lock().await;
+        registry.sync_config(&new);
+    }
+    apply_hot_config(&app, &state, &old, &new).await;
+    let running = state.pipeline.lock().await.is_running();
+    if running {
+        restart_capture_impl(app.clone(), state.inner().clone()).await?;
+    }
+    Ok(SaveResult {
+        applied: 1,
+        restart_required: true,
+        message: "配置已重新加载".to_string(),
+    })
+}
+
+#[tauri::command]
+async fn open_config_file(state: State<'_, Arc<SharedState>>) -> Result<(), String> {
+    let path = ensure_config_path(state.inner())?;
+    open_path(&path)
+}
+
+#[tauri::command]
+async fn open_config_folder(state: State<'_, Arc<SharedState>>) -> Result<(), String> {
+    let path = ensure_config_path(state.inner())?;
+    match path.parent() {
+        Some(dir) => open_path(dir),
+        None => Err("无法定位配置目录".to_string()),
+    }
+}
+
+#[tauri::command]
+async fn open_settings(app: AppHandle) -> Result<(), String> {
+    open_settings_window(&app);
+    Ok(())
+}
+
+// ---------------- 配置档命令 ----------------
+
+fn require_profile_path(state: &SharedState) -> Result<PathBuf, String> {
+    let path = state
+        .config_path()
+        .ok_or_else(|| "当前使用内置默认配置，无法使用配置档".to_string())?;
+    let (enabled, reason) = profiles::profiles_enabled(Some(&path));
+    if !enabled {
+        return Err(reason.unwrap_or_else(|| "当前配置路径不支持配置档".to_string()));
+    }
+    Ok(path)
+}
+
+#[tauri::command]
+async fn create_profile(
+    state: State<'_, Arc<SharedState>>,
+    name: String,
+    copy_current: bool,
+) -> Result<(), String> {
+    let path = require_profile_path(&state)?;
+    let source = if copy_current {
+        Some(path.as_path())
+    } else {
+        None
+    };
+    profiles::create(&path, &name, source)
+}
+
+#[tauri::command]
+async fn duplicate_profile(
+    state: State<'_, Arc<SharedState>>,
+    from: String,
+    to: String,
+) -> Result<(), String> {
+    let path = require_profile_path(&state)?;
+    profiles::duplicate(&path, &from, &to)
+}
+
+#[tauri::command]
+async fn rename_profile(
+    state: State<'_, Arc<SharedState>>,
+    old: String,
+    new: String,
+) -> Result<(), String> {
+    let path = require_profile_path(&state)?;
+    profiles::rename(&path, &old, &new)
+}
+
+#[tauri::command]
+async fn delete_profile(state: State<'_, Arc<SharedState>>, name: String) -> Result<(), String> {
+    let path = require_profile_path(&state)?;
+    profiles::delete(&path, &name)
+}
+
+#[tauri::command]
+async fn switch_profile(
+    app: AppHandle,
+    state: State<'_, Arc<SharedState>>,
+    name: String,
+) -> Result<SaveResult, String> {
+    let inner = state.inner().clone();
+    let _lifecycle = inner.lifecycle.lock().await;
+    let config_path = require_profile_path(&inner)?;
+    let text = profiles::switch(&config_path, &name)?;
+    let new = AppConfig::from_str(&text).map_err(|e| e.to_string())?;
+    new.validate()?;
+
+    let was_running = inner.pipeline.lock().await.is_running();
+    let old = inner.config();
+
+    if was_running {
+        stop_capture_locked(app.clone(), inner.clone()).await?;
+    }
+    let original_text = std::fs::read_to_string(&config_path).unwrap_or_default();
+    if let Err(e) = writer::backup(&config_path) {
+        tracing::warn!("Failed to backup config: {e}");
+    }
+    if let Err(e) = writer::write_atomic(&config_path, &text) {
+        // 失败时恢复旧文件并尝试重启
+        let _ = writer::write_atomic(&config_path, &original_text);
+        if was_running {
+            let _ = start_capture_locked(app.clone(), inner.clone()).await;
+        }
+        return Err(e);
+    }
+    profiles::write_active(&config_path, &name)?;
+
+    inner.set_config(new.clone());
+    {
+        let mut registry = inner.sources.lock().await;
+        registry.sync_config(&new);
+    }
+    apply_hot_config(&app, &inner, &old, &new).await;
+
+    if was_running {
+        start_capture_locked(app.clone(), inner.clone()).await?;
+    }
+    emit_status(&app, was_running, format!("已切换到配置档「{name}」"));
+    Ok(SaveResult {
+        applied: 1,
+        restart_required: true,
+        message: format!("已切换到配置档「{name}」"),
+    })
+}
+
+#[tauri::command]
+async fn open_profiles_dir(state: State<'_, Arc<SharedState>>) -> Result<(), String> {
+    let path = require_profile_path(&state)?;
+    let dir = profiles::profiles_dir(&path);
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    open_path(&dir)
+}
+
+#[tauri::command]
+async fn restart_pipeline(
+    app: AppHandle,
+    state: State<'_, Arc<SharedState>>,
+) -> Result<(), String> {
+    restart_capture_impl(app, state.inner().clone()).await
+}
+
+// ---------------- 原有窗口命令 ----------------
 
 #[tauri::command]
 async fn start_capture(app: AppHandle, state: State<'_, Arc<SharedState>>) -> Result<(), String> {
@@ -381,17 +1675,11 @@ fn close_overlay(window: Window) -> Result<(), String> {
     window.close().map_err(|e| e.to_string())
 }
 
-/// 开始拖动窗口
-///
-/// 用自己的命令而不是 `data-tauri-drag-region`，因为后者走 Window 模块，
-/// 受 allowlist / cargo feature 门控；而且它在双击时会触发最大化，
-/// 不适合本项目的浮窗场景。
 #[tauri::command]
 fn start_dragging(window: Window) -> Result<(), String> {
     window.start_dragging().map_err(|e| e.to_string())
 }
 
-/// 读取窗口当前位置与尺寸（逻辑像素），供前端做自定义边缘缩放
 #[tauri::command]
 fn window_geometry(window: Window) -> Result<(i32, i32, u32, u32), String> {
     let scale = window.scale_factor().map_err(|e| e.to_string())?;
@@ -405,10 +1693,6 @@ fn window_geometry(window: Window) -> Result<(i32, i32, u32, u32), String> {
     ))
 }
 
-/// 设置窗口位置与尺寸（逻辑像素），供前端自定义边缘缩放
-///
-/// Tauri v1 没有 `start_resize_dragging`，只能在 JS 里跟踪鼠标位移后反复
-/// 调用本命令；尺寸和位置放在同一个命令里设置，避免两次调用间出现撕裂。
 #[tauri::command]
 fn set_window_bounds(
     window: Window,
@@ -428,10 +1712,6 @@ fn set_window_bounds(
     Ok(())
 }
 
-/// 手动缩放结束后，把当前窗口尺寸与位置写回配置文件（保留注释）
-///
-/// 直接读窗口实际几何而非相信前端传值，避免与最后一次 `set_window_bounds`
-/// 的异步执行产生竞争。
 #[tauri::command]
 fn persist_window_geometry(
     state: State<'_, Arc<SharedState>>,
@@ -446,11 +1726,18 @@ fn persist_window_geometry(
     let width = (size.width as f64 / scale).round() as u32;
     let height = (size.height as f64 / scale).round() as u32;
 
-    let path = state.config_path.as_ref();
-    persist_setting(path, "subtitle", "window_width", &width.to_string());
-    persist_setting(path, "subtitle", "window_height", &height.to_string());
-    persist_setting(path, "subtitle", "position_x", &x.to_string());
-    persist_setting(path, "subtitle", "position_y", &y.to_string());
+    let mut config = state.config();
+    config.subtitle.window_width = width;
+    config.subtitle.window_height = height;
+    config.subtitle.position_x = x;
+    config.subtitle.position_y = y;
+    state.set_config(config.clone());
+
+    persist_value(&state, "subtitle", "window_width", width.into());
+    persist_value(&state, "subtitle", "window_height", height.into());
+    persist_value(&state, "subtitle", "position_x", x.into());
+    persist_value(&state, "subtitle", "position_y", y.into());
+    mirror_profile(&state);
     Ok(())
 }
 
@@ -460,174 +1747,24 @@ async fn set_click_through(
     state: State<'_, Arc<SharedState>>,
     enabled: bool,
 ) -> Result<(), String> {
-    state.click_through.store(enabled, Ordering::SeqCst);
+    let mut config = state.config();
+    config.subtitle.click_through = enabled;
+    state.set_config(config.clone());
     apply_click_through(&app, enabled);
+    persist_value(&state, "subtitle", "click_through", enabled.into());
+    mirror_profile(&state);
     Ok(())
 }
 
-async fn start_capture_impl(app: AppHandle, state: Arc<SharedState>) -> Result<(), String> {
-    let _lifecycle = state.lifecycle.lock().await;
-    start_capture_locked(app, state.clone()).await
-}
+// ---------------- 系统集成 ----------------
 
-/// 调用方必须已持有 `state.lifecycle`
-async fn start_capture_locked(app: AppHandle, state: Arc<SharedState>) -> Result<(), String> {
-    {
-        let pipeline = state.pipeline.lock().await;
-        if pipeline.is_running() {
-            emit_status(&app, true, "字幕采集中");
-            return Ok(());
-        }
-    }
-
-    {
-        let mut subtitle_state = state.subtitle_state.lock().await;
-        subtitle_state.clear();
-    }
-    emit_subtitle_reset(&app);
-
-    let (event_tx, mut event_rx): (
-        mpsc::Sender<app::PipelineEvent>,
-        mpsc::Receiver<app::PipelineEvent>,
-    ) = mpsc::channel(128);
-    let (stop_tx, stop_rx) = watch::channel(false);
-    // 语言用独立通道：面板切换可实时生效，不需要重启流水线
-    let language_rx = state.language_tx.subscribe();
-    let translate_rx = state.translate_tx.subscribe();
-
-    let mut config = state.config.clone();
-    {
-        let current_device = state.current_device.lock().await;
-        config.audio.device_name = current_device.clone();
-    }
-
-    // 在持有 pipeline 锁期间分配世代号、spawn 并登记句柄：
-    // 即使 runner 立即失败，forwarder 的清理也必须等句柄登记完才能拿到锁
-    emit_status(&app, true, "字幕采集中");
-    let mut pipeline = state.pipeline.lock().await;
-    pipeline.generation = pipeline.generation.wrapping_add(1);
-    let generation = pipeline.generation;
-
-    let app_for_runner = app.clone();
-    let runner = tauri::async_runtime::spawn(async move {
-        if let Err(e) =
-            app::run_pipeline(config, event_tx, stop_rx, language_rx, translate_rx).await
-        {
-            tracing::error!("Audio processing error: {}", e);
-            let _ = app_for_runner.emit_all(ERROR_EVENT, e.to_string());
-            emit_status(&app_for_runner, false, format!("运行失败: {}", e));
-        }
-    });
-
-    let app_for_forwarder = app.clone();
-    let state_for_forwarder = state.clone();
-    let forwarder = tauri::async_runtime::spawn(async move {
-        while let Some(event) = event_rx.recv().await {
-            match event {
-                app::PipelineEvent::Subtitle(subtitle) => {
-                    let payload = {
-                        let mut subtitle_state = state_for_forwarder.subtitle_state.lock().await;
-                        subtitle_state.push(subtitle.clone());
-                        SubtitlePayload {
-                            source: subtitle.source.clone(),
-                            translated: subtitle.translated.clone(),
-                            lines: subtitle_state.get_all(),
-                            text: subtitle_state.get_text(),
-                        }
-                    };
-
-                    let _ = app_for_forwarder.emit_all(SUBTITLE_EVENT, payload);
-                }
-                app::PipelineEvent::Notice(message) => {
-                    // 把 ASR/翻译/配置问题直接显示到面板，避免“一直等待”却无提示
-                    let _ = app_for_forwarder.emit_all(NOTICE_EVENT, message);
-                }
-            }
-        }
-
-        // 仅当仍是当前世代时才清理，避免覆盖刚启动的新流水线
-        let mut pipeline = state_for_forwarder.pipeline.lock().await;
-        if pipeline.generation == generation {
-            emit_status(&app_for_forwarder, false, "字幕流已停止");
-            pipeline.stop_tx = None;
-            pipeline.runner = None;
-            pipeline.forwarder = None;
-        }
-    });
-
-    pipeline.stop_tx = Some(stop_tx);
-    pipeline.runner = Some(runner);
-    pipeline.forwarder = Some(forwarder);
-    Ok(())
-}
-
-async fn stop_capture_impl(app: AppHandle, state: Arc<SharedState>) -> Result<(), String> {
-    let _lifecycle = state.lifecycle.lock().await;
-    stop_capture_locked(app, state.clone()).await
-}
-
-/// 调用方必须已持有 `state.lifecycle`
-async fn stop_capture_locked(app: AppHandle, state: Arc<SharedState>) -> Result<(), String> {
-    let (stop_tx, runner, forwarder) = {
-        let mut pipeline = state.pipeline.lock().await;
-        (
-            pipeline.stop_tx.take(),
-            pipeline.runner.take(),
-            pipeline.forwarder.take(),
-        )
-    };
-
-    if let Some(stop_tx) = stop_tx {
-        let _ = stop_tx.send(true);
-    }
-
-    if let Some(runner) = runner {
-        let _ = runner.await;
-    }
-
-    if let Some(forwarder) = forwarder {
-        forwarder.abort();
-    }
-
-    {
-        let mut subtitle_state = state.subtitle_state.lock().await;
-        subtitle_state.clear();
-    }
-
-    emit_subtitle_reset(&app);
-    emit_status(&app, false, "已停止");
-    Ok(())
-}
-
-fn emit_status(app: &AppHandle, running: bool, message: impl Into<String>) {
-    let _ = app.emit_all(
-        STATUS_EVENT,
-        StatusPayload {
-            running,
-            message: message.into(),
-        },
-    );
-}
-
-fn emit_subtitle_reset(app: &AppHandle) {
-    let _ = app.emit_all(
-        SUBTITLE_EVENT,
-        SubtitlePayload {
-            source: String::new(),
-            translated: String::new(),
-            lines: Vec::new(),
-            text: String::new(),
-        },
-    );
-}
-
-/// 在系统文件管理器中打开用户配置目录
-///
-/// 同时在目录不存在时先创建它，方便用户首次直接编辑。
 pub(crate) fn open_config_dir() -> Result<(), String> {
     let dir = AppConfig::user_config_dir().map_err(|e| e.to_string())?;
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    open_path(&dir)
+}
 
+fn open_path(path: &std::path::Path) -> Result<(), String> {
     #[cfg(target_os = "macos")]
     let opener = "open";
     #[cfg(target_os = "windows")]
@@ -636,11 +1773,10 @@ pub(crate) fn open_config_dir() -> Result<(), String> {
     let opener = "xdg-open";
 
     std::process::Command::new(opener)
-        .arg(&dir)
+        .arg(path)
         .spawn()
-        .map_err(|e| format!("Failed to open {}: {}", dir.display(), e))?;
-
-    tracing::info!("Opened config directory: {}", dir.display());
+        .map_err(|e| format!("Failed to open {}: {}", path.display(), e))?;
+    tracing::info!("Opened: {}", path.display());
     Ok(())
 }
 
@@ -667,10 +1803,6 @@ fn apply_window_config(window: &Window, config: &AppConfig) -> Result<(), String
     Ok(())
 }
 
-/// 选择第一个可写的日志文件位置
-///
-/// 依次尝试：用户日志目录 -> 可执行文件同级 -> 系统临时目录。
-/// 返回 `(日志文件路径, 目录, 文件名)`。
 fn resolve_log_target() -> Option<(PathBuf, PathBuf, String)> {
     let mut candidates: Vec<PathBuf> = Vec::new();
 
@@ -713,14 +1845,11 @@ fn init_logging(level: &str) -> Option<tracing_appender::non_blocking::WorkerGua
 
     let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(level));
 
-    // 控制台输出（从终端启动或重定向时可见）
     let console_layer = tracing_subscriber::fmt::layer()
         .with_target(true)
         .with_thread_ids(true);
 
-    // 文件输出：双击运行（GUI 子系统、无控制台）时唯一的可诊断手段
     if let Some((log_path, log_dir, file_name)) = resolve_log_target() {
-        // 按天滚动并只保留最近 7 个文件，避免日志无限增长
         let appender = match tracing_appender::rolling::Builder::new()
             .rotation(tracing_appender::rolling::Rotation::DAILY)
             .filename_prefix(file_name.clone())
@@ -765,8 +1894,6 @@ fn init_logging(level: &str) -> Option<tracing_appender::non_blocking::WorkerGua
     None
 }
 
-/// Windows: `windows_subsystem = "windows"` 不分配控制台，
-/// 但从 cmd/PowerShell 启动时，附着到父进程控制台就能直接看到日志。
 #[cfg(target_os = "windows")]
 fn attach_parent_console() {
     use windows::Win32::System::Console::{AttachConsole, ATTACH_PARENT_PROCESS};
@@ -778,7 +1905,6 @@ fn attach_parent_console() {
 #[cfg(not(target_os = "windows"))]
 fn attach_parent_console() {}
 
-/// 捕获 panic 并记录到日志；Windows 下额外弹窗提示
 fn install_panic_hook() {
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -795,7 +1921,6 @@ fn install_panic_hook() {
     }));
 }
 
-/// Windows: 弹原生错误对话框，避免 GUI 子系统下错误被静默吞掉
 #[cfg(target_os = "windows")]
 fn show_error_dialog(title: &str, message: &str) {
     use windows::core::{HSTRING, PCWSTR};
@@ -818,7 +1943,6 @@ fn show_error_dialog(title: &str, message: &str) {
 fn show_error_dialog(_title: &str, _message: &str) {}
 
 fn main() {
-    // 先附着父控制台（Windows），否则 GUI 子系统下看不到任何输出
     attach_parent_console();
 
     let args = Args::parse();
@@ -839,13 +1963,11 @@ fn main() {
 fn run(args: Args) -> anyhow::Result<()> {
     tracing::info!("Starting LiveTranslate Application");
 
-    // ONNX Runtime 动态库探测必须在创建任何线程/异步运行时之前完成：
-    // 它会写入进程级环境变量 ORT_DYLIB_PATH，多线程下与 env 读取并发存在 UB 风险。
+    // ONNX Runtime 动态库探测必须在创建任何线程/异步运行时之前完成
     audio::detector::prepare_ort_library();
 
     let (config, config_path) = match AppConfig::resolve(args.config.clone()) {
         Ok(resolved) => resolved,
-        // 显式指定的配置解析失败必须报错退出，否则 UI 改动会无处保存且提示误导
         Err(e) if args.config.is_some() => {
             tracing::error!("Failed to load config: {}", e);
             return Err(e.into());
@@ -871,6 +1993,15 @@ fn run(args: Args) -> anyhow::Result<()> {
     }
     tracing::debug!("Config: {:?}", config.redacted());
 
+    // 配置档首次启用时做非破坏性迁移（仅用户配置目录）
+    if let Some(path) = &config_path {
+        if profiles::profiles_enabled(Some(path)).0 {
+            if let Err(e) = profiles::ensure_initialized(path) {
+                tracing::warn!("Failed to initialize profiles: {e}");
+            }
+        }
+    }
+
     if args.list_devices {
         let runtime = tokio::runtime::Runtime::new()?;
         runtime.block_on(app::list_devices())?;
@@ -891,14 +2022,20 @@ fn run(args: Args) -> anyhow::Result<()> {
 
     let shared = Arc::new(SharedState::new(config.clone(), config_path.clone()));
 
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
         .system_tray(tray::create_system_tray())
         .on_system_tray_event(tray::handle_system_tray_event)
         .manage(shared)
+        .on_window_event(|event| {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event.event() {
+                if event.window().label() == "settings" {
+                    // 关闭设置页时只隐藏，保留窗口与前端状态
+                    api.prevent_close();
+                    let _ = event.window().hide();
+                }
+            }
+        })
         .setup(move |app| {
-            // macOS: 未打包为 .app 直接运行二进制时，应用不会被自动“激活”，
-            // 会导致窗口收不到鼠标/键盘事件（并伴随 IMKCFRunLoopWakeUpReliable 报错）。
-            // 显式设为 Regular 激活策略，让它作为前台应用运行。
             #[cfg(target_os = "macos")]
             {
                 app.set_activation_policy(tauri::ActivationPolicy::Regular);
@@ -908,7 +2045,6 @@ fn run(args: Args) -> anyhow::Result<()> {
                 .get_window("main")
                 .ok_or_else(|| anyhow::anyhow!("main window not found"))?;
 
-            // 以下步骤均“尽力而为”，失败不应阻止应用启动
             if let Err(e) = apply_window_config(&window, &config) {
                 tracing::warn!("Failed to apply window config: {e}");
             }
@@ -922,7 +2058,21 @@ fn run(args: Args) -> anyhow::Result<()> {
                 tracing::warn!("Failed to register global shortcuts (可能被其他程序占用): {e}");
             }
 
-            // 确保窗口可见并获取焦点
+            let handle = app.handle();
+            let state = handle.state::<Arc<SharedState>>();
+            if let Some(window) = app.get_window("main") {
+                if let Ok(registry) = state.sources.try_lock() {
+                    let _ = window.emit(
+                        SOURCE_STATUS_EVENT,
+                        SourcesPayload {
+                            sources: registry.status_items(),
+                            max_active_sources: state.config().audio.max_active_sources,
+                        },
+                    );
+                }
+                let _ = window.emit(OUTPUT_STATUS_EVENT, state.outputs.status());
+            }
+
             let _ = window.show();
             let _ = window.set_focus();
             Ok(())
@@ -937,6 +2087,36 @@ fn run(args: Args) -> anyhow::Result<()> {
             get_status,
             list_devices_command,
             set_device,
+            list_sources,
+            get_sources_config,
+            set_source_translate,
+            set_source_enabled,
+            set_source_device,
+            add_source,
+            update_source,
+            remove_source,
+            reorder_sources,
+            get_output_status,
+            set_output_enabled,
+            get_capabilities,
+            open_settings,
+            get_settings_schema,
+            save_settings,
+            preview_settings,
+            cancel_preview,
+            get_config_raw,
+            save_config_raw,
+            reload_config,
+            open_config_file,
+            open_config_folder,
+            get_profiles,
+            create_profile,
+            duplicate_profile,
+            rename_profile,
+            delete_profile,
+            switch_profile,
+            open_profiles_dir,
+            restart_pipeline,
             start_capture,
             stop_capture,
             close_overlay,
@@ -946,8 +2126,128 @@ fn run(args: Args) -> anyhow::Result<()> {
             persist_window_geometry,
             set_click_through,
         ])
-        .run(tauri::generate_context!())
+        .build(tauri::generate_context!())
         .map_err(|e| anyhow::anyhow!("Tauri runtime error: {e}"))?;
 
+    app.run(|app_handle, event| {
+        if let tauri::RunEvent::Exit = event {
+            let state = app_handle.state::<Arc<SharedState>>();
+            state.outputs.shutdown();
+        }
+    });
+
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn settings_changes_apply_scalars_and_sources() {
+        let mut config = AppConfig::default();
+        let changes = vec![
+            SettingChange {
+                path: "subtitle.font_size".to_string(),
+                value: json!(40),
+            },
+            SettingChange {
+                path: "translate.enabled".to_string(),
+                value: json!(false),
+            },
+            SettingChange {
+                path: "audio.sources".to_string(),
+                value: json!([{
+                    "id": "mic",
+                    "label": "麦克风",
+                    "device": "mic:0",
+                    "enabled": true,
+                    "translate": true,
+                    "language": ""
+                }]),
+            },
+        ];
+        let restart = apply_settings_changes(&mut config, &changes).unwrap();
+        assert!(restart, "输入源变更需要重启采集");
+        assert_eq!(config.subtitle.font_size, 40);
+        assert!(!config.translate.enabled);
+        assert_eq!(config.audio.sources.len(), 1);
+        assert_eq!(config.audio.sources[0].device, "mic:0");
+    }
+
+    #[test]
+    fn settings_changes_reject_unavailable_outputs() {
+        if cfg!(feature = "osc") {
+            return;
+        }
+        let mut config = AppConfig::default();
+        let changes = vec![SettingChange {
+            path: "output.osc.enabled".to_string(),
+            value: json!(true),
+        }];
+        assert!(apply_settings_changes(&mut config, &changes).is_err());
+    }
+
+    #[test]
+    fn history_limit_covers_all_outputs() {
+        let mut config = AppConfig::default();
+        config.subtitle.max_lines = 2;
+        config.output.steamvr.max_lines = 5;
+        config.output.osc.max_lines = 7;
+        assert_eq!(history_limit(&config), 7);
+    }
+
+    #[test]
+    fn desktop_entries_keep_only_configured_lines() {
+        let config = AppConfig {
+            subtitle: config::SubtitleConfig {
+                max_lines: 2,
+                ..AppConfig::default().subtitle
+            },
+            ..AppConfig::default()
+        };
+        let entries: Vec<_> = (0..4)
+            .map(|i| subtitle::DisplayLine {
+                source_id: "mic".into(),
+                label: None,
+                source: format!("s{i}"),
+                translated: format!("t{i}"),
+                lines: vec![format!("t{i}")],
+                text: format!("t{i}"),
+            })
+            .collect();
+        let kept = desktop_entries(entries, &config);
+        assert_eq!(kept.len(), 2);
+        assert_eq!(kept[0].text, "t2");
+        assert_eq!(kept[1].text, "t3");
+    }
+
+    #[test]
+    fn registry_sync_and_per_source_translate() {
+        let mut config = AppConfig::default();
+        config.audio.sources = vec![
+            AudioSourceConfig::new("mic", "麦克风", "mic:0"),
+            AudioSourceConfig::new("game", "游戏", "loopback:0"),
+        ];
+        let mut registry = SourceRegistry::from_config(&config);
+        assert_eq!(registry.runtimes.len(), 2);
+        assert!(registry.set_translate("mic", false));
+        assert!(!registry
+            .runtimes
+            .iter()
+            .find(|r| r.id == "mic")
+            .unwrap()
+            .translate_enabled());
+        assert!(registry
+            .runtimes
+            .iter()
+            .find(|r| r.id == "game")
+            .unwrap()
+            .translate_enabled());
+
+        config.audio.sources.remove(1);
+        registry.sync_config(&config);
+        assert_eq!(registry.runtimes.len(), 1);
+    }
 }
