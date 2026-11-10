@@ -6,9 +6,10 @@
 
 ## 特性
 
-✅ **音频采集**
+✅ **音频采集 / 多输入源**
 - 麦克风 / 系统回环采集（Windows 走 WASAPI Loopback）
-- 自动设备枚举，可在浮窗下拉框热切换
+- **任意数量的输入源并行**（上限可配）：每源独立翻译开关、独立识别语言、独立历史
+- 多源同时开启时输出自动带 `[来源]` 前缀（auto / always / never 可配）
 - 自动下混单声道 + 重采样到 16kHz
 
 ✅ **VAD 语音分段**
@@ -29,6 +30,15 @@
 - 字号滑块、原文开关，快捷键弹窗
 - 鼠标移出自动收起工具栏；开启点击穿透后只保留字幕
 - 字幕去重与重叠拼接（支持中文等无空格语言）
+
+✅ **独立设置页**
+- 覆盖配置文件全部字段（含多源表格、密钥、`extra_body`、原始 TOML）
+- 热字段即时生效，冷字段提示「需重启采集」
+- **多配置档**：新建 / 复制 / 重命名 / 删除 / 切换，切换后自动重启采集
+
+✅ **额外输出通道（Windows Full 版）**
+- **SteamVR Overlay**：头显内深色半透明字幕面板，跟随头部、逐行渐隐
+- **VRChat OSC Chatbox**：多条字幕合并成滚动字幕，超出 144 字符丢弃最早一条，含保守限流与 typing 指示
 
 ✅ **系统集成**
 - 系统托盘菜单 + 全局快捷键
@@ -76,7 +86,7 @@ cargo build --release
 # 设备选择（用 --list-devices 查看可用值）
 #   "default" / "microphone" / "loopback" / "mic:0" / "loopback:0" / "0" / 设备名模糊匹配
 # 回环采集仅 Windows 支持，用于捕获系统声音
-# 也可在浮窗顶部下拉框直接切换
+# 多源配置请使用 [[audio.sources]]；浮窗「源」面板可直接切换各源设备
 device_name = "default"
 # 音频分片时长（秒）
 chunk_seconds = 2.0
@@ -164,6 +174,48 @@ always_on_top = true
 click_through = false
 ```
 
+### v0.2 新增配置段
+
+完整的字段与注释见仓库内 [`config/default.toml`](config/default.toml)，主要新增：
+
+```toml
+[audio]
+max_active_sources = 4          # 同时采集的输入源上限
+
+[[audio.sources]]               # 多输入源（为空时回退到 audio.device_name）
+id = "mic"
+label = "麦克风"
+device = "default"
+enabled = true
+translate = true
+language = ""                   # 空 = 跟随全局识别语言
+
+[subtitle]
+label_sources = "auto"          # auto / always / never
+
+[output.steamvr]                # 仅 Windows Full 版
+enabled = false
+anchor = "hmd"
+width_m = 1.6
+distance_m = 1.6
+height_offset_m = -0.28
+font_size_px = 34
+line_alphas = [1.0, 0.72, 0.48]
+
+[output.osc]                    # 仅 Full 版
+enabled = false
+target = "127.0.0.1:9000"
+mode = "rolling"                # rolling / latest
+max_lines = 4
+max_chars = 144
+separator = "\n"
+min_interval_ms = 2000
+max_per_window = 4
+send_typing = true
+```
+
+> 这些字段都可以在**独立设置页**里编辑，不需要手动改文件。
+
 ## 浮窗面板
 
 工具栏从左右到依次是：
@@ -171,7 +223,8 @@ click_through = false
 | 控件 | 作用 |
 |------|------|
 | 状态灯 + 文本 | 显示运行状态 / 错误提示 |
-| 设备下拉框 | 切换音频输入设备（运行中会自动重启流水线） |
+| **源 (N)** | 打开输入源面板：逐源切换设备 / 翻译开关 / 启停状态 |
+| **⚙ 设置** | 打开独立设置窗口 |
 | **语言下拉框** | 选择识别语言，**切换后立即生效**（无需重启）；候选随 ASR 后端变化 |
 | **字号滑块** | 实时调整字幕文字大小（12–72），松手后写回配置文件 |
 | **原文开关** | 切换是否在译文上方显示原文，立即重绘当前字幕 |
@@ -192,6 +245,58 @@ click_through = false
 > 按住浮窗任意空白处可拖动窗口。
 > 字号与原文开关的修改会**就地写入配置文件并保留原有注释**；
 > 窗口位置目前仅本次运行有效，重启后仍以配置中的 `position_x/position_y` 为准。
+
+### 多输入源
+
+- 浮窗工具栏点 **源 (N)** 打开输入源面板：每行可切设备、开关该源翻译、启用/停用。
+- 完整的输入源表格（ID、展示名、语言覆盖、排序）在 **设置页 → 输入源**。
+- 同一设备不允许被两个启用中的源同时打开；冲突项会被跳过并在面板提示。
+- `audio.max_active_sources`（默认 4）限制同时采集数量，超出按列表顺序取前 N 个。
+- 多源同时运行时，字幕前会自动加 `[麦克风]` 这类来源前缀，可在
+  `subtitle.label_sources = "auto" | "always" | "never"` 中调整。
+
+### 设置页与配置档
+
+- 入口：浮窗工具栏 **⚙ 设置**、托盘菜单 **设置…**、快捷键 `Ctrl/⌘+Alt+,`。
+- 设置页是独立窗口，不受浮窗点击穿透影响；关闭时只隐藏，下次直接复用。
+- 保存采用 `toml_edit` 定点写入：**保留注释**，写入后重新解析校验，失败自动回滚。
+- 配置档存放于用户配置目录：
+  ```
+  config.toml            # 当前激活配置（唯一权威文件）
+  profiles.toml          # { active = "default" }
+  profiles/default.toml
+  profiles/vr.toml
+  ```
+  切换配置档 = 校验目标档 → 原子替换 `config.toml` → 重启采集。
+  使用 `--config <path>` 或便携模式时配置档会自动禁用并显示原因。
+- 首次启用配置档只做非破坏性迁移：把现有 `config.toml` 复制为 `profiles/default.toml`。
+
+### SteamVR Overlay（Windows Full 版）
+
+- 在 **设置页 → SteamVR Overlay** 开启，SteamVR 未启动时会后台重试连接。
+- 视觉：深色半透明圆角面板、原文小字 + 译文大字、来源 chip、按行渐隐、跟随头部。
+- 可调：锚点（hmd/world）、距离、高度偏移、宽度、曲率、透明度、字号、颜色、行透明度。
+- 使用系统字体渲染 CJK，无需内置字体包；SteamVR 仅支持 Windows。
+
+### VRChat OSC Chatbox（Full 版）
+
+1. VRChat：`Action Menu → Options → OSC → Enabled`
+2. 设置页 → **OSC / VRChat** → 启用，目标地址默认 `127.0.0.1:9000`。
+3. 默认 `mode = "rolling"`：把最近 4 条字幕合并成一段滚动字幕；
+   超出 144 字符时**丢弃最早的一条**，并按 Unicode 字符截断超长单条。
+4. 限流：最小间隔 2 秒 + 5 秒窗口最多 4 条（可调），避免触发 VRChat 冷却。
+5. 换行被客户端过滤时，把 `separator` 改成 `" | "` 即可，无需改代码。
+
+### 构建风味：标准版 / Full 版
+
+| 平台 | 包名 | SteamVR | OSC |
+|------|------|---------|-----|
+| Windows x64 | `...-windows-msvc.zip` | — | — |
+| Windows x64 | `...-windows-msvc-full.zip` | ✅ | ✅ |
+| Linux x64 / macOS | 标准包 | — | — |
+
+- 标准版不链接 `rosc` / `openvr` / `cosmic-text`，体积与 v0.1.6 基本持平。
+- 两个包共用同一份配置，互换不会丢设置。详见 [docs/BUILD_FLAVORS.md](docs/BUILD_FLAVORS.md)。
 
 ### 关闭推理模型的思考
 
@@ -464,6 +569,7 @@ DEBUG livetranslate::app: VAD 噪声底 ≈ -52.3 dBFS (speech 阈值 ≈ -44.3 
 | Linux | `~/.config/livetranslate/config.toml` |
 
 > 托盘菜单 → **打开配置目录** 可直接在文件管理器中打开该目录。
+> v0.2 起该目录下还会出现 `profiles/` 与 `profiles.toml`（多配置档，可选能力）。
 
 日志中会打印实际使用的配置路径，例如：
 ```
@@ -514,6 +620,7 @@ INFO livetranslate: Config file: config/default.toml
 | `Ctrl+Alt+R` | 开始采集 |
 | `Ctrl+Alt+E` | 停止采集 |
 | `Ctrl+Alt+T` | 切换点击穿透 |
+| `Ctrl+Alt+,` | 打开设置页 |
 | `Ctrl+Alt+Q` | 退出程序 |
 
 > 单击托盘图标可显示/隐藏浮窗；双击托盘图标可唤出浮窗。

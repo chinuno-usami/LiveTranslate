@@ -46,6 +46,11 @@ if [ -f "$ROOT_DIR/icons/icon.icns" ]; then
   cp "$ROOT_DIR/icons/icon.icns" "$APP_DIR/Contents/Resources/AppIcon.icns"
 fi
 
+# 构建风味说明（标准版 / Full 版差异）
+if [ -f "$ROOT_DIR/docs/BUILD_FLAVORS.md" ]; then
+  cp "$ROOT_DIR/docs/BUILD_FLAVORS.md" "$APP_DIR/Contents/Resources/BUILD_FLAVORS.md"
+fi
+
 # 随包附带 ONNX Runtime（供 silero VAD 后端使用）
 # 放在 Contents/Frameworks/ 下，程序启动时会自动发现
 if [ -n "$ORT_DIR" ]; then

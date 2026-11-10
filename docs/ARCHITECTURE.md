@@ -1,5 +1,13 @@
 # 项目结构与实现总结
 
+> v0.2 变更摘要
+> - `src/config.rs` → `src/config/{mod,writer,schema,profiles}.rs`
+> - 新增 `src/output/{mod,osc,steamvr/*}.rs`（SteamVR / OSC 双输出，feature gate）
+> - `app.rs`：单流水线 → 每源一条 `run_source`，事件带 `source_id/label`
+> - `main.rs`：`SharedState.config` 改为 `RwLock`，新增 `SourceRegistry` / `OutputManager` / 设置页命令
+> - 新增 `tauri-ui/settings.{html,js,css}` 独立设置窗口
+> - 配置档：`profiles/<name>.toml` + `profiles.toml`（`config.toml` 始终权威）
+
 ## 📁 项目文件结构
 
 ```
@@ -14,9 +22,17 @@ livetranslate/
 │   └── default.toml               # 配置文件示例
 │
 ├── src/
-│   ├── main.rs                    # 程序入口
-│   ├── app.rs                     # 应用核心逻辑
-│   ├── config.rs                  # 配置管理
+│   ├── main.rs                    # 程序入口 / Tauri 命令 / 共享状态
+│   ├── app.rs                     # 单源流水线 run_source / 事件
+│   ├── config/                    # 配置管理（结构体 / 写入 / schema / 配置档）
+│   │   ├── mod.rs
+│   │   ├── writer.rs              # toml_edit 定点写入 + 校验 + 回滚
+│   │   ├── schema.rs              # 设置页字段描述
+│   │   └── profiles.rs            # 多配置档
+│   ├── output/                    # 统一输出层
+│   │   ├── mod.rs                 # OutputManager
+│   │   ├── osc.rs                 # VRChat Chatbox（组包/限流/typing）
+│   │   └── steamvr/               # Overlay 线程 + cosmic-text 渲染 + stub
 │   ├── error.rs                   # 错误类型定义
 │   │
 │   ├── audio/                     # 音频采集模块

@@ -9,6 +9,10 @@
 #   <out-dir>/livetranslate-x86_64-pc-windows-msvc/
 #   <out-dir>/livetranslate-x86_64-pc-windows-msvc.zip
 #
+# 注意: 本脚本只产出标准版（无 SteamVR/OSC）。Full 版需要
+#       `--features extras`，且 openvr-sys 需要 CMake + MSVC，
+#       只能在 Windows 本机或 CI 的 Windows runner 上构建。
+#
 # 前置: 已安装 cargo-xwin（cargo install cargo-xwin）
 set -euo pipefail
 
@@ -37,7 +41,7 @@ cp "target/${TARGET}/release/${BIN_NAME}.exe" "$STAGE/"
 
 # 附带的配置样例（用户可直接编辑）
 [ -d config ] && cp -r config "$STAGE/"
-for f in README.md QUICKSTART.md; do
+for f in README.md QUICKSTART.md docs/BUILD_FLAVORS.md; do
   [ -f "$f" ] && cp "$f" "$STAGE/"
 done
 

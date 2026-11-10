@@ -19,16 +19,19 @@ git push origin v0.1.0
 
 推送 tag 后，workflow 会自动：
 
-1. 在三个平台并行构建 release 二进制
-   - `linux-x86_64` (Ubuntu 22.04)
-   - `windows-x86_64` (Windows Server)
-   - `macos-universal` (Apple Silicon + Intel 通用二进制)
+1. 构建 4 个产物（v0.2 起）
+   - `linux-x86_64` (Ubuntu 22.04) — 标准版
+   - `windows-x86_64` (Windows Server) — 标准版
+   - `windows-x86_64-full` (Windows Server) — **Full 版**（SteamVR + OSC）
+   - `macos-universal` (Apple Silicon + Intel 通用二进制) — 标准版
 2. 打包产物
-   - Linux → `tar.gz`
-   - Windows → `zip`
+   - Linux → `livetranslate-x86_64-unknown-linux-gnu.tar.gz`
+   - Windows → `livetranslate-x86_64-pc-windows-msvc.zip` / `...-full.zip`
    - macOS → **`LiveTranslate.app`**（ad-hoc 签名）+ `zip`
+   - 各包内均附 `BUILD_FLAVORS.md`
 3. 用 [git-cliff](https://git-cliff.org) 按提交信息生成本版本的 Release 说明
-4. 创建 GitHub Release 并上传全部产物
+4. Release 说明开头拼接 `docs/BUILD_FLAVORS.md`，明确标准版 / Full 版差异
+5. 创建 GitHub Release 并上传全部产物
 
 ## Release 说明（更新日志）
 

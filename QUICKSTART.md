@@ -180,6 +180,37 @@ curl http://127.0.0.1:8765/v1/models
 - 尝试减少 `max_lines` 的值
 - 重启程序
 
+## 🆕 v0.2：设置页 / 多输入源 / SteamVR / VRChat
+
+### 打开设置页
+
+浮窗工具栏 **⚙ 设置**、托盘菜单 **设置…**，或快捷键 `Ctrl/⌘+Alt+,`。
+设置页是独立窗口，覆盖配置文件全部字段，保存时保留注释并自动校验。
+
+### 多输入源
+
+1. 浮窗点 **源 (N)** → 每行切换设备 / 翻译开关；
+2. 或在设置页 **输入源** 表格里添加、排序、设置语言覆盖；
+3. 同时开启 ≥2 个源时，字幕自动带 `[麦克风]` 前缀（`subtitle.label_sources` 可调）。
+
+### VRChat OSC（Full 版）
+
+1. VRChat：`Action Menu → Options → OSC → Enabled`
+2. 设置页 → **OSC / VRChat** → 启用（目标默认 `127.0.0.1:9000`）
+3. 默认把最近 4 条字幕合并成滚动字幕；超过 144 字符丢弃最早一条
+4. 若 Chatbox 不换行，把 `separator` 改成 `" | "`
+
+### SteamVR Overlay（Windows Full 版）
+
+设置页 → **SteamVR Overlay** → 启用。可调跟随头部/世界坐标、距离、高度、宽度、
+曲率、透明度、字号与颜色。SteamVR 未启动时会自动重试。
+
+### 标准版 vs Full 版
+
+- 标准版：桌面浮窗 + 多源 + 设置页/配置档（无 SteamVR / OSC）
+- Full 版：额外包含 SteamVR + OSC，仅 Windows x64
+- 两包配置互通；详见 `docs/BUILD_FLAVORS.md`
+
 ## 📚 详细文档
 
 - **PLAN.md** - 完整技术方案
