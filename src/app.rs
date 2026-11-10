@@ -6,25 +6,45 @@ use crate::audio::segmenter::SpeechSegmenter;
 use crate::audio::AudioCapture;
 use crate::config::AppConfig;
 use crate::error::AppResult;
-use crate::subtitle::{Subtitle, SubtitleProcessor};
+use crate::output::OutputManager;
+use crate::subtitle::{SubtitleLine, SubtitleProcessor, SubtitleState};
 use crate::translate::OpenAiClient;
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{mpsc, watch};
 
+/// 单个输入源的运行时上下文
+#[derive(Clone)]
+pub struct SourceContext {
+    pub id: String,
+    pub label: String,
+    pub device: String,
+    /// 该源的识别语言（全局语言切换时会遍历所有源 send）
+    pub language: watch::Receiver<String>,
+    /// 该源的翻译开关（独立热切换）
+    pub translate: watch::Receiver<bool>,
+}
+
 /// 流水线输出事件
 #[derive(Debug, Clone)]
 pub enum PipelineEvent {
-    /// 一条可显示的字幕
-    Subtitle(Subtitle),
-    /// 供 UI 展示的提示/错误信息（用于避免“界面一片空白但不说原因”）
-    Notice(String),
+    /// 一条可显示的字幕（带来源）
+    Subtitle(SubtitleLine),
+    /// 供 UI 展示的提示/错误信息
+    Notice {
+        source_id: Option<String>,
+        message: String,
+    },
+    /// 单源运行状态变化
+    SourceState {
+        source_id: String,
+        running: bool,
+        message: String,
+    },
 }
 
 /// 音频分段策略
 enum Segmenter {
-    /// 基于 VAD 按语音边界切句（推荐）
     Vad(Box<SpeechSegmenter>),
-    /// 固定时长切片（回退方案）
     Fixed(Box<AudioChunker>),
 }
 
@@ -43,10 +63,9 @@ impl Segmenter {
         }
     }
 
-    /// 固定切片模式下需要跳过纯静音
     fn is_silence(&self, chunk: &[f32]) -> bool {
         match self {
-            Segmenter::Vad(_) => false, // VAD 已保证片段内有语音
+            Segmenter::Vad(_) => false,
             Segmenter::Fixed(c) => c.is_silence(chunk),
         }
     }
@@ -54,7 +73,6 @@ impl Segmenter {
 
 /// 打印服务端可用模型，用于确认是否存在非思考版本
 pub async fn list_models(config: &AppConfig) -> AppResult<()> {
-    // 翻译服务
     println!("翻译服务: {}", config.translate.base_url);
     let client = OpenAiClient::new(config.translate.clone());
     match client.list_models().await {
@@ -73,7 +91,6 @@ pub async fn list_models(config: &AppConfig) -> AppResult<()> {
         Err(e) => println!("  获取失败: {e}"),
     }
 
-    // 识别服务（可选，失败不影响退出码）
     if !config.asr.base_url.trim().is_empty() {
         println!();
         println!("识别服务: {}", config.asr.base_url);
@@ -111,65 +128,137 @@ pub async fn list_devices() -> AppResult<()> {
             );
         }
         println!();
-        println!("提示: 在 config/default.toml 中设置 device_name 为 [方括号] 内的值即可选择设备");
+        println!("提示: 在 config/default.toml 中设置 device_name 或 [[audio.sources]] 选择设备");
     }
     Ok(())
 }
 
+/// 控制台模式：同时跑所有启用中的源
 pub async fn start_console(config: AppConfig) -> AppResult<()> {
     let (tx, mut rx) = mpsc::channel(128);
     let (_stop_tx, stop_rx) = watch::channel(false);
 
-    // 控制台模式没有面板，语言直接取自配置（两个后端字段不同）
     let configured_language = if languages::is_edge_backend(&config.asr.backend) {
         config.asr.edge.language.clone()
     } else {
         config.asr.language.clone()
     };
-    let initial_language =
+    let global_language =
         languages::normalize_for_backend(&config.asr.backend, &configured_language);
-    let (_language_tx, language_rx) = watch::channel(initial_language);
-    let (_translate_tx, translate_rx) = watch::channel(config.translate.enabled);
 
-    tokio::spawn(async move {
-        if let Err(e) = run_pipeline(config, tx, stop_rx, language_rx, translate_rx).await {
-            tracing::error!("Audio processing error: {}", e);
-        }
-    });
+    let mut sources: Vec<_> = config
+        .audio
+        .effective_sources(config.translate.enabled)
+        .into_iter()
+        .filter(|s| s.enabled)
+        .take(config.audio.max_active_sources.max(1))
+        .collect();
+    sources.dedup_by(|a, b| a.device == b.device);
+
+    let outputs = OutputManager::new(&config.output);
+    let history_limit = config
+        .subtitle
+        .max_lines
+        .max(config.output.steamvr.max_lines)
+        .max(config.output.osc.max_lines)
+        .max(1);
+    let mut subtitle_state = SubtitleState::new(
+        history_limit,
+        config.subtitle.show_source,
+        config.subtitle.label_sources,
+    );
+    subtitle_state.set_active_labels(sources.iter().map(|s| s.label.clone()).collect());
+
+    for source in sources {
+        let language = if source.language.trim().is_empty() {
+            global_language.clone()
+        } else {
+            languages::normalize_for_backend(&config.asr.backend, &source.language)
+        };
+        let (language_tx, language_rx) = watch::channel(language);
+        let (translate_tx, translate_rx) = watch::channel(source.translate);
+        let context = SourceContext {
+            id: source.id.clone(),
+            label: source.label.clone(),
+            device: source.device.clone(),
+            language: language_rx,
+            translate: translate_rx,
+        };
+        let source_config = config.clone();
+        let source_tx = tx.clone();
+        let source_stop = stop_rx.clone();
+        tokio::spawn(async move {
+            // 保持发送端存活，避免 receiver.changed() 立即报错
+            let _language_tx = language_tx;
+            let _translate_tx = translate_tx;
+            if let Err(e) = run_source(source_config, context, source_tx, source_stop).await {
+                tracing::error!("Audio processing error: {}", e);
+            }
+        });
+    }
+    drop(tx);
 
     tracing::info!("Console pipeline running. Press Ctrl+C to stop.");
     while let Some(event) = rx.recv().await {
         match event {
-            PipelineEvent::Subtitle(s) if s.translated.is_empty() => {
-                tracing::info!("Subtitle: {}", s.source)
+            PipelineEvent::Subtitle(line) if line.translated.is_empty() => {
+                subtitle_state.push(line.clone());
+                outputs.publish(&subtitle_state.display_lines());
+                tracing::info!("[{}] {}", line.label, line.source)
             }
-            PipelineEvent::Subtitle(s) => {
-                tracing::info!("Subtitle: {} => {}", s.source, s.translated)
+            PipelineEvent::Subtitle(line) => {
+                subtitle_state.push(line.clone());
+                outputs.publish(&subtitle_state.display_lines());
+                tracing::info!("[{}] {} => {}", line.label, line.source, line.translated)
             }
-            PipelineEvent::Notice(n) => tracing::warn!("Notice: {}", n),
+            PipelineEvent::Notice { source_id, message } => {
+                tracing::warn!("Notice ({}): {}", source_id.unwrap_or_default(), message)
+            }
+            PipelineEvent::SourceState {
+                source_id,
+                running,
+                message,
+            } => {
+                tracing::info!(
+                    "Source {} {}: {}",
+                    source_id,
+                    if running { "started" } else { "stopped" },
+                    message
+                )
+            }
         }
     }
 
+    outputs.shutdown();
     Ok(())
 }
 
 /// 去重地发送 Notice，避免同一个错误每几秒刷屏
-async fn send_notice(tx: &mpsc::Sender<PipelineEvent>, last: &mut String, msg: String) {
+async fn send_notice(
+    tx: &mpsc::Sender<PipelineEvent>,
+    last: &mut String,
+    source_id: Option<&str>,
+    msg: String,
+) {
     if *last == msg {
         return;
     }
     *last = msg.clone();
-    let _ = tx.send(PipelineEvent::Notice(msg)).await;
+    let _ = tx
+        .send(PipelineEvent::Notice {
+            source_id: source_id.map(str::to_string),
+            message: msg,
+        })
+        .await;
 }
 
 /// 处理一个音频片段：ASR -> 翻译（可关闭）-> 去重 -> 发送
-///
-/// `translate_enabled = false` 时为仅识别模式，字幕的译文为空串。
-/// 返回 `Ok(false)` 表示接收端已关闭，流水线应结束。
 #[allow(clippy::too_many_arguments)]
 async fn process_segment(
     chunk: &[f32],
     sample_rate: u32,
+    source_id: &str,
+    label: &str,
     engine: &AsrEngine,
     translator: &OpenAiClient,
     translate_enabled: bool,
@@ -180,20 +269,20 @@ async fn process_segment(
 ) -> AppResult<bool> {
     match engine.transcribe(chunk, sample_rate).await {
         Ok(text) if !text.trim().is_empty() => {
-            // 音乐/噪声引起的幻听输出直接丢弃，既不显示也不翻译
             if filter_hallucination && !crate::asr::cleaner::is_meaningful_speech(&text) {
                 tracing::debug!("Dropped non-speech ASR output: {:?}", text);
                 return Ok(true);
             }
 
-            tracing::debug!("Recognized text: {}", text);
+            tracing::debug!("[{}] Recognized text: {}", label, text);
 
             let translated = if translate_enabled {
                 match translator.translate(&text).await {
                     Ok(translated) => translated,
                     Err(e) => {
                         tracing::error!("Translation failed: {}", e);
-                        send_notice(tx, last_notice, format!("翻译失败: {e}")).await;
+                        send_notice(tx, last_notice, Some(source_id), format!("翻译失败: {e}"))
+                            .await;
                         return Ok(true);
                     }
                 }
@@ -212,7 +301,9 @@ async fn process_segment(
                     processor.record(&text, &translated);
 
                     if tx
-                        .send(PipelineEvent::Subtitle(Subtitle::new(
+                        .send(PipelineEvent::Subtitle(SubtitleLine::new(
+                            source_id,
+                            label,
                             clean_text,
                             clean_trans,
                         )))
@@ -233,6 +324,7 @@ async fn process_segment(
             send_notice(
                 tx,
                 last_notice,
+                Some(source_id),
                 format!("ASR 失败（{} @ {}）: {e}", engine.name(), engine.endpoint()),
             )
             .await;
@@ -242,113 +334,135 @@ async fn process_segment(
     Ok(true)
 }
 
-pub async fn run_pipeline(
-    config: AppConfig,
+/// 单个输入源的完整流水线
+pub async fn run_source(
+    base: AppConfig,
+    source: SourceContext,
     tx: mpsc::Sender<PipelineEvent>,
     mut stop_rx: watch::Receiver<bool>,
-    language_rx: watch::Receiver<String>,
-    translate_rx: watch::Receiver<bool>,
 ) -> AppResult<()> {
-    tracing::info!("Starting audio pipeline");
+    tracing::info!(
+        "Starting audio pipeline for source {} ({}) device={}",
+        source.id,
+        source.label,
+        source.device
+    );
+
+    let _ = tx
+        .send(PipelineEvent::SourceState {
+            source_id: source.id.clone(),
+            running: true,
+            message: "采集中".to_string(),
+        })
+        .await;
 
     let mut last_notice = String::new();
 
-    // 配置健全性检查：这些是最常见的“看着在跑但其实没结果”的原因
-    let api_key = config.translate.api_key.trim();
-    let translate_enabled = *translate_rx.borrow();
-    tracing::info!(
-        "Mode: {}",
-        if translate_enabled {
-            "ASR + translate"
-        } else {
-            "ASR only"
-        }
-    );
+    let api_key = base.translate.api_key.trim();
+    let translate_enabled = *source.translate.borrow();
     if translate_enabled && (api_key.is_empty() || api_key == "YOUR_API_KEY") {
         send_notice(
             &tx,
             &mut last_notice,
-            "翻译 API Key 未配置：请在配置文件里设置 translate.api_key".to_string(),
+            Some(&source.id),
+            "翻译 API Key 未配置：请在设置页填写 translate.api_key".to_string(),
         )
         .await;
     }
 
-    let mut audio_capture = AudioCapture::new(
-        &config.audio.device_name,
-        config.audio.sample_rate,
-        config.audio.channels,
+    let mut audio_capture = match AudioCapture::new(
+        &source.device,
+        base.audio.sample_rate,
+        base.audio.channels,
     )
-    .await?;
+    .await
+    {
+        Ok(capture) => capture,
+        Err(e) => {
+            let _ = tx
+                .send(PipelineEvent::SourceState {
+                    source_id: source.id.clone(),
+                    running: false,
+                    message: format!("打开设备失败: {e}"),
+                })
+                .await;
+            return Err(e);
+        }
+    };
 
     let native_rate = audio_capture.native_sample_rate;
-    let target_rate = config.audio.sample_rate;
+    let target_rate = base.audio.sample_rate;
     let mut resampler = LinearResampler::new(native_rate, target_rate);
     tracing::info!(
-        "Resampling: {} Hz -> {} Hz (needed: {})",
+        "[{}] Resampling: {} Hz -> {} Hz (needed: {})",
+        source.label,
         native_rate,
         target_rate,
         resampler.is_needed()
     );
 
-    // VAD 分段之间没有重叠，只有固定分片模式需要做重叠去重
-    let overlap_removal = !config.vad.enabled;
-    let mut segmenter = if config.vad.enabled {
-        let (engine, warning) = VadEngine::from_config(&config.vad, target_rate);
+    let overlap_removal = !base.vad.enabled;
+    let mut segmenter = if base.vad.enabled {
+        let (engine, warning) = VadEngine::from_config(&base.vad, target_rate);
         tracing::info!(
-            "VAD enabled: backend={} frame_len={} min_speech={}ms min_silence={}ms max={}ms",
+            "[{}] VAD enabled: backend={} frame_len={} min_speech={}ms min_silence={}ms max={}ms",
+            source.label,
             engine.backend(),
             engine.frame_len(),
-            config.vad.min_speech_ms,
-            config.vad.min_silence_ms,
-            config.vad.max_speech_ms
+            base.vad.min_speech_ms,
+            base.vad.min_silence_ms,
+            base.vad.max_speech_ms
         );
-
-        // 例如请求了 silero 但缺 ONNX Runtime，这里会把原因告知用户
         if let Some(message) = warning {
-            send_notice(&tx, &mut last_notice, message).await;
+            send_notice(&tx, &mut last_notice, Some(&source.id), message).await;
         }
-
         Segmenter::Vad(Box::new(SpeechSegmenter::new(
-            &config.vad,
+            &base.vad,
             target_rate,
             engine,
         )))
     } else {
-        tracing::info!("VAD disabled: fixed {}s chunks", config.audio.chunk_seconds);
+        tracing::info!(
+            "[{}] VAD disabled: fixed {}s chunks",
+            source.label,
+            base.audio.chunk_seconds
+        );
         Segmenter::Fixed(Box::new(AudioChunker::new(
             target_rate,
-            config.audio.chunk_seconds,
+            base.audio.chunk_seconds,
             0.25,
-            config.audio.silence_threshold,
+            base.audio.silence_threshold,
         )?))
     };
 
-    let asr_engine = AsrEngine::from_config(&config.asr, language_rx)?;
+    let asr_engine = AsrEngine::from_config(&base.asr, source.language.clone())?;
     tracing::info!(
-        "ASR backend: {} ({}) language={}",
+        "[{}] ASR backend: {} ({}) language={}",
+        source.label,
         asr_engine.name(),
         asr_engine.endpoint(),
         asr_engine.language()
     );
 
-    // 把识别/翻译放到独立任务里：
-    // 网络请求可能耗时数秒，若直接在采集循环里 await，采集会被阻塞，
-    // 音频通道填满后 `try_send` 会静默丢样本——结果是片段残缺、请求延迟。
     let (utterance_tx, mut utterance_rx) = mpsc::channel::<Vec<f32>>(4);
-    let translate_client = OpenAiClient::new(config.translate.clone());
+    let translate_client = OpenAiClient::new(base.translate.clone());
     let worker_tx = tx.clone();
-    let filter_hallucination = config.asr.filter_hallucination;
+    let filter_hallucination = base.asr.filter_hallucination;
+    let worker_source_id = source.id.clone();
+    let worker_label = source.label.clone();
+    let translate_rx = source.translate.clone();
 
     let worker = tokio::spawn(async move {
         let mut subtitle_processor = SubtitleProcessor::new().with_overlap_removal(overlap_removal);
         let mut last_notice = String::new();
 
         while let Some(chunk) = utterance_rx.recv().await {
-            // 先取值再 await：watch::Ref 不是 Send，不能跨 await 持有
             let translate_enabled = *translate_rx.borrow();
             let keep_going = process_segment(
                 &chunk,
                 target_rate,
+                &worker_source_id,
+                &worker_label,
                 &asr_engine,
                 &translate_client,
                 translate_enabled,
@@ -361,34 +475,35 @@ pub async fn run_pipeline(
             .unwrap_or(true);
 
             if !keep_going {
-                tracing::warn!("Subtitle receiver dropped, stopping worker");
                 break;
             }
         }
     });
 
-    // 周期性打印噪声底，便于用户按环境调整 vad.margin_db
     let mut pushed_chunks: u64 = 0;
     let mut dropped_segments: u64 = 0;
 
     'capture: loop {
         tokio::select! {
             changed = stop_rx.changed() => {
-                // 发送端被丢弃也视为停止，避免 changed() 持续返回 Err 导致空转
                 if changed.is_err() || *stop_rx.borrow() {
-                    tracing::info!("Received stop signal for audio pipeline");
+                    tracing::info!("[{}] Received stop signal", source.label);
                     break;
                 }
             }
             samples = audio_capture.next_chunk() => {
-                // 音频通道关闭（设备拔出/流错误）：结束流水线而不是空转
                 let Some(samples) = samples else {
-                    tracing::warn!("Audio stream ended, stopping pipeline");
-                    send_notice(&tx, &mut last_notice, "音频输入已中断（设备断开？），已停止采集".to_string()).await;
+                    tracing::warn!("[{}] Audio stream ended", source.label);
+                    send_notice(
+                        &tx,
+                        &mut last_notice,
+                        Some(&source.id),
+                        "音频输入已中断（设备断开？），该源已停止".to_string(),
+                    )
+                    .await;
                     break 'capture;
                 };
 
-                // 下混已是单声道，这里做重采样到目标采样率
                 let mut resampled = Vec::new();
                 resampler.process(&samples, &mut resampled);
                 segmenter.push(&resampled);
@@ -398,14 +513,16 @@ pub async fn run_pipeline(
                     if let Segmenter::Vad(vad) = &mut segmenter {
                         if let Some(floor) = vad.noise_floor_db() {
                             tracing::debug!(
-                                "VAD 噪声底 ≈ {:.1} dBFS (speech 阈值 ≈ {:.1} dBFS)",
+                                "[{}] VAD 噪声底 ≈ {:.1} dBFS (speech 阈值 ≈ {:.1} dBFS)",
+                                source.label,
                                 floor,
-                                floor + config.vad.margin_db
+                                floor + base.vad.margin_db
                             );
                         }
                         if let Some(stats) = vad.stats() {
                             tracing::debug!(
-                                "Silero 最近概率: max={:.3} avg={:.3} 阈值(进/出)={:.2}/{:.2} active={}",
+                                "[{}] Silero 最近概率: max={:.3} avg={:.3} 阈值(进/出)={:.2}/{:.2} active={}",
+                                source.label,
                                 stats.max_prob,
                                 stats.avg_prob,
                                 stats.threshold,
@@ -423,14 +540,15 @@ pub async fn run_pipeline(
                     }
 
                     let ms = chunk.len() as u64 * 1000 / target_rate.max(1) as u64;
-                    tracing::info!("VAD segment ready: {} ms", ms);
+                    tracing::debug!("[{}] VAD segment ready: {} ms", source.label, ms);
 
                     match utterance_tx.try_send(chunk) {
                         Ok(()) => {}
                         Err(TrySendError::Full(_)) => {
                             dropped_segments += 1;
                             tracing::warn!(
-                                "识别速度跟不上，丢弃一个片段（累计 {} 个）",
+                                "[{}] 识别速度跟不上，丢弃一个片段（累计 {} 个）",
+                                source.label,
                                 dropped_segments
                             );
                         }
@@ -441,19 +559,24 @@ pub async fn run_pipeline(
         }
     }
 
-    // 采集结束：关闭发送端，等处理任务收尾
-    // 最多等待一小段时间让在途请求收尾，超时直接中止，避免停止操作卡住数分钟
     drop(utterance_tx);
     let mut worker = worker;
     if tokio::time::timeout(std::time::Duration::from_secs(2), &mut worker)
         .await
         .is_err()
     {
-        tracing::info!("Worker did not finish in time, aborting pending segments");
+        tracing::info!("[{}] Worker did not finish in time, aborting", source.label);
         worker.abort();
     }
 
     audio_capture.stop();
-    tracing::info!("Audio pipeline stopped");
+    let _ = tx
+        .send(PipelineEvent::SourceState {
+            source_id: source.id.clone(),
+            running: false,
+            message: "已停止".to_string(),
+        })
+        .await;
+    tracing::info!("[{}] Audio pipeline stopped", source.label);
     Ok(())
 }
