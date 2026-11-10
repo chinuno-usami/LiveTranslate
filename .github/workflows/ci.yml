@@ -22,6 +22,7 @@ jobs:
   check:
     name: Check & Test (${{ matrix.name }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -64,39 +65,67 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: cargo clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --locked --all-targets -- -D warnings
 
       - name: cargo check
-        run: cargo check --all-targets
+        run: cargo check --locked --all-targets
 
       - name: cargo test
-        run: cargo test --all-targets
+        run: cargo test --locked --all-targets
 
-      # ---- v0.2 双构建风味校验 ----
+      # ---- 构建风味校验 ----
 
-      - name: cargo check (osc, Linux/macOS)
+      - name: cargo check + clippy (osc)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo check --locked --all-targets --features osc
+          cargo clippy --locked --all-targets --features osc -- -D warnings
+
+      # 非 Windows 上 steamvr 走 stub.rs，这条路径必须被编译到
+      - name: cargo check + clippy (steamvr stub, 非 Windows)
         if: runner.os != 'Windows'
-        run: cargo check --all-targets --features osc
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo check --locked --all-targets --features steamvr
+          cargo clippy --locked --all-targets --features steamvr -- -D warnings
 
-      - name: cargo check (extras / Full)
+      - name: cargo check + clippy + test (extras / Full)
         if: runner.os == 'Windows'
-        run: cargo check --all-targets --features extras
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo check --locked --all-targets --features extras
+          cargo clippy --locked --all-targets --features extras -- -D warnings
+          cargo test --locked --all-targets --features extras
 
-      - name: cargo clippy (extras / Full)
-        if: runner.os == 'Windows'
-        run: cargo clippy --all-targets --features extras -- -D warnings
-
-      - name: cargo test (extras / Full)
-        if: runner.os == 'Windows'
-        run: cargo test --all-targets --features extras
+      # 关闭 silero-vad（无 ort/libloading）的降级路径
+      - name: cargo check (no default features)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo check --locked --all-targets --no-default-features --features custom-protocol
 
       # 标准包不能链接可选依赖（rosc / openvr / cosmic-text）
       - name: standard build excludes optional deps
         shell: bash
         run: |
           set -euo pipefail
-          if cargo tree --features custom-protocol | grep -E 'rosc|openvr|cosmic-text'; then
+          # 先独立落盘：cargo tree 失败时 set -e 直接终止，避免 grep 拿到空输入误判通过
+          cargo tree --locked --prefix none --features custom-protocol > /tmp/standard-tree.txt
+          if grep -E '^(rosc|openvr|cosmic-text)( |$)' /tmp/standard-tree.txt; then
             echo "::error::standard build must not link optional output dependencies"
             exit 1
           fi
           echo "ok: standard dependency tree is clean"
+
+      # 锁文件不得在 CI 中被隐式改写
+      - name: Cargo.lock is unchanged
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! git diff --exit-code -- Cargo.lock; then
+            echo "::error::Cargo.lock changed during the build; commit the resolved lock file"
+            exit 1
+          fi

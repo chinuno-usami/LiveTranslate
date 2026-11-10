@@ -26,7 +26,7 @@ livetranslate/
 │   ├── app.rs                     # 单源流水线 run_source / 事件
 │   ├── config/                    # 配置管理（结构体 / 写入 / schema / 配置档）
 │   │   ├── mod.rs
-│   │   ├── writer.rs              # toml_edit 定点写入 + 校验 + 回滚
+│   │   ├── writer.rs              # toml_edit 定点写入 + 先校验后落盘 + 写入串行化
 │   │   ├── schema.rs              # 设置页字段描述
 │   │   └── profiles.rs            # 多配置档
 │   ├── output/                    # 统一输出层

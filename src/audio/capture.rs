@@ -400,7 +400,7 @@ fn send_or_count(
 ) {
     if let Err(mpsc::error::TrySendError::Full(_)) = tx.try_send(data) {
         let n = dropped.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-        if n == 1 || n % 100 == 0 {
+        if n == 1 || n.is_multiple_of(100) {
             tracing::warn!(
                 "Audio consumer is lagging, dropped {} audio blocks so far",
                 n

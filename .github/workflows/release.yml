@@ -12,7 +12,7 @@ on:
         type: string
 
 permissions:
-  contents: write
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -28,6 +28,7 @@ jobs:
   build:
     name: Build ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
@@ -88,14 +89,16 @@ jobs:
 
       - name: Build (single target)
         if: matrix.target != 'universal-apple-darwin'
-        run: cargo build --release --features ${{ matrix.features }} --target ${{ matrix.target }}
+        run: cargo build --locked --release --features ${{ matrix.features }} --target ${{ matrix.target }}
 
       - name: Build (macOS universal)
         if: matrix.target == 'universal-apple-darwin'
+        env:
+          FEATURES: ${{ matrix.features }}
         run: |
           rustup target add aarch64-apple-darwin x86_64-apple-darwin
-          cargo build --release --features custom-protocol --target aarch64-apple-darwin
-          cargo build --release --features custom-protocol --target x86_64-apple-darwin
+          cargo build --locked --release --features "${FEATURES}" --target aarch64-apple-darwin
+          cargo build --locked --release --features "${FEATURES}" --target x86_64-apple-darwin
           mkdir -p target/universal/release
           lipo -create \
             target/aarch64-apple-darwin/release/${BIN_NAME} \
@@ -140,7 +143,7 @@ jobs:
             dist \
             "${{ matrix.target }}" \
             dist/onnxruntime
-          [ -f docs/BUILD_FLAVORS.md ] && cp docs/BUILD_FLAVORS.md dist/BUILD_FLAVORS.md
+          # BUILD_FLAVORS.md 已由 make-macos-app.sh 放进 Contents/Resources
           ls -lh dist
 
       - name: Package (Windows)
@@ -200,6 +203,9 @@ jobs:
     name: Publish Release
     needs: build
     runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
         with:
@@ -231,6 +237,11 @@ jobs:
           TAG: ${{ steps.tag.outputs.tag }}
         run: |
           version=$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"(.*)".*/\1/')
+          ui_version=$(python3 -c "import json;print(json.load(open('tauri.conf.json'))['package']['version'])")
+          if [ "${ui_version}" != "${version}" ]; then
+            echo "::error::tauri.conf.json version ${ui_version} does not match Cargo.toml ${version}"
+            exit 1
+          fi
           if [ "${TAG}" != "v${version}" ]; then
             echo "::error::tag ${TAG} does not match Cargo.toml version v${version}"
             exit 1
@@ -259,13 +270,20 @@ jobs:
           OUTPUT: RELEASE_NOTES.md
 
       - name: Compose release body (flavors + changelog)
+        env:
+          CHANGELOG_PATH: ${{ steps.cliff.outputs.changelog }}
         run: |
+          set -euo pipefail
           {
-            cat docs/BUILD_FLAVORS.md
+            if [ -f docs/BUILD_FLAVORS.md ]; then
+              cat docs/BUILD_FLAVORS.md
+            else
+              echo '(构建风味说明 docs/BUILD_FLAVORS.md 缺失)'
+            fi
             echo
             echo '---'
             echo
-            cat "${{ steps.cliff.outputs.changelog }}"
+            cat "${CHANGELOG_PATH}"
           } > RELEASE_BODY.md
 
       - name: Create GitHub Release

@@ -86,7 +86,8 @@ impl EnergyVad {
         // 但持续的背景噪声会在若干秒后把噪声底抬上来，从而退出语音态
         let sample_while_active = self.active && {
             self.active_frames += 1;
-            self.active_frames % Self::ACTIVE_UPDATE_INTERVAL == 0
+            self.active_frames
+                .is_multiple_of(Self::ACTIVE_UPDATE_INTERVAL)
         };
         if !self.active || sample_while_active || self.window.len() < Self::BOOTSTRAP_FRAMES {
             self.window.push_back(db);

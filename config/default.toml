@@ -213,6 +213,7 @@ text_color = "#FFFFFF"
 source_color = "#AEB8C4"
 label_color = "#7DD3FC"
 # 最新一行 / 第二行 / 更早行的不透明度（做渐隐）
+# 最新一行 → 更早行的淡出系数（三档，0–1）
 line_alphas = [1.0, 0.72, 0.48]
 # >0 时静音 N 秒后淡出（0 = 不自动隐藏）
 hide_on_silence_secs = 0
@@ -243,7 +244,8 @@ min_interval_ms = 2000
 max_per_window = 4
 # 采集期间发送 /chatbox/typing true
 send_typing = true
-# 额外自定义地址（可选）：发送 (text, source_id, label) 三个 string
+# 额外自定义地址（可选）：把 (text, source_id, label) 三个 string 发到
+# /livetranslate/subtitle，这里的值是 UDP 目标 host:port（不是 OSC 路径）
 custom_address = ""
 # 把组包结果写日志（调试用）
 debug_log = false

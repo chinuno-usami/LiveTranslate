@@ -2,7 +2,7 @@
 name = "livetranslate"
 version = "0.2.0"
 edition = "2021"
-rust-version = "1.70"
+rust-version = "1.89"
 
 [[bin]]
 name = "livetranslate"
@@ -41,7 +41,10 @@ toml = "0.8"
 toml_edit = "0.22"
 # OSC（仅 extras / osc feature）
 rosc = { version = "0.11", optional = true }
-# SteamVR 文本渲染（仅 steamvr feature；非 Windows 只用于构建 stub 之外的渲染代码）
+# SteamVR 文本渲染（仅 steamvr feature / Windows 真实实现使用）。
+# 有意放在全局依赖而非 [target.'cfg(windows)']：render.rs 是纯 Rust 代码，
+# 保持其在所有平台上可编译/可单测（CI 在 Linux/macOS 上也会 check --features steamvr）。
+# 因此 rust-version 需跟随 cosmic-text 的 MSRV（1.89）。
 cosmic-text = { version = "0.19", optional = true }
 
 # Audio
