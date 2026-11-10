@@ -10,7 +10,12 @@ const els = {
   statusText: document.getElementById('status-text'),
   emptyState: document.getElementById('empty-state'),
   subtitleLines: document.getElementById('subtitle-lines'),
-  deviceSelect: document.getElementById('device-select'),
+  sourcesBtn: document.getElementById('sources-btn'),
+  sourcesPopover: document.getElementById('sources-popover'),
+  sourcesList: document.getElementById('sources-list'),
+  sourcesClose: document.getElementById('sources-close'),
+  addSourceBtn: document.getElementById('add-source-btn'),
+  settingsBtn: document.getElementById('settings-btn'),
   languageSelect: document.getElementById('language-select'),
   fontSlider: document.getElementById('font-slider'),
   fontSizeValue: document.getElementById('font-size-value'),
@@ -82,8 +87,21 @@ function setStatus(running, message) {
   els.statusDot.classList.toggle('idle', !running);
 }
 
-function renderLines(lines) {
-  if (!lines || lines.length === 0) {
+/// 根据 source_id 稳定地映射到一个来源颜色（用于 chip）
+const SOURCE_COLORS = ['#7DD3FC', '#F0ABFC', '#FDE68A', '#6EE7B7', '#FCA5A5', '#C4B5FD'];
+function colorForSource(id) {
+  let hash = 0;
+  const text = String(id || '');
+  for (let i = 0; i < text.length; i += 1) {
+    hash = (hash * 31 + text.charCodeAt(i)) >>> 0;
+  }
+  return SOURCE_COLORS[hash % SOURCE_COLORS.length];
+}
+
+/// 渲染结构化字幕条目；后端行文本已含 [来源] 前缀，这里改用 chip 展示
+function renderLines(entries) {
+  const list = Array.isArray(entries) ? entries : [];
+  if (list.length === 0) {
     els.subtitleLines.style.display = 'none';
     els.emptyState.style.display = 'block';
     els.subtitleLines.innerHTML = '';
@@ -92,8 +110,22 @@ function renderLines(lines) {
 
   els.emptyState.style.display = 'none';
   els.subtitleLines.style.display = 'flex';
-  els.subtitleLines.innerHTML = lines
-    .map((line) => `<div class="subtitle-line">${escapeHtml(line)}</div>`)
+  els.subtitleLines.innerHTML = list
+    .map((entry) => {
+      const label = entry.label ? String(entry.label) : '';
+      const prefix = label ? `[${label}] ` : '';
+      const lines = (entry.lines || []).map((line) => {
+        const text = prefix && line.startsWith(prefix) ? line.slice(prefix.length) : line;
+        return escapeHtml(text);
+      });
+      const chip = label
+        ? `<span class="source-chip" style="--chip-color:${colorForSource(entry.source_id)}">${escapeHtml(label)}</span>`
+        : '';
+      const body = lines
+        .map((line, index) => `<div class="subtitle-line${index === 0 ? '' : ' subtitle-line-sub'}">${line}</div>`)
+        .join('');
+      return `<div class="subtitle-entry">${chip}${body}</div>`;
+    })
     .join('');
 }
 
@@ -347,32 +379,93 @@ function fatal(message) {
   }
 }
 
-async function loadDevices() {
+let lastSourcesPayload = null;
+
+function sourceRow(source, devices) {
+  const options = devices
+    .map(
+      (device) =>
+        `<option value="${escapeHtml(device.spec)}"${device.spec === source.device ? ' selected' : ''}>` +
+        `${escapeHtml(device.kind)} | ${escapeHtml(device.name)}</option>`,
+    )
+    .join('');
+  const known = devices.some((device) => device.spec === source.device);
+  const fallback = known
+    ? ''
+    : `<option value="${escapeHtml(source.device)}" selected>${escapeHtml(source.device)}（未找到）</option>`;
+  const dot = source.running ? 'running' : 'idle';
+
+  return `
+    <div class="source-row" data-id="${escapeHtml(source.id)}">
+      <span class="status-dot ${dot}"></span>
+      <span class="source-label" title="${escapeHtml(source.message || '')}">${escapeHtml(source.label)}</span>
+      <select class="device-select source-device" title="选择设备（切换会重启采集）">
+        ${fallback}${options}
+      </select>
+      <label class="source-toggle" title="该源是否翻译">
+        <input type="checkbox" class="source-translate" ${source.translate ? 'checked' : ''} />
+        <span>翻译</span>
+      </label>
+      <label class="source-toggle" title="是否参与采集（改动会重启采集）">
+        <input type="checkbox" class="source-enabled" ${source.enabled ? 'checked' : ''} />
+        <span>启用</span>
+      </label>
+    </div>`;
+}
+
+async function refreshSources() {
+  let payload;
+  let devicesPayload;
   try {
-    const payload = await invoke('list_devices_command');
-    const devices = payload.devices || [];
-    els.deviceSelect.innerHTML = '';
-
-    if (devices.length === 0) {
-      const opt = document.createElement('option');
-      opt.value = 'default';
-      opt.textContent = '未找到音频设备';
-      els.deviceSelect.appendChild(opt);
-      return;
-    }
-
-    for (const device of devices) {
-      const opt = document.createElement('option');
-      opt.value = device.spec;
-      opt.textContent = `${device.kind} | ${device.name}`;
-      if (device.spec === payload.current) {
-        opt.selected = true;
-      }
-      els.deviceSelect.appendChild(opt);
-    }
+    [payload, devicesPayload] = await Promise.all([
+      invoke('list_sources'),
+      invoke('list_devices_command'),
+    ]);
   } catch (error) {
-    console.error('加载设备失败', error);
+    console.error('加载输入源失败', error);
+    return;
   }
+  lastSourcesPayload = payload;
+  renderSources(payload, devicesPayload.devices || []);
+}
+
+function renderSources(payload, devices) {
+  const sources = (payload && payload.sources) || [];
+  if (sources.length === 0) {
+    els.sourcesList.innerHTML = '<div class="sources-empty">没有输入源</div>';
+    return;
+  }
+  els.sourcesList.innerHTML = sources.map((source) => sourceRow(source, devices)).join('');
+
+  els.sourcesList.querySelectorAll('.source-row').forEach((row) => {
+    const id = row.dataset.id;
+    row.querySelector('.source-device').addEventListener('change', async (event) => {
+      try {
+        await invoke('set_source_device', { id, spec: event.target.value });
+      } catch (error) {
+        console.error('切换设备失败', error);
+        setStatus(false, `切换设备失败: ${error}`);
+      }
+      refreshSources();
+    });
+    row.querySelector('.source-translate').addEventListener('change', async (event) => {
+      try {
+        await invoke('set_source_translate', { id, enabled: event.target.checked });
+      } catch (error) {
+        console.error('切换翻译失败', error);
+      }
+      refreshSources();
+    });
+    row.querySelector('.source-enabled').addEventListener('change', async (event) => {
+      try {
+        await invoke('set_source_enabled', { id, enabled: event.target.checked });
+      } catch (error) {
+        console.error('切换启用失败', error);
+        setStatus(false, `切换启用失败: ${error}`);
+      }
+      refreshSources();
+    });
+  });
 }
 
 /// 加载识别语言候选（随 ASR 后端不同，语言码格式也不同）
@@ -420,13 +513,29 @@ async function bindActions() {
     applyClickThroughToToolbar();
   });
 
-  els.deviceSelect.addEventListener('change', async () => {
-    const spec = els.deviceSelect.value;
+  els.sourcesBtn.addEventListener('click', async () => {
+    const hidden = els.sourcesPopover.classList.toggle('hidden');
+    if (!hidden) {
+      await refreshSources();
+    }
+  });
+  els.sourcesClose.addEventListener('click', () => {
+    els.sourcesPopover.classList.add('hidden');
+  });
+  els.addSourceBtn.addEventListener('click', async () => {
+    els.sourcesPopover.classList.add('hidden');
     try {
-      await invoke('set_device', { spec });
+      await invoke('open_settings');
     } catch (error) {
-      console.error('切换设备失败', error);
-      setStatus(false, `切换设备失败: ${error}`);
+      console.error('打开设置失败', error);
+    }
+  });
+  els.settingsBtn.addEventListener('click', async () => {
+    try {
+      await invoke('open_settings');
+    } catch (error) {
+      console.error('打开设置失败', error);
+      setStatus(false, `打开设置失败: ${error}`);
     }
   });
 
@@ -511,7 +620,34 @@ async function bindEvents() {
   }
 
   await listen('subtitle://update', (event) => {
-    renderLines(event.payload.lines || []);
+    renderLines(event.payload.entries || []);
+  });
+
+  await listen('source-status://update', (event) => {
+    const payload = event.payload || { sources: [] };
+    const count = (payload.sources || []).length;
+    if (els.sourcesBtn) {
+      els.sourcesBtn.textContent = count > 0 ? `源 (${count})` : '源';
+    }
+    if (!els.sourcesPopover.classList.contains('hidden')) {
+      invoke('list_devices_command')
+        .then((devices) => renderSources(payload, devices.devices || []))
+        .catch((error) => console.error('刷新输入源失败', error));
+    }
+  });
+
+  await listen('output-status://update', (event) => {
+    const payload = event.payload || {};
+    const messages = [];
+    if (payload.steamvr && payload.steamvr.enabled) {
+      messages.push(`SteamVR: ${payload.steamvr.message || (payload.steamvr.connected ? '已连接' : '等待连接')}`);
+    }
+    if (payload.osc && payload.osc.enabled) {
+      messages.push(`OSC: ${payload.osc.message || '已启用'}`);
+    }
+    if (messages.length > 0) {
+      els.statusText.title = messages.join(' / ');
+    }
   });
 
   await listen('status://update', (event) => {
@@ -612,7 +748,7 @@ window.addEventListener('DOMContentLoaded', async () => {
     console.error('bindEvents 失败', error);
   }
 
-  for (const step of [loadInitialConfig, loadInitialStatus, loadDevices, loadLanguages]) {
+  for (const step of [loadInitialConfig, loadInitialStatus, loadLanguages]) {
     try {
       await step();
     } catch (error) {

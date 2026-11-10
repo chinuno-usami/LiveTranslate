@@ -12,7 +12,7 @@
         <div class="status-group">
           <span id="status-dot" class="status-dot idle"></span>
           <span id="status-text">未启动</span>
-          <select id="device-select" class="device-select" title="选择音频输入设备"></select>
+          <button id="sources-btn" class="ghost-btn" title="管理输入源">源</button>
           <select id="language-select" class="device-select" title="选择识别语言（立即生效）"></select>
         </div>
 
@@ -40,8 +40,22 @@
           <button id="start-btn" class="ghost-btn">开始</button>
           <button id="stop-btn" class="ghost-btn">停止</button>
           <button id="through-btn" class="ghost-btn">穿透: 关</button>
+          <button id="settings-btn" class="ghost-btn" title="打开设置页 (Ctrl/Cmd+Alt+,)">⚙ 设置</button>
           <button id="help-btn" class="ghost-btn" title="查看快捷键">快捷键</button>
           <button id="close-btn" class="ghost-btn danger">关闭</button>
+        </div>
+      </div>
+
+      <!-- 输入源 popover：设备 / 逐源翻译开关 / 运行状态 -->
+      <div id="sources-popover" class="sources-popover hidden">
+        <div class="popover-header">
+          <span>输入源</span>
+          <button id="sources-close" class="ghost-btn">关闭</button>
+        </div>
+        <div id="sources-list" class="sources-list"></div>
+        <div class="popover-footer">
+          <button id="add-source-btn" class="ghost-btn">＋ 添加输入源…</button>
+          <span class="popover-hint">更多选项（语言覆盖、并发上限）在设置页</span>
         </div>
       </div>
 
@@ -74,6 +88,7 @@
             <tr><td><kbd>Ctrl</kbd>/<kbd>Cmd</kbd> + <kbd>Alt</kbd> + <kbd>R</kbd></td><td>开始采集</td></tr>
             <tr><td><kbd>Ctrl</kbd>/<kbd>Cmd</kbd> + <kbd>Alt</kbd> + <kbd>E</kbd></td><td>停止采集</td></tr>
             <tr><td><kbd>Ctrl</kbd>/<kbd>Cmd</kbd> + <kbd>Alt</kbd> + <kbd>T</kbd></td><td>切换点击穿透</td></tr>
+            <tr><td><kbd>Ctrl</kbd>/<kbd>Cmd</kbd> + <kbd>Alt</kbd> + <kbd>,</kbd></td><td>打开设置页</td></tr>
             <tr><td><kbd>Ctrl</kbd>/<kbd>Cmd</kbd> + <kbd>Alt</kbd> + <kbd>Q</kbd></td><td>退出程序</td></tr>
           </tbody>
         </table>
