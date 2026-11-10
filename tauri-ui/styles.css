@@ -455,8 +455,12 @@ kbd {
   font-size: 11px;
   line-height: 1.5;
   color: var(--chip-color, #7dd3fc);
+  /* 兜底色：color-mix() 需要 WebKit 16.2+（macOS 13.1），
+     声明支持更老的系统时不能让 chip 完全失去底色/描边 */
+  background: rgba(125, 211, 252, 0.16);
+  border: 1px solid rgba(125, 211, 252, 0.38);
   background: color-mix(in srgb, var(--chip-color, #7dd3fc) 18%, transparent);
-  border: 1px solid color-mix(in srgb, var(--chip-color, #7dd3fc) 45%, transparent);
+  border-color: color-mix(in srgb, var(--chip-color, #7dd3fc) 45%, transparent);
 }
 
 .sources-popover {

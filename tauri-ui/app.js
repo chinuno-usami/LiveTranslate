@@ -226,8 +226,12 @@ async function bindDrag() {
     if (event.button !== 0) {
       return;
     }
-    // 点在交互控件上时不拖动
-    if (event.target.closest('button, select, input, textarea, a, label')) {
+    // 点在交互控件或浮层（输入源面板 / 帮助）上时不拖动
+    if (
+      event.target.closest(
+        'button, select, input, textarea, a, label, .popover, .modal, .help-modal, #sources-popover',
+      )
+    ) {
       return;
     }
     event.preventDefault();
@@ -380,6 +384,10 @@ function fatal(message) {
 }
 
 let lastSourcesPayload = null;
+/// 后端当前生效的浮窗配置（用于失败时回滚乐观更新）
+let lastConfig = {};
+/// 后端当前生效的识别语言
+let lastLanguage = '';
 
 function sourceRow(source, devices) {
   const options = devices
@@ -411,6 +419,23 @@ function sourceRow(source, devices) {
         <span>启用</span>
       </label>
     </div>`;
+}
+
+/// 按 id 就地更新状态点与提示，不重建 DOM
+function updateSourceRows(sources) {
+  if (lastSourcesPayload) {
+    lastSourcesPayload = { ...lastSourcesPayload, sources };
+  }
+  for (const source of sources) {
+    const row = els.sourcesList.querySelector(
+      `.source-row[data-id="${CSS.escape(String(source.id))}"]`,
+    );
+    if (!row) continue;
+    const dot = row.querySelector('.status-dot');
+    if (dot) dot.className = `status-dot ${source.running ? 'running' : 'idle'}`;
+    const label = row.querySelector('.source-label');
+    if (label) label.title = source.message || '';
+  }
 }
 
 async function refreshSources() {
@@ -453,6 +478,8 @@ function renderSources(payload, devices) {
         await invoke('set_source_translate', { id, enabled: event.target.checked });
       } catch (error) {
         console.error('切换翻译失败', error);
+        setStatus(false, `切换翻译失败: ${error}`);
+        event.target.checked = !event.target.checked;
       }
       refreshSources();
     });
@@ -473,6 +500,7 @@ async function loadLanguages() {
   try {
     const payload = await invoke('list_languages');
     const options = payload.options || [];
+    lastLanguage = payload.current || '';
     els.languageSelect.innerHTML = '';
 
     if (options.length === 0) {
@@ -515,12 +543,14 @@ async function bindActions() {
 
   els.sourcesBtn.addEventListener('click', async () => {
     const hidden = els.sourcesPopover.classList.toggle('hidden');
+    els.sourcesBtn.setAttribute('aria-expanded', hidden ? 'false' : 'true');
     if (!hidden) {
       await refreshSources();
     }
   });
   els.sourcesClose.addEventListener('click', () => {
     els.sourcesPopover.classList.add('hidden');
+    els.sourcesBtn.setAttribute('aria-expanded', 'false');
   });
   els.addSourceBtn.addEventListener('click', async () => {
     els.sourcesPopover.classList.add('hidden');
@@ -546,6 +576,7 @@ async function bindActions() {
       await invoke('set_language', { code });
     } catch (error) {
       console.error('切换语言失败', error);
+      if (lastLanguage) els.languageSelect.value = lastLanguage;
       setStatus(false, `切换语言失败: ${error}`);
     }
   });
@@ -564,6 +595,9 @@ async function bindActions() {
       await invoke('set_font_size', { size });
     } catch (error) {
       console.error('保存字号失败', error);
+      // 浮窗已经按新字号渲染了，回退到后端仍生效的值，避免“幽灵设置”
+      applyFontSize(lastConfig.font_size || 28);
+      setStatus(false, `保存字号失败: ${error}`);
     }
   });
 
@@ -608,6 +642,8 @@ async function bindActions() {
   document.addEventListener('keydown', (event) => {
     if (event.key === 'Escape') {
       els.helpModal.classList.add('hidden');
+      els.sourcesPopover.classList.add('hidden');
+      els.sourcesBtn.setAttribute('aria-expanded', 'false');
       applyClickThroughToToolbar();
     }
   });
@@ -630,9 +666,9 @@ async function bindEvents() {
       els.sourcesBtn.textContent = count > 0 ? `源 (${count})` : '源';
     }
     if (!els.sourcesPopover.classList.contains('hidden')) {
-      invoke('list_devices_command')
-        .then((devices) => renderSources(payload, devices.devices || []))
-        .catch((error) => console.error('刷新输入源失败', error));
+      // 只做行级局部更新：重建整块 DOM 会摧毁正在展开的 <select> 与焦点，
+      // 而源状态变化恰好发生在用户刚操作完之后。设备列表也不该每次重新枚举。
+      updateSourceRows(payload.sources || []);
     }
   });
 
@@ -647,6 +683,8 @@ async function bindEvents() {
     }
     if (messages.length > 0) {
       els.statusText.title = messages.join(' / ');
+    } else {
+      els.statusText.removeAttribute('title');
     }
   });
 
@@ -656,6 +694,7 @@ async function bindEvents() {
 
   await listen('config://subtitle', (event) => {
     const config = event.payload;
+    lastConfig = { ...config };
     applyFontSize(Number(config.font_size) || 28);
     applyShowSource(config.show_source);
     applyTranslateEnabled(config.translate_enabled);

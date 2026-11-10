@@ -51,9 +51,11 @@ function deepClone(value) {
   return JSON.parse(JSON.stringify(value));
 }
 
+const STATUS_CLASS = { ok: 'ok', err: 'err' };
+
 function setStatus(message, kind) {
   els.status.textContent = message;
-  els.status.className = kind === 'ok' ? 'ok' : kind === 'err' ? 'err' : '';
+  els.status.className = STATUS_CLASS[kind] || '';
 }
 
 function showError(message) {
@@ -165,6 +167,15 @@ function selectedProfile() {
 
 async function switchProfile(name) {
   if (!name) return;
+  if (state.dirty.size > 0) {
+    const ok = window.confirm(
+      `当前有 ${state.dirty.size} 项未保存的修改，切换配置档将丢弃它们。继续？`,
+    );
+    if (!ok) {
+      renderProfileBar();
+      return;
+    }
+  }
   if (!window.confirm(`切换到配置档「${name}」将重启采集并替换当前配置，继续？`)) {
     renderProfileBar();
     return;
@@ -174,7 +185,10 @@ async function switchProfile(name) {
     setStatus(result.message || '已切换配置档', 'ok');
     state.profiles = await invoke('get_profiles');
     renderProfileBar();
+    // 旧配置档的未保存编辑不能带进新配置档
+    state.dirty.clear();
     await refreshSchemaOnly();
+    updateDirtyIndicator();
   } catch (error) {
     console.error(error);
     showError(`切换配置档失败: ${error}`);
@@ -390,9 +404,9 @@ function renderControl(field, value) {
     return value
       .map(
         (item, index) =>
-          `<input type="number" data-path="${path}" data-array-index="${index}" step="0.01" value="${escapeHtml(
+          `<input type="number" class="array-input" data-path="${path}" data-array-index="${index}" step="0.01" value="${escapeHtml(
             item,
-          )}" style="min-width:80px;max-width:90px" />`,
+          )}" />`,
       )
       .join('');
   }
@@ -408,8 +422,9 @@ function renderControl(field, value) {
         field.step != null ? `step="${field.step}"` : ''
       } />`;
     case 'secret':
-      return `<input type="text" data-path="${path}" value="${escapeHtml(value)}" spellcheck="false" />
-        <button class="btn small" data-secret-toggle="${path}">隐藏</button>`;
+      // 默认遮蔽：密钥不该在不经意间被旁人/录屏看到
+      return `<input type="password" data-path="${path}" value="${escapeHtml(value)}" spellcheck="false" autocomplete="off" />
+        <button class="btn small" data-secret-toggle="${path}">显示</button>`;
     case 'enum':
       return `<select data-path="${path}">${(field.options || [])
         .map(
@@ -640,28 +655,39 @@ function markSourcesDirty() {
   validateSources();
 }
 
-function validateSources() {
-  const box = document.getElementById('sources-error');
-  if (!box) return [];
+/**
+ * 输入源校验（纯函数）。
+ * 不依赖 DOM：设置页切到别的分组时 #sources-error 不在文档里，
+ * 旧实现会因此返回“无错误”，把非法配置直接交给后端。
+ */
+function collectSourceErrors(sources) {
   const errors = [];
   const ids = new Set();
   const devices = new Set();
-  for (const source of state.sources) {
-    if (!source.id) errors.push('输入源 ID 不能为空');
-    if (!/^[A-Za-z0-9_-]{1,32}$/.test(source.id || '')) {
-      errors.push(`ID「${source.id}」只能包含字母、数字、下划线、短横线，且不超过 32 字符`);
+  sources.forEach((source, index) => {
+    const row = `输入源 #${index + 1}`;
+    const id = String(source.id || '');
+    if (!id) errors.push(`${row}: ID 不能为空`);
+    if (!/^[A-Za-z0-9_-]{1,32}$/.test(id)) {
+      errors.push(`${row}: ID「${id}」只能包含字母、数字、下划线、短横线，且不超过 32 字符`);
     }
-    if (ids.has(source.id)) errors.push(`ID「${source.id}」重复`);
-    ids.add(source.id);
-    if (!source.label.trim()) errors.push(`输入源「${source.id}」展示名不能为空`);
-    if (source.enabled && source.device) {
-      if (devices.has(source.device)) {
-        errors.push(`设备「${source.device}」被多个启用中的输入源占用`);
-      }
-      devices.add(source.device);
+    if (ids.has(id)) errors.push(`${row}: ID「${id}」重复`);
+    ids.add(id);
+    if (!String(source.label || '').trim()) errors.push(`${row}: 展示名不能为空`);
+    const device = String(source.device || '').trim();
+    if (source.enabled && !device) errors.push(`${row}: 启用中的输入源必须指定设备`);
+    if (source.enabled && device) {
+      if (devices.has(device)) errors.push(`${row}: 设备「${device}」被多个启用中的输入源占用`);
+      devices.add(device);
     }
-  }
-  box.textContent = errors.join('；');
+  });
+  return errors;
+}
+
+function validateSources() {
+  const errors = collectSourceErrors(state.sources);
+  const box = document.getElementById('sources-error');
+  if (box) box.textContent = errors.join('；');
   return errors;
 }
 
@@ -743,10 +769,6 @@ function bindFieldEvents() {
       state.dirty.set(path, value);
       updateDirtyIndicator();
 
-      if (path === 'translate.extra_body' || element.dataset.toml) {
-        // TOML 文本原样提交，后端负责解析
-      }
-
       if (element.type === 'text' && path && isColorPath(path)) {
         updateColorPreview(path, element.value);
       }
@@ -800,8 +822,16 @@ function updateColorPreview(path, value) {
 function updateDirtyIndicator() {
   const count = state.dirty.size;
   els.save.textContent = count > 0 ? `保存（${count} 项修改）` : '保存';
-  if (count > 0 && els.status.textContent === '就绪') {
+  els.save.classList.toggle('primary', count > 0);
+  const wasDirty = state.wasDirty === true;
+  state.wasDirty = count > 0;
+  if (count > 0 && !wasDirty) {
     setStatus(`有 ${count} 项未保存的修改`);
+  } else if (count === 0 && wasDirty) {
+    setStatus('就绪');
+  } else if (count > 0) {
+    // 计数变化时刷新文案（旧实现会永久冻结在第一次的数字上）
+    els.status.textContent = `有 ${count} 项未保存的修改`;
   }
 }
 
@@ -834,20 +864,67 @@ function schedulePreview(changedPath) {
 
 // ---------------- 保存 / 取消 / 重载 ----------------
 
+function findField(path) {
+  const normalized = path.replace(/\[\]$/, '');
+  for (const group of state.schema?.groups || []) {
+    for (const field of group.fields || []) {
+      if (field.path === path || field.path === normalized) return field;
+    }
+  }
+  return null;
+}
+
+/**
+ * 数值字段的本地校验：HTML 的 min/max 只约束步进箭头，手输仍然可以越界。
+ * 一条非法值会让后端整批保存失败，用户还得逐项排查。
+ */
+function validateNumbers(changes) {
+  const errors = [];
+  for (const change of changes) {
+    const field = findField(change.path);
+    if (!field || !['int', 'float', 'number'].includes(field.kind)) continue;
+    const value = change.value;
+    if (typeof value !== 'number' || !Number.isFinite(value)) {
+      errors.push(`${field.label} 必须是数字`);
+      continue;
+    }
+    if (field.kind === 'int' && !Number.isInteger(value)) {
+      errors.push(`${field.label} 必须是整数`);
+    }
+    if (field.min != null && value < field.min) {
+      errors.push(`${field.label} 不能小于 ${field.min}`);
+    }
+    if (field.max != null && value > field.max) {
+      errors.push(`${field.label} 不能大于 ${field.max}`);
+    }
+  }
+  return errors;
+}
+
 async function save() {
-  const sourceErrors = validateSources();
-  if (sourceErrors.length > 0) {
-    showError(`输入源校验失败：${sourceErrors.join('；')}`);
+  const changes = [...state.dirty].map(([path, value]) => ({ path, value }));
+  const errors = [...collectSourceErrors(state.sources), ...validateNumbers(changes)];
+  if (errors.length > 0) {
+    showError(`校验失败：${errors.join('；')}`);
+    setStatus('校验失败', 'err');
     return;
   }
-  const changes = [...state.dirty].map(([path, value]) => ({ path, value }));
   if (changes.length === 0) {
     setStatus('没有需要保存的修改');
     return;
   }
 
+  els.save.disabled = true;
   try {
-    const result = await invoke('save_settings', { changes });
+    let result;
+    try {
+      result = await invoke('save_settings', { changes });
+    } catch (error) {
+      console.error(error);
+      showError(`保存失败: ${error}`);
+      setStatus('保存失败', 'err');
+      return;
+    }
     state.dirty.clear();
     state.originalSourcesJson = JSON.stringify(state.sources);
     setStatus(result.message || '已保存', 'ok');
@@ -857,12 +934,17 @@ async function save() {
     } else {
       els.restartBanner.classList.add('hidden');
     }
-    await refreshSchemaOnly();
     updateDirtyIndicator();
-  } catch (error) {
-    console.error(error);
-    showError(`保存失败: ${error}`);
-    setStatus('保存失败', 'err');
+    // 刷新失败不能报成“保存失败”：配置已经落盘了
+    try {
+      await refreshSchemaOnly();
+      updateDirtyIndicator();
+    } catch (error) {
+      console.warn(error);
+      showError('已保存，但界面刷新失败，请点「重新加载」');
+    }
+  } finally {
+    els.save.disabled = false;
   }
 }
 
@@ -876,7 +958,12 @@ async function cancel() {
   }
   els.restartBanner.classList.add('hidden');
   showError('');
-  await refreshSchemaOnly();
+  try {
+    await refreshSchemaOnly();
+  } catch (error) {
+    console.warn(error);
+    showError('已恢复配置，但界面刷新失败，请点「重新加载」');
+  }
   updateDirtyIndicator();
   setStatus('已放弃未保存的修改');
 }
@@ -918,6 +1005,17 @@ function bindTopbar() {
   });
 }
 
+async function reloadOnShow() {
+  if (state.dirty.size > 0) {
+    const keep = window.confirm(
+      `有 ${state.dirty.size} 项未保存的修改。确定 = 保留并继续编辑；取消 = 丢弃并重新加载。`,
+    );
+    if (keep) return;
+  }
+  state.dirty.clear();
+  await loadAll();
+}
+
 window.addEventListener('DOMContentLoaded', async () => {
   if (typeof invoke !== 'function') {
     document.body.innerHTML =
@@ -926,4 +1024,14 @@ window.addEventListener('DOMContentLoaded', async () => {
   }
   bindTopbar();
   await loadAll();
+  // 设置窗口关闭只是 hide()，前端状态会一直活着；
+  // 不重新拉取的话，用户会拿启动时的快照去覆盖浮窗里的改动。
+  if (window.__TAURI__?.event?.listen) {
+    await window.__TAURI__.event.listen('settings://shown', () => {
+      reloadOnShow().catch((error) => {
+        console.error(error);
+        showError(`重新加载失败: ${error}`);
+      });
+    });
+  }
 });

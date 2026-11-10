@@ -12,7 +12,7 @@
         <div class="status-group">
           <span id="status-dot" class="status-dot idle"></span>
           <span id="status-text">未启动</span>
-          <button id="sources-btn" class="ghost-btn" title="管理输入源">源</button>
+          <button id="sources-btn" class="ghost-btn" title="管理输入源" aria-expanded="false" aria-controls="sources-popover">源</button>
           <select id="language-select" class="device-select" title="选择识别语言（立即生效）"></select>
         </div>
 
@@ -47,7 +47,7 @@
       </div>
 
       <!-- 输入源 popover：设备 / 逐源翻译开关 / 运行状态 -->
-      <div id="sources-popover" class="sources-popover hidden">
+      <div id="sources-popover" class="sources-popover hidden" role="dialog" aria-label="输入源">
         <div class="popover-header">
           <span>输入源</span>
           <button id="sources-close" class="ghost-btn">关闭</button>

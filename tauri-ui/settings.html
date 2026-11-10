@@ -19,18 +19,18 @@
         <span id="profile-reason" class="hint"></span>
       </div>
       <div class="top-actions">
-        <input id="search" class="search" type="search" placeholder="搜索设置项…" />
+        <input id="search" class="search" type="search" aria-label="搜索设置项" placeholder="搜索设置项…" />
         <button id="reload-btn" class="btn">重新加载</button>
         <button id="cancel-btn" class="btn">取消</button>
         <button id="save-btn" class="btn primary">保存</button>
       </div>
     </header>
 
-    <div id="restart-banner" class="banner hidden">
+    <div id="restart-banner" class="banner hidden" role="status" aria-live="polite">
       <span>部分修改需要重启采集后生效。</span>
       <button id="restart-btn" class="btn small">立即重启采集</button>
     </div>
-    <div id="error-banner" class="banner error hidden"></div>
+    <div id="error-banner" class="banner error hidden" role="alert"></div>
 
     <div class="layout">
       <nav id="group-nav" class="group-nav"></nav>
@@ -38,7 +38,7 @@
     </div>
 
     <footer class="statusbar">
-      <span id="save-status">加载中…</span>
+      <span id="save-status" role="status" aria-live="polite">加载中…</span>
       <span id="config-path" class="hint"></span>
     </footer>
 
