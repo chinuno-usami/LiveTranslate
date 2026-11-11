@@ -71,7 +71,6 @@ pub(crate) fn write_atomic_unlocked(path: &Path, content: &str) -> Result<(), St
             fs::create_dir_all(parent).map_err(|e| format!("创建目录失败: {e}"))?;
         }
     }
-    let orig_meta = fs::metadata(target).ok();
     let tmp = tmp_path_for(target);
     if let Err(e) = write_file_durable(&tmp, content.as_bytes()) {
         let _ = fs::remove_file(&tmp);
@@ -79,20 +78,14 @@ pub(crate) fn write_atomic_unlocked(path: &Path, content: &str) -> Result<(), St
     }
     // Unix 下保留原文件非只读的自定义权限位（write_file_durable 默认已按 0600 创建）
     #[cfg(unix)]
-    if let Some(meta) = &orig_meta {
+    if let Ok(meta) = fs::metadata(target) {
         if !meta.permissions().readonly() {
             let _ = fs::set_permissions(&tmp, meta.permissions());
         }
     }
     // Windows 下目标文件带只读属性时 MoveFileExW 会拒绝覆盖，需先解除目标只读位
     #[cfg(windows)]
-    if let Some(meta) = &orig_meta {
-        let mut perms = meta.permissions();
-        if perms.readonly() {
-            perms.set_readonly(false);
-            let _ = fs::set_permissions(target, perms);
-        }
-    }
+    clear_readonly(target);
     if let Err(e) = fs::rename(&tmp, target) {
         let _ = fs::remove_file(&tmp);
         return Err(format!("替换配置文件失败: {e}"));
@@ -101,6 +94,24 @@ pub(crate) fn write_atomic_unlocked(path: &Path, content: &str) -> Result<(), St
     // 否则掉电后可能留下一个长度为 0 的配置文件（里面存着 api_key）。
     sync_parent_dir(target);
     Ok(())
+}
+
+/// 清除 Windows 只读属性（`FILE_ATTRIBUTE_READONLY`），让随后的 rename 能覆盖目标。
+///
+/// `Permissions::set_readonly(false)` 在 Unix 上等价于 `chmod a+w`，因此 clippy 的
+/// `permissions_set_readonly_false` 会报警。这段代码只在 `cfg(windows)` 下编译，
+/// 那里它仅去掉只读属性位、不动 ACL，正是我们想要的行为，所以按需放行该 lint。
+#[cfg(windows)]
+#[allow(clippy::permissions_set_readonly_false)]
+fn clear_readonly(target: &Path) {
+    let Ok(meta) = fs::metadata(target) else {
+        return;
+    };
+    let mut perms = meta.permissions();
+    if perms.readonly() {
+        perms.set_readonly(false);
+        let _ = fs::set_permissions(target, perms);
+    }
 }
 
 fn write_file_durable(path: &Path, content: &[u8]) -> std::io::Result<()> {
@@ -154,13 +165,7 @@ pub fn backup(path: &Path) -> Result<Option<PathBuf>, String> {
     name.push(".bak");
     let backup = PathBuf::from(name);
     #[cfg(windows)]
-    if let Ok(meta) = fs::metadata(&backup) {
-        let mut perms = meta.permissions();
-        if perms.readonly() {
-            perms.set_readonly(false);
-            let _ = fs::set_permissions(&backup, perms);
-        }
-    }
+    clear_readonly(&backup);
     write_file_durable(&backup, &bytes).map_err(|e| format!("备份配置失败: {e}"))?;
     Ok(Some(backup))
 }

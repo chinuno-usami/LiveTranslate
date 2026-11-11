@@ -313,7 +313,9 @@ impl Renderer {
         }
 
         if config.swap_red_blue {
-            for pixel in canvas.chunks_exact_mut(4) {
+            // 用 `as_chunks_mut` 而不是 `chunks_exact_mut(4)`：常量分块在 clippy 里会提示换成
+            // `as_chunks*`（`chunks-exact-to-as-chunks`），后者还能省掉运行时余数检查
+            for pixel in canvas.as_chunks_mut::<4>().0 {
                 pixel.swap(0, 2);
             }
         }
@@ -687,7 +689,9 @@ mod tests {
         // 之前这里只断言「存在 <255 的像素」，而抗锯齿像素恒满足，测试是空过的。
         let peak_alpha = |from: usize, to: usize| -> u8 {
             frame.rgba[from * CANVAS_WIDTH * 4..to * CANVAS_WIDTH * 4]
-                .chunks_exact(4)
+                .as_chunks::<4>()
+                .0
+                .iter()
                 .map(|pixel| pixel[3])
                 .max()
                 .unwrap_or(0)
@@ -710,8 +714,20 @@ mod tests {
         let normal = render(&[line(None, "", "测试")], &config);
         config.swap_red_blue = true;
         let swapped = render(&[line(None, "", "测试")], &config);
-        let normal_pixel = normal.rgba.chunks_exact(4).find(|p| p[3] == 255).unwrap();
-        let swapped_pixel = swapped.rgba.chunks_exact(4).find(|p| p[3] == 255).unwrap();
+        let normal_pixel = normal
+            .rgba
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .find(|p| p[3] == 255)
+            .unwrap();
+        let swapped_pixel = swapped
+            .rgba
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .find(|p| p[3] == 255)
+            .unwrap();
         assert_eq!(normal_pixel[0], 255);
         assert_eq!(swapped_pixel[2], 255);
     }
@@ -726,7 +742,14 @@ mod tests {
         };
         let frame = render(&[line(None, "", "半透明测试")], &config);
         // 去除 1px 描边（alpha <= 20），字形峰值 alpha 应受 #FFFFFF80 约束（约 128）
-        let max_alpha = frame.rgba.chunks_exact(4).map(|p| p[3]).max().unwrap_or(0);
+        let max_alpha = frame
+            .rgba
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|p| p[3])
+            .max()
+            .unwrap_or(0);
         assert!(
             (40..=140).contains(&max_alpha),
             "文字透明度未生效，max_alpha={max_alpha}"
