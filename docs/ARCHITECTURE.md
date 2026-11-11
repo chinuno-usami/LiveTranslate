@@ -58,14 +58,26 @@ livetranslate/
 │   │   └── mod.rs                 # OpenAI 兼容客户端与思考块剥离
 │   │
 │   ├── subtitle/                  # 字幕管理
-│   │   └── mod.rs                 # 多源字幕历史、重叠合并与来源标签格式化
+│   │   ├── mod.rs                 # 多源字幕历史与来源标签格式化
+│   │   └── processor.rs           # 去重 / 固定分片重叠裁剪
 │   │
-│   └── ui/                        # 前后端事件名与 IPC 载荷结构定义
-│       └── mod.rs
+│   ├── output/                    # 统一输出层
+│   │   ├── mod.rs                 # OutputManager
+│   │   ├── osc.rs                 # VRChat OSC Chatbox
+│   │   └── steamvr/               # SteamVR Overlay（Windows + feature）
+│   │
+│   └── ui/                        # 前后端事件名与 IPC 载荷
+│       ├── mod.rs
+│       └── overlay.rs             # 浮窗相关载荷辅助
+│
+├── tauri-ui/                      # 桌面浮窗与设置页前端
+│   ├── app.js / index.html / styles.css
+│   └── settings.js / settings.html / settings.css
 │
 └── docs/
     ├── ARCHITECTURE.md            # 架构说明
-    └── BUILD_FLAVORS.md           # 标准版 / Full 版构建说明
+    ├── BUILD_FLAVORS.md           # 标准版 / Full 版构建说明
+    └── V0.2_FEATURE_PLAN.md       # v0.2 功能规划
 ```
 
 ## 🏗️ 模块设计
@@ -82,7 +94,7 @@ livetranslate/
 **关键函数**：
 ```rust
 pub fn list_devices() -> AppResult<Vec<DeviceInfo>>
-pub fn new(device_spec: &str, sample_rate: u32, channels: u16) -> AppResult<Self>
+pub async fn new(device_spec: &str, sample_rate: u32, channels: u16) -> AppResult<Self>
 pub async fn next_chunk(&mut self) -> Option<Vec<f32>>
 ```
 
@@ -218,7 +230,7 @@ pub struct AppConfig {
 采用 `tokio` 异步运行时，使得：
 - 音频采集不阻塞 ASR 和翻译调用
 - 多个网络请求可以并发处理
-- 响应式 UI 更新（未来浮窗实现时）
+- 桌面浮窗与设置页通过 Tauri 事件 / IPC 做响应式更新
 
 ### 2. 音频分片策略
 
@@ -291,7 +303,7 @@ cargo run          # 直接运行
 ### 发布编译
 ```bash
 cargo build --release    # 优化编译（3-5x 快）
-cargo build --release --target x86_64-pc-windows-gnu  # 跨平台编译
+cargo xwin build --release --target x86_64-pc-windows-msvc  # 跨平台编译（推荐）
 ```
 
 ### 依赖大小

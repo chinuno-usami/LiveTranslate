@@ -7,7 +7,7 @@ cd /path/to/livetranslate
 cargo build --release
 ```
 
-✅ 输出：`target/release/livetranslate`（约 9.5 MB）
+✅ 输出：`target/release/livetranslate`（标准版约数 MB 到十余 MB，Full/extras 更大）
 
 从 macOS/Linux 交叉编译到 Windows：
 
@@ -47,12 +47,14 @@ curl http://127.0.0.1:8765/v1/models
 
 ```toml
 [translate]
-base_url = "https://api.openai.com/v1"      # OpenAI 官方或其他兼容服务
+# 内置样例默认 DeepSeek；也可换成 OpenAI 或其他兼容服务
+base_url = "https://api.deepseek.com/v1"
 api_key = "sk-your-api-key-here"            # 替换为实际 API Key
-model = "gpt-4o-mini"                       # 或其他可用模型
+model = "deepseek-flash"                    # 或其他可用模型
 target_language = "zh-CN"                   # 翻译目标语言
 system_prompt = "You are a real-time subtitle translator. Translate naturally and concisely."
 timeout_secs = 20
+# 切到 OpenAI 时记得删掉样例里的 [translate.extra_body] thinking 段，否则会 400
 ```
 
 ## 3️⃣ 配置
@@ -215,20 +217,20 @@ curl http://127.0.0.1:8765/v1/models
 
 ## 📚 详细文档
 
-- **PLAN.md** - 完整技术方案
+- **PLAN.md** - 完整技术方案（历史设计稿）
 - **README.md** - 详细用户指南
 - **docs/ARCHITECTURE.md** - 系统架构
-- **IMPLEMENTATION_SUMMARY.md** - 实现总结
+- **docs/BUILD_FLAVORS.md** - 标准版 / Full 版构建说明
+- **IMPLEMENTATION_SUMMARY.md** - 实现总结（历史快照，以 README / ARCHITECTURE 为准）
 
 ## ⚡ 性能参考
 
 | 指标 | 值 |
 |-----|-----|
-| 编译时间 | 19.21s |
-| 二进制大小 | 4.5 MB |
-| 内存占用 | < 2 MB |
-| 端到端延迟 | 4-8 秒 |
-| 支持设备 | Windows 10/11 |
+| 编译时间 | 视机器与特性而定（首次较慢） |
+| 二进制大小 | 标准版约数 MB～十余 MB；Full/extras 更大 |
+| 端到端延迟 | 通常数秒（取决于 ASR/翻译服务） |
+| 支持设备 | macOS / Windows / Linux（SteamVR 仅 Windows Full） |
 
 ## 🚀 下一步
 
