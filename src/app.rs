@@ -170,7 +170,17 @@ pub async fn start_console(config: AppConfig) -> AppResult<()> {
         config.subtitle.show_source,
         config.subtitle.label_sources,
     );
-    subtitle_state.set_active_labels(sources.iter().map(|s| s.label.clone()).collect());
+    let mut active_sources: Vec<(String, String, bool)> = sources
+        .iter()
+        .map(|s| (s.id.clone(), s.label.clone(), true))
+        .collect();
+    subtitle_state.set_active_labels(
+        active_sources
+            .iter()
+            .filter(|(_, _, running)| *running)
+            .map(|(_, label, _)| label.clone())
+            .collect(),
+    );
 
     for source in sources {
         let language = if source.language.trim().is_empty() {
@@ -206,7 +216,7 @@ pub async fn start_console(config: AppConfig) -> AppResult<()> {
         tokio::select! {
             maybe_event = rx.recv() => {
                 match maybe_event {
-                    Some(event) => handle_console_event(&mut subtitle_state, &outputs, event),
+                    Some(event) => handle_console_event(&mut subtitle_state, &mut active_sources, &outputs, event),
                     None => break,
                 }
             }
@@ -219,7 +229,7 @@ pub async fn start_console(config: AppConfig) -> AppResult<()> {
                 let _ = stop_tx.send(true);
                 let drain = async {
                     while let Some(event) = rx.recv().await {
-                        handle_console_event(&mut subtitle_state, &outputs, event);
+                        handle_console_event(&mut subtitle_state, &mut active_sources, &outputs, event);
                     }
                 };
                 let _ = tokio::time::timeout(std::time::Duration::from_secs(3), drain).await;
@@ -229,12 +239,13 @@ pub async fn start_console(config: AppConfig) -> AppResult<()> {
     }
 
     outputs.set_capture_active(false);
-    outputs.shutdown();
+    outputs.shutdown_async().await;
     Ok(())
 }
 
 fn handle_console_event(
     subtitle_state: &mut SubtitleState,
+    active_sources: &mut [(String, String, bool)],
     outputs: &OutputManager,
     event: PipelineEvent,
 ) {
@@ -257,6 +268,19 @@ fn handle_console_event(
             running,
             message,
         } => {
+            if let Some((_, _, slot_running)) = active_sources
+                .iter_mut()
+                .find(|(id, _, _)| *id == source_id)
+            {
+                *slot_running = running;
+                let labels = active_sources
+                    .iter()
+                    .filter(|(_, _, active)| *active)
+                    .map(|(_, label, _)| label.clone())
+                    .collect();
+                subtitle_state.set_active_labels(labels);
+                outputs.publish(&subtitle_state.display_lines());
+            }
             tracing::info!(
                 "Source {} {}: {}",
                 source_id,
@@ -624,6 +648,9 @@ async fn run_source_inner(
         }
     }
 
+    // 先停止系统音频流释放硬件句柄，再排空已在队列中的识别/翻译请求
+    audio_capture.stop();
+
     drop(utterance_tx);
     let mut worker = worker;
     if tokio::time::timeout(std::time::Duration::from_secs(2), &mut worker)
@@ -634,7 +661,6 @@ async fn run_source_inner(
         worker.abort();
     }
 
-    audio_capture.stop();
     tracing::info!("[{}] Audio pipeline stopped", source.label);
     Ok(())
 }

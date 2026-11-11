@@ -10,6 +10,8 @@ use serde_json::Value as JsonValue;
 #[derive(Debug, Clone, Serialize)]
 pub struct SettingsSchema {
     pub groups: Vec<SettingsGroup>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub warning: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -718,7 +720,16 @@ pub fn build(config: &AppConfig) -> SettingsSchema {
         },
     ];
 
-    SettingsSchema { groups }
+    SettingsSchema {
+        groups,
+        warning: None,
+    }
+}
+
+pub fn build_with_warning(config: &AppConfig, warning: Option<String>) -> SettingsSchema {
+    let mut schema = build(config);
+    schema.warning = warning;
+    schema
 }
 
 /// 该字段是否需要重启采集才能生效

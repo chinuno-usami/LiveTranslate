@@ -553,6 +553,9 @@ pub struct ResolvedConfig {
     pub config: AppConfig,
     pub path: Option<PathBuf>,
     pub warning: Option<String>,
+    /// 磁盘配置加载失败并回退到默认值：运行期禁止自动镜像覆盖已有配置档，
+    /// 直至用户显式保存设置或切换配置档。
+    pub degraded: bool,
 }
 
 impl AppConfig {
@@ -664,6 +667,15 @@ impl AppConfig {
 
     /// 按优先级解析配置，并在非显式配置文件损坏时保留原路径与告警信息
     pub fn resolve_detailed(explicit: Option<PathBuf>) -> AppResult<ResolvedConfig> {
+        Self::resolve_inner(explicit, false)
+    }
+
+    /// 只读解析配置（用于 `--list-models` 等诊断命令，不创建或隔离改写用户配置文件）
+    pub fn resolve_read_only(explicit: Option<PathBuf>) -> AppResult<ResolvedConfig> {
+        Self::resolve_inner(explicit, true)
+    }
+
+    fn resolve_inner(explicit: Option<PathBuf>, read_only: bool) -> AppResult<ResolvedConfig> {
         if let Some(path) = explicit {
             if !path.exists() {
                 return Err(AppError::Config(format!(
@@ -677,6 +689,7 @@ impl AppConfig {
                 config: cfg,
                 path: Some(path),
                 warning: None,
+                degraded: false,
             });
         }
 
@@ -703,56 +716,54 @@ impl AppConfig {
                             config: cfg,
                             path: Some(user_path),
                             warning: None,
+                            degraded: false,
+                        });
+                    }
+                    Err(e) if read_only => {
+                        tracing::warn!(
+                            "Failed to load config from {}: {}; falling back to defaults",
+                            user_path.display(),
+                            e
+                        );
+                        return Ok(ResolvedConfig {
+                            config: AppConfig::default(),
+                            path: None,
+                            warning: Some(format!(
+                                "配置文件 {} 加载失败（{e}），本次将使用内置默认配置",
+                                user_path.display()
+                            )),
+                            degraded: true,
                         });
                     }
                     Err(e) => {
-                        // 保留坏文件（用户可手动修复），并继续用配置路径运行，
-                        // 否则配置档功能会静默消失、下次保存会覆盖原文件。
-                        let warning = match Self::quarantine(&user_path) {
-                            Some(bad) => format!(
-                                "配置 {} 无法加载（{e}），已备份为 {} 并恢复默认配置",
-                                user_path.display(),
-                                bad.display()
-                            ),
-                            None => format!(
-                                "配置 {} 无法加载（{e}），本次使用内置默认配置",
-                                user_path.display()
-                            ),
-                        };
-                        tracing::error!("{warning}");
-                        let cfg = match Self::write_default_if_absent(&user_path) {
-                            Ok(true) => Self::load_validated(&user_path).unwrap_or_default(),
-                            _ => AppConfig::default(),
-                        };
-                        return Ok(ResolvedConfig {
-                            config: cfg,
-                            path: Some(user_path),
-                            warning: Some(warning),
-                        });
+                        return Ok(Self::recover_user_config(&user_path, &e.to_string()));
                     }
                 }
             }
 
-            match Self::write_default_if_absent(&user_path) {
-                Ok(true) => {
-                    tracing::info!(
-                        "Created default config at: {} (请填入翻译 API Key)",
-                        user_path.display()
-                    );
-                    let cfg = Self::load_validated(&user_path).unwrap_or_default();
-                    return Ok(ResolvedConfig {
-                        config: cfg,
-                        path: Some(user_path),
-                        warning: None,
-                    });
-                }
-                Ok(false) => {}
-                Err(e) => {
-                    tracing::warn!(
-                        "Failed to create default config at {}: {}",
-                        user_path.display(),
-                        e
-                    );
+            if !read_only {
+                match Self::write_default_if_absent(&user_path) {
+                    Ok(true) => {
+                        tracing::info!(
+                            "Created default config at: {} (请填入翻译 API Key)",
+                            user_path.display()
+                        );
+                        let cfg = Self::load_validated(&user_path).unwrap_or_default();
+                        return Ok(ResolvedConfig {
+                            config: cfg,
+                            path: Some(user_path),
+                            warning: None,
+                            degraded: false,
+                        });
+                    }
+                    Ok(false) => {}
+                    Err(e) => {
+                        tracing::warn!(
+                            "Failed to create default config at {}: {}",
+                            user_path.display(),
+                            e
+                        );
+                    }
                 }
             }
         }
@@ -769,7 +780,79 @@ impl AppConfig {
             config: AppConfig::default(),
             path: None,
             warning: None,
+            degraded: false,
         })
+    }
+
+    /// 用户配置目录 `config.toml` 加载失败时的恢复逻辑：
+    /// 1. 先将损坏原文件备份为 `.bad-*`；
+    /// 2. 若当前激活配置档（`profiles/<active>.toml`）存在且校验合法，优先从该快照恢复，避免丢失 `api_key` 等设置；
+    /// 3. 否则回退到内置默认配置，并标记 `degraded = true` 以阻止后续运行期自动镜像覆盖完好的配置档文件。
+    pub(crate) fn recover_user_config(user_path: &Path, err_msg: &str) -> ResolvedConfig {
+        // 保留坏文件（用户可手动修复），并继续用配置路径运行，
+        // 否则配置档功能会静默消失、下次保存会覆盖原文件。
+        let quarantined = Self::quarantine(user_path);
+
+        if let Some(active) = profiles::read_active(user_path) {
+            if profiles::validate_name(&active).is_ok() {
+                let snap = profiles::profiles_dir(user_path).join(format!("{active}.toml"));
+                if let Ok(text) = fs::read_to_string(&snap) {
+                    if let Ok(cfg) = Self::from_str(&text).and_then(|cfg| {
+                        cfg.validate().map_err(AppError::Config)?;
+                        Ok(cfg)
+                    }) {
+                        let restored =
+                            quarantined.is_some() && writer::write_atomic(user_path, &text).is_ok();
+                        let warning = match (&quarantined, restored) {
+                            (Some(bad), true) => format!(
+                                "配置 {} 无法加载（{err_msg}），已备份为 {} 并从配置档「{active}」恢复",
+                                user_path.display(),
+                                bad.display()
+                            ),
+                            (Some(bad), false) => format!(
+                                "配置 {} 无法加载（{err_msg}），已备份为 {}，本次使用配置档「{active}」运行",
+                                user_path.display(),
+                                bad.display()
+                            ),
+                            (None, _) => format!(
+                                "配置 {} 无法加载（{err_msg}），本次使用配置档「{active}」运行",
+                                user_path.display()
+                            ),
+                        };
+                        tracing::error!("{warning}");
+                        return ResolvedConfig {
+                            config: cfg,
+                            path: Some(user_path.to_path_buf()),
+                            warning: Some(warning),
+                            degraded: !restored,
+                        };
+                    }
+                }
+            }
+        }
+
+        let warning = match quarantined {
+            Some(bad) => format!(
+                "配置 {} 无法加载（{err_msg}），已备份为 {} 并恢复默认配置",
+                user_path.display(),
+                bad.display()
+            ),
+            None => format!(
+                "配置 {} 无法加载（{err_msg}），本次使用内置默认配置",
+                user_path.display()
+            ),
+        };
+        tracing::error!("{warning}");
+        let cfg = match Self::write_default_if_absent(user_path) {
+            Ok(true) => Self::load_validated(user_path).unwrap_or_default(),
+            _ => AppConfig::default(),
+        };
+        ResolvedConfig {
+            config: cfg,
+            path: Some(user_path.to_path_buf()),
+            warning: Some(warning),
+            degraded: true,
+        }
     }
 
     /// 便携模式 / 工作目录配置损坏时保留原路径（避免运行期误写进系统用户配置目录）
@@ -781,6 +864,7 @@ impl AppConfig {
                     config: cfg,
                     path: Some(path),
                     warning: None,
+                    degraded: false,
                 }
             }
             Err(e) => {
@@ -793,6 +877,7 @@ impl AppConfig {
                     config: AppConfig::default(),
                     path: Some(path),
                     warning: Some(warning),
+                    degraded: true,
                 }
             }
         }
@@ -1212,8 +1297,16 @@ pub fn is_hex_color(value: &str) -> bool {
 
 /// 解析 `host:port`，返回 `(host, port)`
 pub fn parse_target(value: &str) -> Option<(String, u16)> {
-    let (host, port) = value.rsplit_once(':')?;
+    let trimmed = value.trim();
+    let (host, port) = trimmed.rsplit_once(':')?;
     if host.is_empty() || host.contains(char::is_whitespace) {
+        return None;
+    }
+    if host.starts_with('[') || host.ends_with(']') {
+        let inner = host.strip_prefix('[')?.strip_suffix(']')?;
+        inner.parse::<std::net::Ipv6Addr>().ok()?;
+    } else if host.contains(':') {
+        // 未加方括号的 IPv6（如 "::1:9000"）无法被 ToSocketAddrs 解析
         return None;
     }
     let port: u16 = port.parse().ok()?;
@@ -1359,9 +1452,15 @@ mod tests {
         assert!(is_hex_color("#FFFFFF00"));
         assert!(!is_hex_color("rgba(0,0,0,0.5)"));
         assert_eq!(
-            parse_target("127.0.0.1:9000"),
+            parse_target(" 127.0.0.1:9000 "),
             Some(("127.0.0.1".to_string(), 9000))
         );
+        assert_eq!(
+            parse_target("[::1]:9000"),
+            Some(("[::1]".to_string(), 9000))
+        );
+        assert!(parse_target("::1:9000").is_none());
+        assert!(parse_target("[not-ipv6]:9000").is_none());
         assert!(parse_target("127.0.0.1").is_none());
         assert!(parse_target("host:notaport").is_none());
     }
@@ -1413,5 +1512,43 @@ mod tests {
 
         cfg.audio.sources[0].language = "ja-JP".to_string();
         cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn recover_user_config_restores_from_valid_active_profile() {
+        let path = temp_config_path("recover-profile");
+        let mut work = AppConfig::default();
+        work.translate.api_key = "sk-keep-me".to_string();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, work.to_toml_string().unwrap()).unwrap();
+        profiles::ensure_initialized(&path).unwrap();
+        profiles::create(&path, "work", Some(&path)).unwrap();
+        profiles::switch_to(&path, "work").unwrap();
+
+        // 模拟权威 config.toml 损坏，但激活配置档 work.toml 完好
+        fs::write(&path, "broken toml [[[").unwrap();
+        let resolved = AppConfig::recover_user_config(&path, "parse error");
+        assert!(!resolved.degraded);
+        assert_eq!(resolved.config.translate.api_key, "sk-keep-me");
+        assert_eq!(
+            AppConfig::from_file(&path).unwrap().translate.api_key,
+            "sk-keep-me"
+        );
+
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn recover_user_config_marks_degraded_without_valid_profile() {
+        let path = temp_config_path("recover-degraded");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, "broken toml [[[").unwrap();
+
+        let resolved = AppConfig::recover_user_config(&path, "parse error");
+        assert!(resolved.degraded);
+        assert!(resolved.warning.is_some());
+        assert!(path.exists());
+
+        let _ = fs::remove_dir_all(path.parent().unwrap());
     }
 }

@@ -361,13 +361,15 @@ pub fn delete(config_path: &Path, name: &str) -> Result<(), String> {
     }
     let _guard = writer::lock_writes();
     ensure_initialized_unlocked(config_path)?;
-    let active = read_active(config_path);
-    if active.as_deref() == Some(name) {
-        return Err("不能删除当前激活的配置档，请先切换到其它配置档".to_string());
-    }
     let path = profile_path(config_path, name);
     if !path.exists() {
         return Err(format!("配置档「{name}」不存在"));
+    }
+    if let Some(active) = read_active(config_path) {
+        let active_path = profile_path(config_path, &active);
+        if active == name || same_path(&path, &active_path) {
+            return Err("不能删除当前激活的配置档，请先切换到其它配置档".to_string());
+        }
     }
     fs::remove_file(&path).map_err(|e| format!("删除失败: {e}"))
 }
@@ -589,6 +591,25 @@ mod tests {
             entries.iter().any(|n| n == "VR.toml"),
             "目录项大小写应更新为 VR.toml，实际: {entries:?}"
         );
+        let _ = fs::remove_dir_all(config.parent().unwrap());
+    }
+
+    #[test]
+    fn delete_blocks_active_profile_even_with_different_case_on_insensitive_fs() {
+        let config = setup("delete-active-case");
+        fs::write(&config, AppConfig::default().to_toml_string().unwrap()).unwrap();
+        ensure_initialized(&config).unwrap();
+        create(&config, "vr", None).unwrap();
+        switch_to(&config, "vr").unwrap();
+
+        let same_fs = same_path(&profile_path(&config, "vr"), &profile_path(&config, "VR"));
+        if same_fs {
+            assert!(
+                delete(&config, "VR").is_err(),
+                "大小写不敏感文件系统上不应允许通过不同大小写删除当前激活档"
+            );
+            assert!(profile_path(&config, "vr").exists());
+        }
         let _ = fs::remove_dir_all(config.parent().unwrap());
     }
 }

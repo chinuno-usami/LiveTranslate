@@ -313,6 +313,9 @@ pub(crate) struct SharedState {
     _translate_rx: watch::Receiver<bool>,
     /// 启动阶段的配置回退/修复提示，在主界面就绪后展示一次
     startup_warning: std::sync::Mutex<Option<String>>,
+    /// 磁盘配置加载失败并回退到默认值：显式保存前禁止自动镜像覆盖配置档，并在设置页透出告警
+    config_degraded: AtomicBool,
+    degraded_warning: std::sync::Mutex<Option<String>>,
 }
 
 /// 字幕历史保留上限：桌面浮窗与 SteamVR 的 max_lines 独立，取较大者
@@ -350,6 +353,7 @@ impl SharedState {
         config: AppConfig,
         config_path: Option<PathBuf>,
         startup_warning: Option<String>,
+        config_degraded: bool,
     ) -> Self {
         let subtitle_state = SubtitleState::new(
             history_limit(&config),
@@ -364,6 +368,11 @@ impl SharedState {
         let (translate_tx, translate_rx) = watch::channel(config.translate.enabled);
         let outputs = OutputManager::new(&config.output);
         let sources = SourceRegistry::from_config(&config);
+        let degraded_warning = if config_degraded {
+            startup_warning.clone()
+        } else {
+            None
+        };
 
         Self {
             config: RwLock::new(config),
@@ -384,6 +393,8 @@ impl SharedState {
             translate_tx,
             _translate_rx: translate_rx,
             startup_warning: std::sync::Mutex::new(startup_warning),
+            config_degraded: AtomicBool::new(config_degraded),
+            degraded_warning: std::sync::Mutex::new(degraded_warning),
         }
     }
 
@@ -392,6 +403,55 @@ impl SharedState {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .take()
+    }
+
+    fn is_config_degraded(&self) -> bool {
+        self.config_degraded.load(Ordering::SeqCst)
+    }
+
+    fn clear_config_degraded(&self) {
+        self.config_degraded.store(false, Ordering::SeqCst);
+        *self
+            .degraded_warning
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
+    fn degraded_warning(&self) -> Option<String> {
+        self.degraded_warning
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// 设置页表单基准配置：当磁盘文件仅因字段校验未通过而进入降级态时，
+    /// 直接从磁盘读取原结构体供设置页展示与编辑，避免表单显示内存默认值导致无法修正。
+    fn settings_base_config(&self) -> (AppConfig, Option<String>) {
+        if !self.is_config_degraded() {
+            return (self.config(), None);
+        }
+        if let Some(path) = self.config_path() {
+            match AppConfig::from_file(&path) {
+                Ok(disk_cfg) => {
+                    let warning = disk_cfg
+                        .validate()
+                        .err()
+                        .map(|e| format!("配置文件 {} 存在待修正项：{e}", path.display()))
+                        .or_else(|| self.degraded_warning());
+                    return (disk_cfg, warning);
+                }
+                Err(e) => {
+                    let warning = self.degraded_warning().unwrap_or_else(|| {
+                        format!(
+                            "配置文件 {} 解析失败（{e}），请切到「高级 / 原始配置」修复后再保存",
+                            path.display()
+                        )
+                    });
+                    return (self.config(), Some(warning));
+                }
+            }
+        }
+        (self.config(), self.degraded_warning())
     }
 
     fn config(&self) -> AppConfig {
@@ -524,7 +584,7 @@ async fn shutdown_once(app: &AppHandle) {
     {
         tracing::warn!("停止采集超时，继续退出");
     }
-    state.outputs.shutdown();
+    state.outputs.shutdown_async().await;
     state.outputs.notify_status();
 }
 
@@ -540,6 +600,11 @@ pub(crate) fn quit_app(app: &AppHandle) {
 fn ensure_config_path(state: &SharedState) -> Result<PathBuf, String> {
     if let Some(path) = state.config_path() {
         return Ok(path);
+    }
+    if state.is_config_degraded() {
+        return Err(
+            "当前配置文件解析失败并处于回退保护状态，请先修复原配置文件后再保存".to_string(),
+        );
     }
     let path = AppConfig::user_config_path().map_err(|e| e.to_string())?;
     AppConfig::write_default_if_absent(&path).map_err(|e| e.to_string())?;
@@ -587,6 +652,9 @@ fn persist_sources(state: &SharedState, config: &AppConfig) -> Result<(), String
 }
 
 fn mirror_profile(state: &SharedState) {
+    if state.is_config_degraded() {
+        return;
+    }
     let Some(config_path) = state.config_path() else {
         return;
     };
@@ -668,7 +736,7 @@ async fn apply_hot_config(app: &AppHandle, state: &SharedState, old: &AppConfig,
         .store(new.subtitle.show_source, Ordering::SeqCst);
 
     // 输出
-    state.outputs.apply_config(&new.output);
+    state.outputs.apply_config(&new.output).await;
     publish_subtitle_snapshot(state).await;
 
     // 翻译开关 / 语言
@@ -1002,12 +1070,6 @@ async fn stop_capture_locked(app: AppHandle, state: Arc<SharedState>) -> Result<
     Ok(())
 }
 
-async fn restart_capture_impl(app: AppHandle, state: Arc<SharedState>) -> Result<(), String> {
-    let _lifecycle = state.lifecycle.lock().await;
-    stop_capture_locked(app.clone(), state.clone()).await?;
-    start_capture_locked(app, state.clone()).await
-}
-
 // ---------------- 前端命令：查询 ----------------
 
 #[tauri::command]
@@ -1097,7 +1159,7 @@ async fn list_sources(state: State<'_, Arc<SharedState>>) -> Result<SourcesPaylo
 async fn get_sources_config(
     state: State<'_, Arc<SharedState>>,
 ) -> Result<serde_json::Value, String> {
-    let config = state.config();
+    let (config, _) = state.settings_base_config();
     Ok(serde_json::json!({
         "sources": config.audio.effective_sources(config.translate.enabled),
         "max_active_sources": config.audio.max_active_sources,
@@ -1121,7 +1183,8 @@ async fn get_capabilities() -> Result<CapabilitiesPayload, String> {
 async fn get_settings_schema(
     state: State<'_, Arc<SharedState>>,
 ) -> Result<schema::SettingsSchema, String> {
-    Ok(schema::build(&state.config()))
+    let (config, warning) = state.settings_base_config();
+    Ok(schema::build_with_warning(&config, warning))
 }
 
 #[tauri::command]
@@ -1226,41 +1289,45 @@ async fn set_language(
     state: State<'_, Arc<SharedState>>,
     code: String,
 ) -> Result<(), String> {
-    let backend = state.config().asr.backend.clone();
-    let normalized = asr::languages::normalize_for_backend(&backend, &code);
-    if normalized.is_empty()
-        || normalized.len() > 32
-        || !normalized
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-    {
-        return Err(format!("非法语言代码: {code}"));
-    }
-
-    let _ = state.language_tx.send(normalized.clone());
-
-    let (section, key) = if asr::languages::is_edge_backend(&backend) {
-        ("asr.edge", "language")
-    } else {
-        ("asr", "language")
-    };
+    let mut resolved_lang = String::new();
+    let mut resolved_section = "asr";
     let config = state
         .update_config(|config| {
+            let normalized = asr::languages::normalize_for_backend(&config.asr.backend, &code);
+            if normalized.is_empty()
+                || normalized.len() > 32
+                || !normalized
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+            {
+                return Err(format!("非法语言代码: {code}"));
+            }
             if asr::languages::is_edge_backend(&config.asr.backend) {
+                resolved_section = "asr.edge";
                 config.asr.edge.language = normalized.clone();
             } else {
+                resolved_section = "asr";
                 config.asr.language = normalized.clone();
             }
+            resolved_lang = normalized;
             Ok(())
         })
         .await?;
+
+    let _ = state.language_tx.send(resolved_lang.clone());
     {
         let mut registry = state.sources.lock().await;
-        registry.set_language(&config, &normalized);
+        registry.set_language(&config, &resolved_lang);
     }
-    persist_value(&app, &state, section, key, normalized.clone().into());
+    persist_value(
+        &app,
+        &state,
+        resolved_section,
+        "language",
+        resolved_lang.clone().into(),
+    );
     emit_config(&app, &config);
-    tracing::info!("ASR language set to: {}", normalized);
+    tracing::info!("ASR language set to: {}", resolved_lang);
     Ok(())
 }
 
@@ -1274,8 +1341,10 @@ async fn set_device(
     if spec.is_empty() {
         return Err("设备名不能为空".to_string());
     }
-    let was_running = state.pipeline.lock().await.is_running();
-    let config = state
+    let inner = state.inner().clone();
+    let _lifecycle = inner.lifecycle.lock().await;
+    let was_running = inner.pipeline.lock().await.is_running();
+    let config = inner
         .update_config(|config| {
             if config.audio.sources.is_empty() {
                 config.audio.sources = config.audio.effective_sources(config.translate.enabled);
@@ -1292,17 +1361,22 @@ async fn set_device(
         .map_err(|e| format!("序列化输入源失败: {e}"))?;
     persist_or_report(
         &app,
-        &state,
+        &inner,
         &[
             ("audio.device_name", spec.into()),
             ("audio.sources", sources),
         ],
     );
+    {
+        let mut registry = inner.sources.lock().await;
+        registry.sync_config(&config);
+    }
     // 只在本就在采集时重启：用户只是换了下设备就自己开麦会让人意外
     if was_running {
-        restart_capture_impl(app, state.inner().clone()).await
+        stop_capture_locked(app.clone(), inner.clone()).await?;
+        start_capture_locked(app, inner.clone()).await
     } else {
-        emit_source_status(&app, &state).await;
+        emit_source_status(&app, &inner).await;
         Ok(())
     }
 }
@@ -1314,19 +1388,22 @@ async fn set_source_translate(
     id: String,
     enabled: bool,
 ) -> Result<(), String> {
-    let config = state
-        .update_config(|config| {
-            if config.audio.sources.is_empty() {
-                config.audio.sources = config.audio.effective_sources(config.translate.enabled);
-            }
-            let Some(source) = config.audio.sources.iter_mut().find(|s| s.id == id) else {
-                return Err(format!("输入源不存在: {id}"));
-            };
-            source.translate = enabled;
-            Ok(())
-        })
-        .await?;
-    persist_sources(&state, &config)?;
+    let config = {
+        let _guard = state.config_update.lock().await;
+        let mut next = state.config();
+        if next.audio.sources.is_empty() {
+            next.audio.sources = next.audio.effective_sources(next.translate.enabled);
+        }
+        let Some(source) = next.audio.sources.iter_mut().find(|s| s.id == id) else {
+            return Err(format!("输入源不存在: {id}"));
+        };
+        source.translate = enabled;
+        next.validate()?;
+        // 先落盘校验成功再更新内存与运行态，避免磁盘失败时内存与 SourceRegistry 失步
+        persist_sources(&state, &next)?;
+        state.set_config(next.clone());
+        next
+    };
     {
         let mut registry = state.sources.lock().await;
         registry.sync_config(&config);
@@ -1343,15 +1420,18 @@ where
     let _lifecycle = state.lifecycle.lock().await;
     let was_running = state.pipeline.lock().await.is_running();
 
-    let config = state
-        .update_config(|config| {
-            if config.audio.sources.is_empty() {
-                config.audio.sources = config.audio.effective_sources(config.translate.enabled);
-            }
-            mutate(config)
-        })
-        .await?;
-    persist_sources(&state, &config)?;
+    let config = {
+        let _guard = state.config_update.lock().await;
+        let mut next = state.config();
+        if next.audio.sources.is_empty() {
+            next.audio.sources = next.audio.effective_sources(next.translate.enabled);
+        }
+        mutate(&mut next)?;
+        next.validate()?;
+        persist_sources(&state, &next)?;
+        state.set_config(next.clone());
+        next
+    };
     {
         let mut registry = state.sources.lock().await;
         registry.sync_config(&config);
@@ -1511,8 +1591,10 @@ async fn set_output_enabled(
         })
         .await?;
     persist_value(&app, &state, section, "enabled", enabled.into());
-    mirror_profile(&state);
-    state.outputs.apply_config(&config.output);
+    state.outputs.apply_config(&config.output).await;
+    if enabled {
+        publish_subtitle_snapshot(&state).await;
+    }
     emit_output_status(&app, &state);
     Ok(())
 }
@@ -1573,6 +1655,7 @@ async fn write_config_changes(
         .collect();
     // writer 先校验再落盘，并回读确认每个配置项真的生效了
     let cfg = writer::apply_changes(&path, &payload)?;
+    state.clear_config_degraded();
     mirror_profile(state);
     Ok(cfg)
 }
@@ -1588,7 +1671,7 @@ async fn save_settings(
     let _lifecycle = state.lifecycle.lock().await;
     let _config_guard = state.config_update.lock().await;
     let old = state.config();
-    let mut new = old.clone();
+    let (mut new, _) = state.settings_base_config();
     let restart = apply_settings_changes(&mut new, &changes)?;
     new.validate()?;
 
@@ -1631,7 +1714,7 @@ async fn preview_settings(
     let mut preview = saved.clone();
     apply_settings_changes(&mut preview, &changes)?;
     preview.validate()?;
-    state.outputs.apply_config(&preview.output);
+    state.outputs.apply_config(&preview.output).await;
     {
         let mut subtitle_state = state.subtitle_state.lock().await;
         subtitle_state.set_max_lines(history_limit(&preview));
@@ -1664,7 +1747,7 @@ async fn cancel_preview(app: AppHandle, state: State<'_, Arc<SharedState>>) -> R
 async fn cancel_preview_impl(app: AppHandle, state: Arc<SharedState>) -> Result<(), String> {
     let _config_guard = state.config_update.lock().await;
     let config = state.config();
-    state.outputs.apply_config(&config.output);
+    state.outputs.apply_config(&config.output).await;
     {
         let mut subtitle_state = state.subtitle_state.lock().await;
         subtitle_state.set_max_lines(history_limit(&config));
@@ -1699,6 +1782,7 @@ async fn save_config_raw(
         return Err("当前构建为标准版，未包含 OSC 支持，请下载 Full 版".to_string());
     }
     let new = writer::save_raw(&path, &text)?;
+    state.clear_config_degraded();
     state.set_config(new.clone());
     {
         let mut registry = state.sources.lock().await;
@@ -1746,6 +1830,7 @@ async fn reload_config(
     let new = AppConfig::from_file(&path).map_err(|e| e.to_string())?;
     new.validate()?;
     let old = state.config();
+    state.clear_config_degraded();
     state.set_config(new.clone());
     {
         let mut registry = state.sources.lock().await;
@@ -1881,6 +1966,7 @@ async fn switch_profile(
         return Err(e);
     }
 
+    inner.clear_config_degraded();
     inner.set_config(new.clone());
     {
         let mut registry = inner.sources.lock().await;
@@ -1891,11 +1977,17 @@ async fn switch_profile(
     if was_running {
         start_capture_locked(app.clone(), inner.clone()).await?;
     }
-    emit_status(&app, was_running, format!("已切换到配置档「{name}」"));
+    let now_running = inner.pipeline.lock().await.is_running();
+    let status_message = if was_running && !now_running {
+        format!("已切换到配置档「{name}」（无可用输入源，采集未启动）")
+    } else {
+        format!("已切换到配置档「{name}」")
+    };
+    emit_status(&app, now_running, status_message.clone());
     Ok(SaveResult {
         applied: 1,
         restart_required: false,
-        message: format!("已切换到配置档「{name}」"),
+        message: status_message,
     })
 }
 
@@ -2296,7 +2388,19 @@ fn run(args: Args) -> anyhow::Result<()> {
     // ONNX Runtime 动态库探测必须在创建任何线程/异步运行时之前完成
     audio::detector::prepare_ort_library();
 
-    let resolved = match AppConfig::resolve_detailed(args.config.clone()) {
+    // --list-devices 纯查询命令不应创建/修改/隔离任何配置文件
+    if args.list_devices {
+        let runtime = tokio::runtime::Runtime::new()?;
+        runtime.block_on(app::list_devices())?;
+        return Ok(());
+    }
+
+    let resolved = if args.list_models {
+        AppConfig::resolve_read_only(args.config.clone())
+    } else {
+        AppConfig::resolve_detailed(args.config.clone())
+    };
+    let resolved = match resolved {
         Ok(resolved) => resolved,
         Err(e) if args.config.is_some() => {
             tracing::error!("Failed to load config: {}", e);
@@ -2309,12 +2413,14 @@ fn run(args: Args) -> anyhow::Result<()> {
                 config: AppConfig::default(),
                 path: None,
                 warning: Some(format!("配置文件加载失败（{e}），已回退到默认配置")),
+                degraded: true,
             }
         }
     };
     let config = resolved.config;
     let config_path = resolved.path;
     let startup_warning = resolved.warning;
+    let config_degraded = resolved.degraded;
 
     match &config_path {
         Some(path) => tracing::info!("Config file: {}", path.display()),
@@ -2330,25 +2436,21 @@ fn run(args: Args) -> anyhow::Result<()> {
     }
     tracing::debug!("Config: {:?}", config.redacted());
 
-    // 配置档首次启用时做非破坏性迁移（仅用户配置目录）
-    if let Some(path) = &config_path {
-        if profiles::profiles_enabled(Some(path)).0 {
-            if let Err(e) = profiles::ensure_initialized(path) {
-                tracing::warn!("Failed to initialize profiles: {e}");
-            }
-        }
-    }
-
-    if args.list_devices {
-        let runtime = tokio::runtime::Runtime::new()?;
-        runtime.block_on(app::list_devices())?;
-        return Ok(());
-    }
-
     if args.list_models {
         let runtime = tokio::runtime::Runtime::new()?;
         runtime.block_on(app::list_models(&config))?;
         return Ok(());
+    }
+
+    // 配置档首次启用时做非破坏性迁移（仅用户配置目录，且不覆盖损坏恢复态）
+    if !config_degraded {
+        if let Some(path) = &config_path {
+            if profiles::profiles_enabled(Some(path)).0 {
+                if let Err(e) = profiles::ensure_initialized(path) {
+                    tracing::warn!("Failed to initialize profiles: {e}");
+                }
+            }
+        }
     }
 
     if args.console {
@@ -2361,6 +2463,7 @@ fn run(args: Args) -> anyhow::Result<()> {
         config.clone(),
         config_path.clone(),
         startup_warning,
+        config_degraded,
     ));
 
     let app = tauri::Builder::default()
@@ -2653,5 +2756,22 @@ mod tests {
         }];
         apply_settings_changes(&mut preview, &changes).unwrap();
         assert!(preview.validate().is_err());
+    }
+
+    #[test]
+    fn degraded_shared_state_blocks_unconfigured_ensure_and_clears_cleanly() {
+        let state = SharedState::new(
+            AppConfig::default(),
+            None,
+            Some("便携配置损坏".to_string()),
+            true,
+        );
+        assert!(state.is_config_degraded());
+        assert_eq!(state.degraded_warning().as_deref(), Some("便携配置损坏"));
+        assert!(ensure_config_path(&state).is_err());
+
+        state.clear_config_degraded();
+        assert!(!state.is_config_degraded());
+        assert!(state.degraded_warning().is_none());
     }
 }

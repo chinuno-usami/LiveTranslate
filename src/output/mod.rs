@@ -67,17 +67,21 @@ impl OutputManager {
         self.osc.publish(snapshot);
     }
 
-    /// 设置热更新
-    pub fn apply_config(&self, config: &OutputConfig) {
-        self.steamvr.apply_config(&config.steamvr);
+    /// 设置热更新（旧 VR 线程若有停止等待，放到 blocking 池回收以免阻塞异步锁持有者）
+    pub async fn apply_config(&self, config: &OutputConfig) {
+        let handle = self.steamvr.apply_config_detached(&config.steamvr);
         self.osc.apply_config(&config.osc);
         self.status_notify.notify_one();
+        if let Some(handle) = handle {
+            let _ =
+                tokio::task::spawn_blocking(move || steamvr::join_bounded_default(handle)).await;
+        }
     }
 
     pub fn set_capture_active(&self, active: bool) {
         self.capture_active.store(active, Ordering::SeqCst);
+        self.osc.set_active(active);
         if !active {
-            self.osc.set_active(false);
             // 停止时清空 SteamVR 面板
             self.steamvr.publish(&[]);
         }
@@ -93,6 +97,11 @@ impl OutputManager {
     pub fn shutdown(&self) {
         self.steamvr.shutdown();
         self.osc.shutdown();
+    }
+
+    pub async fn shutdown_async(self: &Arc<Self>) {
+        let this = self.clone();
+        let _ = tokio::task::spawn_blocking(move || this.shutdown()).await;
     }
 }
 

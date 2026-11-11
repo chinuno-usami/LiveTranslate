@@ -110,8 +110,7 @@ fn sync_parent_dir(path: &Path) {
 #[cfg(not(unix))]
 fn sync_parent_dir(_path: &Path) {}
 
-/// 原子写入（自行加锁）。供单测直接调用。
-#[cfg(test)]
+/// 原子写入（自行加锁）。用于配置恢复与单测。
 pub fn write_atomic(path: &Path, content: &str) -> Result<(), String> {
     let _guard = lock_writes();
     write_atomic_unlocked(path, content)
@@ -317,16 +316,56 @@ fn parse_sources(value: &JsonValue) -> Result<Vec<AudioSourceConfig>, String> {
         .collect()
 }
 
+fn update_table_scalar(table: &mut Table, key: &str, mut value: Value) {
+    if let Some((_, Item::Value(old))) = table.get_key_value_mut(key) {
+        *value.decor_mut() = old.decor().clone();
+        *old = value;
+    } else {
+        table[key] = Item::Value(value);
+    }
+}
+
 fn set_sources(doc: &mut DocumentMut, sources: &[AudioSourceConfig]) {
+    let existing = doc
+        .get("audio")
+        .and_then(Item::as_table)
+        .and_then(|audio| audio.get("sources"))
+        .and_then(Item::as_array_of_tables);
+    let first_decor = existing
+        .and_then(|arr| arr.get(0))
+        .map(|table| table.decor().clone());
+    let first_id = existing
+        .and_then(|arr| arr.get(0))
+        .and_then(|table| table.get("id"))
+        .and_then(Item::as_str)
+        .map(str::to_string);
+    let first_removed = first_id
+        .as_deref()
+        .is_some_and(|id| !sources.iter().any(|s| s.id == id));
+    let mut old_tables: Vec<Table> = existing
+        .map(|arr| arr.iter().cloned().collect())
+        .unwrap_or_default();
+
     let mut tables = ArrayOfTables::new();
-    for source in sources {
-        let mut table = Table::new();
-        table["id"] = toml_edit::value(source.id.clone());
-        table["label"] = toml_edit::value(source.label.clone());
-        table["device"] = toml_edit::value(source.device.clone());
-        table["enabled"] = toml_edit::value(source.enabled);
-        table["translate"] = toml_edit::value(source.translate);
-        table["language"] = toml_edit::value(source.language.clone());
+    for (idx, source) in sources.iter().enumerate() {
+        let matched = old_tables
+            .iter()
+            .position(|t| t.get("id").and_then(Item::as_str) == Some(source.id.as_str()));
+        let mut table = match matched {
+            Some(pos) => old_tables.remove(pos),
+            None => Table::new(),
+        };
+        if idx == 0 && (matched.is_none() || first_removed) && table.decor().prefix().is_none() {
+            if let Some(decor) = &first_decor {
+                *table.decor_mut() = decor.clone();
+            }
+        }
+        update_table_scalar(&mut table, "id", Value::from(source.id.clone()));
+        update_table_scalar(&mut table, "label", Value::from(source.label.clone()));
+        update_table_scalar(&mut table, "device", Value::from(source.device.clone()));
+        update_table_scalar(&mut table, "enabled", Value::from(source.enabled));
+        update_table_scalar(&mut table, "translate", Value::from(source.translate));
+        update_table_scalar(&mut table, "language", Value::from(source.language.clone()));
         tables.push(table);
     }
     let audio = doc
@@ -726,9 +765,36 @@ mod tests {
 
         let text = fs::read_to_string(&path).unwrap();
         assert!(text.contains("# 是否启用 VAD"), "其它段注释应保留");
+        assert!(
+            text.contains("# 多输入源：每个源一条"),
+            "输入源段头注释应保留:\n{text}"
+        );
         assert!(text.contains("font_size = 40"));
         assert!(text.contains("max_chars = 100"));
         assert!(text.contains("[[audio.sources]]"));
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn updating_existing_sources_preserves_per_source_comments() {
+        let path = temp_path("sources-comments");
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        fs::write(&path, AppConfig::SHIPPED_DEFAULT).unwrap();
+
+        let mut cfg = AppConfig::from_file(&path).unwrap();
+        cfg.audio.sources[0].translate = false;
+        cfg.audio.sources[1].device = "loopback:1".to_string();
+        let value = serde_json::to_value(&cfg.audio.sources).unwrap();
+
+        let updated = apply_changes(&path, &[("audio.sources".into(), value)]).unwrap();
+        assert!(!updated.audio.sources[0].translate);
+        assert_eq!(updated.audio.sources[1].device, "loopback:1");
+
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(text.contains("# 多输入源：每个源一条"));
+        assert!(text.contains("# 回环采集仅 Windows 支持"));
         let _ = fs::remove_dir_all(path.parent().unwrap());
     }
 

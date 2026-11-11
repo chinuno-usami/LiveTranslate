@@ -13,6 +13,10 @@ use std::time::{Duration, Instant};
 /// 停止 VR 线程时的最长等待
 const STOP_TIMEOUT: Duration = Duration::from_secs(3);
 
+pub(crate) fn join_bounded_default(handle: JoinHandle<()>) {
+    join_bounded(handle, STOP_TIMEOUT);
+}
+
 /// 有上限地等待 VR 线程退出；超时则放弃（detach），不让退出流程挂死。
 ///
 /// `openvr::init()` 在 SteamVR 正在启动或卡住时没有超时语义，
@@ -70,16 +74,11 @@ impl SteamVrSink {
         }
     }
 
-    pub fn apply_config(&self, config: &SteamVrConfig) {
+    /// 更新配置并返回需要回收的旧线程句柄（供异步调用方放入 `spawn_blocking` 等待，避免阻塞 Tokio 工作线程）
+    pub fn apply_config_detached(&self, config: &SteamVrConfig) -> Option<JoinHandle<()>> {
         let _lifecycle = self.lifecycle.lock().unwrap_or_else(|e| e.into_inner());
-        // 先取走线程句柄再释放 inner 锁，否则 join 期间 publish/status 都会阻塞
-        let handle = {
-            let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-            inner.apply_config(config)
-        };
-        if let Some(handle) = handle {
-            join_bounded(handle, STOP_TIMEOUT);
-        }
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        inner.apply_config(config)
     }
 
     /// 传入完整字幕快照；内部只保留最新一帧
