@@ -1,6 +1,7 @@
 use super::SteamVrStatus;
 use crate::config::SteamVrConfig;
 use crate::subtitle::DisplayLine;
+use std::thread::JoinHandle;
 
 pub struct SteamVrSink {
     status: SteamVrStatus,
@@ -25,8 +26,9 @@ impl SteamVrSink {
         }
     }
 
-    pub fn apply_config(&mut self, config: &SteamVrConfig) {
+    pub fn apply_config(&mut self, config: &SteamVrConfig) -> Option<JoinHandle<()>> {
         self.status.enabled = config.enabled;
+        None
     }
 
     pub fn publish(&self, _lines: &[DisplayLine]) {}
@@ -35,5 +37,7 @@ impl SteamVrSink {
         self.status.clone()
     }
 
-    pub fn shutdown(&mut self) {}
+    pub fn shutdown(&mut self) -> Option<JoinHandle<()>> {
+        None
+    }
 }

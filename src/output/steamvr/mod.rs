@@ -7,6 +7,27 @@ use crate::config::SteamVrConfig;
 use crate::subtitle::DisplayLine;
 use serde::Serialize;
 use std::sync::Mutex;
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
+
+/// 停止 VR 线程时的最长等待
+const STOP_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// 有上限地等待 VR 线程退出；超时则放弃（detach），不让退出流程挂死。
+///
+/// `openvr::init()` 在 SteamVR 正在启动或卡住时没有超时语义，
+/// 所以这里不能直接 `join()`。
+fn join_bounded(handle: JoinHandle<()>, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    while !handle.is_finished() {
+        if Instant::now() >= deadline {
+            tracing::warn!("SteamVR overlay thread did not stop in {timeout:?}; detaching it");
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let _ = handle.join();
+}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct SteamVrStatus {
@@ -48,8 +69,15 @@ impl SteamVrSink {
     }
 
     pub fn apply_config(&self, config: &SteamVrConfig) {
-        if let Ok(mut inner) = self.inner.lock() {
-            inner.apply_config(config);
+        // 先取走线程句柄再释放外层锁，否则 join 期间 publish/shutdown 都会阻塞
+        let handle = {
+            let Ok(mut inner) = self.inner.lock() else {
+                return;
+            };
+            inner.apply_config(config)
+        };
+        if let Some(handle) = handle {
+            join_bounded(handle, STOP_TIMEOUT);
         }
     }
 
@@ -68,8 +96,14 @@ impl SteamVrSink {
     }
 
     pub fn shutdown(&self) {
-        if let Ok(mut inner) = self.inner.lock() {
-            inner.shutdown();
+        let handle = {
+            let Ok(mut inner) = self.inner.lock() else {
+                return;
+            };
+            inner.shutdown()
+        };
+        if let Some(handle) = handle {
+            join_bounded(handle, STOP_TIMEOUT);
         }
     }
 }

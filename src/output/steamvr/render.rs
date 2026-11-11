@@ -13,6 +13,8 @@ const MAX_CANVAS_HEIGHT: usize = 2048;
 const MAX_LINE_CHARS: usize = 400;
 const PADDING: f32 = 28.0;
 const RADIUS: f32 = 24.0;
+/// 原文行与译文行之间的间距
+const SOURCE_ROW_GAP: f32 = 4.0;
 
 pub struct RenderedFrame {
     pub width: usize,
@@ -60,6 +62,34 @@ struct Block {
     translated: Option<Buffer>,
     source_height: f32,
     translated_height: f32,
+    /// 逐行不透明度（line_alphas）。cosmic-text 的 mask 像素会把 alpha
+    /// 换成字形覆盖度，所以只能在混合时乘，不能靠 attrs 传下去。
+    alpha: f32,
+}
+
+/// 画布装不下时，需要从最旧的多少行开始丢弃（至少保留一行）
+fn rows_to_drop(heights: &[f32], gap: f32, max_height: f32) -> usize {
+    let total = |from: usize| -> f32 {
+        heights[from..].iter().sum::<f32>()
+            + gap * (heights.len() - from).saturating_sub(1) as f32
+            + PADDING * 2.0
+    };
+    let mut dropped = 0;
+    while heights.len() - dropped > 1 && total(dropped) > max_height {
+        dropped += 1;
+    }
+    dropped
+}
+
+impl Block {
+    fn height(&self) -> f32 {
+        let source = if self.source.is_some() {
+            self.source_height.max(0.0) + SOURCE_ROW_GAP
+        } else {
+            0.0
+        };
+        source + self.translated_height
+    }
 }
 
 /// 渲染器：缓存系统字体扫描结果，避免每帧重新扫描字体（首次扫描可能接近 1 秒）
@@ -185,14 +215,20 @@ impl Renderer {
                 translated: Some(buffer),
                 source_height,
                 translated_height,
+                alpha,
             });
         }
 
-        let content_height: f32 = blocks
-            .iter()
-            .map(|block| block.source_height + block.translated_height)
-            .sum::<f32>()
-            + block_gap * blocks.len().saturating_sub(1) as f32;
+        // 画布高度有上限，而绘制是从最旧到最新自上而下：
+        // 超限时被裁掉的是**最新**内容，正好是字幕最不该丢的。
+        // 因此从最旧一行开始丢，直到装得下。
+        let heights: Vec<f32> = blocks.iter().map(Block::height).collect();
+        let dropped = rows_to_drop(&heights, block_gap, MAX_CANVAS_HEIGHT as f32);
+        for _ in 0..dropped {
+            blocks.remove(0);
+        }
+        let content_height = heights[dropped..].iter().sum::<f32>()
+            + block_gap * (heights.len() - dropped).saturating_sub(1) as f32;
         let total_height = (content_height + PADDING * 2.0).max(PADDING * 2.0 + translated_size);
         let height = (total_height.ceil() as usize).clamp(1, MAX_CANVAS_HEIGHT);
         let mut canvas = vec![0u8; CANVAS_WIDTH * height * 4];
@@ -230,8 +266,9 @@ impl Renderer {
                     height,
                     x,
                     y as i32,
+                    block.alpha,
                 );
-                y += block.source_height.max(0.0) + 4.0;
+                y += block.source_height.max(0.0) + SOURCE_ROW_GAP;
             }
             if let Some(translated) = block.translated.as_mut() {
                 draw_buffer(
@@ -243,6 +280,7 @@ impl Renderer {
                     height,
                     PADDING as i32,
                     y as i32,
+                    block.alpha,
                 );
                 y += block.translated_height;
             }
@@ -324,22 +362,19 @@ fn draw_buffer(
     height: usize,
     x: i32,
     y: i32,
+    alpha: f32,
 ) {
+    let alpha = alpha.clamp(0.0, 1.0);
     buffer.draw(
         font_system,
         cache,
         Color::rgba(255, 255, 255, 255),
         |gx, gy, gw, gh, color| {
-            blend_rect(
-                canvas,
-                width,
-                height,
-                x + gx,
-                y + gy,
-                gw,
-                gh,
-                color.as_rgba(),
-            );
+            // 这里的 alpha 是字形覆盖度；attrs 里的逐行透明度在上面被
+            // cosmic-text 丢掉了，只能在这里乘回来。
+            let mut rgba = color.as_rgba();
+            rgba[3] = (rgba[3] as f32 * alpha).round() as u8;
+            blend_rect(canvas, width, height, x + gx, y + gy, gw, gh, rgba);
         },
     );
 }
@@ -507,6 +542,17 @@ mod tests {
         assert!(frame.rgba.iter().skip(3).step_by(4).any(|a| *a > 100));
     }
 
+    /// 超长内容时要丢最旧的行，而不是让最新一行被画布边界裁掉
+    #[test]
+    fn drops_oldest_rows_when_canvas_overflows() {
+        let heights = [1000.0, 1000.0, 1000.0];
+        assert_eq!(rows_to_drop(&heights, 16.0, 2048.0), 2);
+        // 装得下时一行都不丢
+        assert_eq!(rows_to_drop(&[100.0, 100.0], 16.0, 2048.0), 0);
+        // 单行就超高时也必须保留一行
+        assert_eq!(rows_to_drop(&[5000.0], 16.0, 2048.0), 0);
+    }
+
     #[test]
     fn empty_input_does_not_panic() {
         let frame = render(&[], &SteamVrConfig::default());
@@ -530,6 +576,23 @@ mod tests {
             &config,
         );
         assert!(frame.rgba.iter().any(|b| *b < 255));
+
+        // 真正验证淡出：最新一行（画布底部）的字形峰值不透明度必须高于最旧一行（顶部）。
+        // 之前这里只断言「存在 <255 的像素」，而抗锯齿像素恒满足，测试是空过的。
+        let peak_alpha = |from: usize, to: usize| -> u8 {
+            frame.rgba[from * CANVAS_WIDTH * 4..to * CANVAS_WIDTH * 4]
+                .chunks_exact(4)
+                .map(|pixel| pixel[3])
+                .max()
+                .unwrap_or(0)
+        };
+        let third = frame.height / 3;
+        let newest = peak_alpha(frame.height - third, frame.height);
+        let oldest = peak_alpha(0, third);
+        assert!(
+            newest > oldest,
+            "最新一行({newest})应比最旧一行({oldest})更不透明"
+        );
     }
 
     #[test]

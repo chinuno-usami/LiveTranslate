@@ -77,14 +77,16 @@ impl SteamVrSink {
             .ok();
     }
 
-    fn stop_thread(&mut self) {
+    /// 请求 VR 线程退出并取走句柄。
+    ///
+    /// **不在调用处 join**：`join()` 可能卡在 `openvr::init()` 里任意长时间，
+    /// 而调用方（`mod.rs` 的外层 Mutex）被持有时，热路径的 `publish` 会一起阻塞。
+    fn take_thread(&mut self) -> Option<JoinHandle<()>> {
         self.shared.stop.store(true, Ordering::SeqCst);
-        if let Some(handle) = self.handle.take() {
-            let _ = handle.join();
-        }
+        self.handle.take()
     }
 
-    pub fn apply_config(&mut self, config: &SteamVrConfig) {
+    pub fn apply_config(&mut self, config: &SteamVrConfig) -> Option<JoinHandle<()>> {
         if let Ok(mut current) = self.shared.config.lock() {
             *current = config.clone();
         }
@@ -99,34 +101,45 @@ impl SteamVrSink {
 
         if config.enabled {
             self.start();
+            None
         } else {
-            self.stop_thread();
+            self.take_thread()
         }
     }
 
     pub fn publish(&self, lines: &[DisplayLine]) {
         // 33ms 的 VR 线程可能正拿着这把锁，这里不能无限等待热路径
-        if let Ok(mut current) = self.shared.lines.try_lock() {
-            *current = lines.to_vec();
-        }
+        let stored = match self.shared.lines.try_lock() {
+            Ok(mut current) => {
+                *current = lines.to_vec();
+                true
+            }
+            Err(_) => false,
+        };
         if !lines.is_empty() {
             *lock(&self.shared.last_activity) = Instant::now();
         }
-        self.shared.revision.fetch_add(1, Ordering::SeqCst);
+        // 快照被丢掉时就别递增 revision：VR 线程会把「上一份内容」当成已渲染，
+        // 导致最新一条字幕再也不出现，直到下一次 ASR 事件。
+        if stored {
+            self.shared.revision.fetch_add(1, Ordering::SeqCst);
+        }
     }
 
     pub fn status(&self) -> SteamVrStatus {
         lock(&self.shared.status).clone()
     }
 
-    pub fn shutdown(&mut self) {
-        self.stop_thread();
+    pub fn shutdown(&mut self) -> Option<JoinHandle<()>> {
+        self.take_thread()
     }
 }
 
 impl Drop for SteamVrSink {
     fn drop(&mut self) {
-        self.stop_thread();
+        if let Some(handle) = self.take_thread() {
+            super::join_bounded(handle, super::STOP_TIMEOUT);
+        }
     }
 }
 

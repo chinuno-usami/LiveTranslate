@@ -236,6 +236,8 @@ mod imp {
         activity_ms: AtomicU64,
         /// 配置变更后请求清空去重状态（否则停止再开启时相同文本永不发送）
         reset_dedup: AtomicBool,
+        /// 请求发送一次空文本（Chatbox 是有状态的，停止后要主动清屏）
+        pending_clear: AtomicBool,
     }
 
     impl Shared {
@@ -275,6 +277,7 @@ mod imp {
                 stop: AtomicBool::new(false),
                 activity_ms: AtomicU64::new(0),
                 reset_dedup: AtomicBool::new(false),
+                pending_clear: AtomicBool::new(false),
             });
 
             let thread_shared = shared.clone();
@@ -332,6 +335,9 @@ mod imp {
                 if let Ok(mut pending) = self.shared.pending.lock() {
                     *pending = Some(Vec::new());
                 }
+                // 空快照组包后是 None（什么都不发），Chatbox 会把最后一句留在画面里，
+                // 所以额外标记一次「发空串」。
+                self.shared.pending_clear.store(true, Ordering::SeqCst);
             }
         }
 
@@ -367,6 +373,21 @@ mod imp {
             .ok_or_else(|| format!("解析 {trimmed} 得不到地址"))
     }
 
+    /// 取缓存的目标地址；配置里的字符串变了才重解析
+    fn cached_target(
+        cache: &mut Option<(String, SocketAddr)>,
+        configured: &str,
+    ) -> Result<SocketAddr, String> {
+        if let Some((source, addr)) = cache.as_ref() {
+            if source == configured {
+                return Ok(*addr);
+            }
+        }
+        let addr = resolve_target(configured)?;
+        *cache = Some((configured.to_string(), addr));
+        Ok(addr)
+    }
+
     fn run(shared: Arc<Shared>) {
         let socket = match UdpSocket::bind("0.0.0.0:0") {
             Ok(socket) => socket,
@@ -384,13 +405,15 @@ mod imp {
         let mut sent_at: VecDeque<Instant> = VecDeque::new();
         let mut typing = false;
         let mut last_typing_sent: Option<Instant> = None;
-        // 解析好的目标地址（配置变更时重解析，避免每包 DNS）
-        let mut target: Option<SocketAddr> = None;
+        // 解析好的目标地址：只在「配置里的字符串变了」时重解析，避免每包 DNS。
+        // 只判断 `is_none()` 会让 output.osc.target 的改动永远不生效。
+        let mut target: Option<(String, SocketAddr)> = None;
+        let mut custom_target: Option<(String, SocketAddr)> = None;
 
         loop {
             if shared.stop.load(Ordering::SeqCst) {
                 if typing {
-                    if let Some(addr) = target {
+                    if let Some((_, addr)) = target {
                         let _ = send_typing(&socket, addr, false);
                     }
                 }
@@ -407,7 +430,7 @@ mod imp {
 
             if !config.enabled {
                 if typing {
-                    if let Some(addr) = target {
+                    if let Some((_, addr)) = target {
                         let _ = send_typing(&socket, addr, false);
                     }
                     typing = false;
@@ -454,6 +477,12 @@ mod imp {
                 }
             }
 
+            // 停止采集后主动清屏：pack() 对空历史返回 None，只能显式发一个空串
+            if shared.pending_clear.swap(false, Ordering::SeqCst) {
+                last_sent_text = None;
+                pending_text = Some(String::new());
+            }
+
             // typing：有字幕活动后置 true，静音 3 秒后置 false
             let activity = shared.activity_ms.load(Ordering::SeqCst);
             let want_typing =
@@ -463,17 +492,14 @@ mod imp {
                     .map(|t| t.elapsed() >= Duration::from_millis(500))
                     .unwrap_or(true);
                 if throttle_ok {
-                    if target.is_none() {
-                        match resolve_target(&config.target) {
-                            Ok(addr) => target = Some(addr),
-                            Err(e) => shared.set_status_message(format!("OSC 目标无效: {e}")),
+                    match cached_target(&mut target, &config.target) {
+                        Ok(addr) => {
+                            if send_typing(&socket, addr, want_typing).is_ok() {
+                                typing = want_typing;
+                                last_typing_sent = Some(Instant::now());
+                            }
                         }
-                    }
-                    if let Some(addr) = target {
-                        if send_typing(&socket, addr, want_typing).is_ok() {
-                            typing = want_typing;
-                            last_typing_sent = Some(Instant::now());
-                        }
+                        Err(e) => shared.set_status_message(format!("OSC 目标无效: {e}")),
                     }
                 }
             }
@@ -487,13 +513,14 @@ mod imp {
             let window_ok = has_window_quota(&sent_at, config.max_per_window.max(1));
 
             if let (Some(text), true, true) = (pending_text.clone(), interval_ok, window_ok) {
-                if target.is_none() {
-                    match resolve_target(&config.target) {
-                        Ok(addr) => target = Some(addr),
-                        Err(e) => shared.set_status_message(format!("OSC 目标无效: {e}")),
+                let addr = match cached_target(&mut target, &config.target) {
+                    Ok(addr) => Some(addr),
+                    Err(e) => {
+                        shared.set_status_message(format!("OSC 目标无效: {e}"));
+                        None
                     }
-                }
-                let send_result = match target {
+                };
+                let send_result = match addr {
                     Some(addr) => send_chatbox(&socket, addr, &text),
                     None => Err("目标地址无效".to_string()),
                 };
@@ -515,17 +542,28 @@ mod imp {
                         }
                         let custom = config.custom_address.trim();
                         if !custom.is_empty() {
-                            if let (Some((source_id, label)), Ok(addr)) =
-                                (&latest_meta, resolve_target(custom))
-                            {
-                                if let Err(e) = send_custom(&socket, addr, &text, source_id, label)
-                                {
-                                    shared.set_status_message(format!("自定义地址发送失败: {e}"));
+                            match cached_target(&mut custom_target, custom) {
+                                Ok(addr) => {
+                                    if let Some((source_id, label)) = &latest_meta {
+                                        if let Err(e) =
+                                            send_custom(&socket, addr, &text, source_id, label)
+                                        {
+                                            shared.set_status_message(format!(
+                                                "自定义地址发送失败: {e}"
+                                            ));
+                                        }
+                                    }
                                 }
+                                // 以前这里是 `Ok(addr)` 模式匹配，失败就静默跳过
+                                Err(e) => shared.set_status_message(format!("自定义地址无效: {e}")),
                             }
                         }
                     }
-                    Err(e) => shared.set_status_message(format!("OSC 发送失败: {e}")),
+                    Err(e) => {
+                        // 也记一次时间戳：否则失败会每个 100ms tick 重试一次（含 DNS 解析）
+                        last_sent_at = Some(Instant::now());
+                        shared.set_status_message(format!("OSC 发送失败: {e}"));
+                    }
                 }
             }
 
