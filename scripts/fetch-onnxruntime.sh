@@ -95,7 +95,8 @@ if [ -n "$EXPECTED_SHA256" ]; then
   fi
   echo "  checksum ok"
 else
-  echo "warning: 未提供 ${PLATFORM}/${ORT_VERSION} 的 SHA-256，跳过完整性校验" >&2
+  echo "error: 未提供 ${PLATFORM}/${ORT_VERSION} 的 SHA-256；请在脚本内置表或 ORT_SHA256 中补充后重试" >&2
+  exit 1
 fi
 
 mkdir -p "$TMP_DIR/extract"

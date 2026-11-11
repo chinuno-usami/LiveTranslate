@@ -186,7 +186,7 @@ jobs:
             }
             Write-Host "checksum ok"
           } else {
-            Write-Warning "没有 onnxruntime $ortVersion 的内置校验和，跳过完整性校验"
+            throw "没有 onnxruntime $ortVersion 的内置校验和；请先在 release.yml / fetch-onnxruntime.sh 补齐 SHA-256"
           }
 
           Expand-Archive -Path $ortZip -DestinationPath $ortDir -Force
