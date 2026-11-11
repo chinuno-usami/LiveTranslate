@@ -1,7 +1,11 @@
 //! 多配置档：`config.toml` 始终是权威文件，`profiles/<name>.toml` 是命名快照。
 //!
-//! 配置档只在「使用用户配置目录」时启用；`--config` 或便携模式下禁用，
-//! 避免与显式指定的配置语义冲突。
+//! 配置档在两种来源下启用：
+//! - 用户配置目录（Release 默认）：`%APPDATA%\chinuno\LiveTranslate\config\config.toml`
+//! - 便携 / 开发模式：程序目录或当前目录下的 `config/default.toml`
+//!
+//! 只有 `--config <任意其它路径>` 才禁用：配置文件在用户指定位置时，
+//! 不主动在旁边创建 `profiles/` 目录，避免污染用户目录。
 
 use crate::config::writer;
 use crate::config::AppConfig;
@@ -36,6 +40,9 @@ struct ProfilesMeta {
 }
 
 /// 判断当前配置路径下是否允许使用配置档
+///
+/// 用户配置目录与便携/开发模式的 `config/default.toml` 都启用；
+/// 显式 `--config <其它路径>` 禁用（避免在任意目录旁生成 `profiles/`）。
 pub fn profiles_enabled(config_path: Option<&Path>) -> (bool, Option<String>) {
     let Some(path) = config_path else {
         return (
@@ -43,20 +50,33 @@ pub fn profiles_enabled(config_path: Option<&Path>) -> (bool, Option<String>) {
             Some("当前使用内置默认配置，保存一次设置后即可使用配置档".to_string()),
         );
     };
-    let user_path = match AppConfig::user_config_path() {
-        Ok(p) => p,
-        Err(e) => return (false, Some(format!("无法确定用户配置目录: {e}"))),
-    };
-    if same_path(path, &user_path) {
-        (true, None)
-    } else {
-        (
-            false,
-            Some(format!(
-                "当前使用显式指定的配置文件（{}），配置档已禁用",
-                path.display()
-            )),
-        )
+    if is_user_config(path) || is_portable_config(path) {
+        return (true, None);
+    }
+    (
+        false,
+        Some(format!(
+            "当前使用显式指定的配置文件（{}），配置档已禁用；\
+             改用用户配置目录或不带 --config 启动即可使用配置档",
+            path.display()
+        )),
+    )
+}
+
+fn is_user_config(path: &Path) -> bool {
+    AppConfig::user_config_path().is_ok_and(|user_path| same_path(path, &user_path))
+}
+
+/// 便携 / 开发模式：程序目录旁的 `config/default.toml`，或当前目录的 `config/default.toml`
+fn is_portable_config(path: &Path) -> bool {
+    if same_path(path, Path::new("config/default.toml")) {
+        return true;
+    }
+    match std::env::current_exe() {
+        Ok(exe) => exe
+            .parent()
+            .is_some_and(|dir| same_path(path, &dir.join("config").join("default.toml"))),
+        Err(_) => false,
     }
 }
 
@@ -598,6 +618,18 @@ mod tests {
         assert!(!enabled);
         assert!(reason.is_some());
         assert!(!profiles_enabled(None).0);
+    }
+
+    #[test]
+    fn enabled_for_portable_and_dev_config() {
+        // 便携模式 / 开发模式都读 <程序目录或当前目录>/config/default.toml
+        let portable = Path::new("config/default.toml");
+        assert!(portable.exists(), "单测应在仓库根目录运行");
+        let (enabled, reason) = profiles_enabled(Some(portable));
+        assert!(enabled, "便携/开发配置必须支持配置档: {reason:?}");
+
+        // 便携模式下配置档与配置同目录
+        assert_eq!(profiles_dir(portable), Path::new("config").join("profiles"));
     }
 
     #[test]

@@ -409,7 +409,8 @@ function renderProfileBar(preferredSelected) {
         }</option>`,
     )
     .join('');
-  els.profileSelect.innerHTML = options || '<option value="">（无）</option>';
+  els.profileSelect.innerHTML =
+    options || `<option value="">${status.enabled ? '（无）' : '（配置档不可用）'}</option>`;
   updateProfileActionButtons();
   els.profileReason.textContent = status.enabled
     ? ''

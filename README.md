@@ -273,7 +273,9 @@ send_typing = true
   profiles/vr.toml
   ```
   切换配置档 = 校验目标档 → 原子替换 `config.toml` → 重启采集。
-  使用 `--config <path>` 或便携模式时配置档会自动禁用并显示原因。
+  配置档跟着「当前权威配置文件」走：用户配置目录下是 `config.toml` + `profiles/`，
+  便携 / 开发模式（`config/default.toml`）下则是 `config/default.toml` + `config/profiles/`。
+  只有 `--config <其它路径>` 会禁用配置档（避免在任意目录旁生成 `profiles/`），设置页会显示原因。
 - 首次启用配置档只做非破坏性迁移：把现有 `config.toml` 复制为 `profiles/default.toml`。
 
 ### SteamVR Overlay（Windows Full 版）
@@ -560,8 +562,8 @@ DEBUG livetranslate::app: VAD 噪声底 ≈ -52.3 dBFS (speech 阈值 ≈ -44.3 
 | 优先级 | 位置 | 适用场景 |
 |--------|------|----------|
 | 1 | `--config <路径>` | 显式指定（找不到或格式错误会直接报错） |
-| 2 | `<可执行文件目录>/config/default.toml` | 便携模式（将随包 `config/config.example.toml` 重命名为 `default.toml` 启用） |
-| 3 | `./config/default.toml` | 源码 / 开发模式下运行 |
+| 2 | `<可执行文件目录>/config/default.toml` | 便携模式（将随包 `config/config.example.toml` 重命名为 `default.toml` 启用；支持多配置档，放在 `config/profiles/`） |
+| 3 | `./config/default.toml` | 源码 / 开发模式下运行（同样支持配置档） |
 | 4 | 用户配置目录 | Release 压缩包 / `.app` 默认使用（支持多配置档与标准版/Full 版互通） |
 | 5 | 内置默认值 | 都没有时（`api_key` 为占位符，首次保存自动写入用户配置目录） |
 

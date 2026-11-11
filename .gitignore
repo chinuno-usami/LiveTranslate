@@ -17,3 +17,7 @@ Thumbs.db
 
 # 运行期落盘的临时会话文件（如 SQLite 内存库产物）
 *.ses
+
+# 便携 / 开发模式（config/default.toml）下的多配置档运行时产物
+/config/profiles/
+/config/profiles.toml
