@@ -16,7 +16,7 @@ use config::{profiles, schema, writer, AppConfig, AudioSourceConfig};
 use output::OutputManager;
 use serde::Deserialize;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use subtitle::SubtitleState;
 use tauri::{AppHandle, LogicalPosition, LogicalSize, Manager, State, Window};
@@ -25,8 +25,8 @@ use tracing_subscriber::EnvFilter;
 use ui::{
     ActiveSourcePayload, CapabilitiesPayload, OverlayConfigPayload, SaveResult, SourceStatusItem,
     SourcesPayload, StatusPayload, SubtitlePayload, CLICK_THROUGH_EVENT, CONFIG_EVENT, ERROR_EVENT,
-    NOTICE_EVENT, OUTPUT_STATUS_EVENT, SETTINGS_SHOWN_EVENT, SOURCE_STATUS_EVENT, STATUS_EVENT,
-    SUBTITLE_EVENT,
+    NOTICE_EVENT, OUTPUT_STATUS_EVENT, SETTINGS_HIDDEN_EVENT, SETTINGS_SHOWN_EVENT,
+    SOURCE_STATUS_EVENT, STATUS_EVENT, SUBTITLE_EVENT,
 };
 
 #[derive(Parser, Debug)]
@@ -276,7 +276,7 @@ impl SourceRegistry {
                 label: r.label.clone(),
                 running: r.running,
                 enabled: r.enabled,
-                translate: r.translate_enabled(),
+                translate: r.translate_pref,
                 device: r.device.clone(),
                 message: r.message.clone(),
             })
@@ -301,6 +301,10 @@ pub(crate) struct SharedState {
     pub(crate) click_through: AtomicBool,
     font_size: AtomicU32,
     show_source: AtomicBool,
+    /// 保证关闭浮窗、托盘退出、快捷键退出与 RunEvent::Exit 最多只执行一次停机清理
+    shutting_down: AtomicBool,
+    /// 浮窗拖动位置持久化的防抖序号
+    move_seq: AtomicU64,
     /// 全局语言
     language_tx: watch::Sender<String>,
     _language_rx: watch::Receiver<String>,
@@ -367,6 +371,8 @@ impl SharedState {
             click_through: AtomicBool::new(click_through),
             font_size: AtomicU32::new(font_size),
             show_source: AtomicBool::new(show_source),
+            shutting_down: AtomicBool::new(false),
+            move_seq: AtomicU64::new(0),
             language_tx,
             _language_rx: language_rx,
             translate_tx,
@@ -452,16 +458,63 @@ pub(crate) fn apply_click_through(app: &AppHandle, enabled: bool) {
 pub(crate) fn open_settings_window(app: &AppHandle) {
     match app.get_window("settings") {
         Some(window) => {
+            let was_visible = window.is_visible().unwrap_or(false);
             // 先显示再通知，避免前端的确认框挂在一个还没显示的窗口上。
-            // 窗口只是 hide()，前端状态会一直活着；通知它重新拉取一次配置，
-            // 否则会拿启动时的快照去覆盖浮窗上的改动。
+            // 仅在由隐藏转为显示时通知重新拉取配置，避免已打开时重复点「设置」清掉脏编辑。
             let _ = window.show();
             let _ = window.unminimize();
             let _ = window.set_focus();
-            let _ = app.emit_all(SETTINGS_SHOWN_EVENT, ());
+            if !was_visible {
+                let _ = app.emit_all(SETTINGS_SHOWN_EVENT, ());
+            }
         }
         None => tracing::warn!("Settings window not found in tauri.conf.json"),
     }
+}
+
+pub(crate) fn start_capture_bg(app: &AppHandle) {
+    let app_handle = app.clone();
+    let state = app.state::<Arc<SharedState>>().inner().clone();
+    tauri::async_runtime::spawn(async move {
+        if let Err(e) = start_capture_impl(app_handle.clone(), state).await {
+            tracing::error!("Failed to start capture: {e}");
+            let _ = app_handle.emit_all(ERROR_EVENT, e);
+        }
+    });
+}
+
+pub(crate) fn stop_capture_bg(app: &AppHandle) {
+    let app_handle = app.clone();
+    let state = app.state::<Arc<SharedState>>().inner().clone();
+    tauri::async_runtime::spawn(async move {
+        if let Err(e) = stop_capture_impl(app_handle.clone(), state).await {
+            tracing::error!("Failed to stop capture: {e}");
+            let _ = app_handle.emit_all(ERROR_EVENT, e);
+        }
+    });
+}
+
+async fn shutdown_once(app: &AppHandle) {
+    let state = app.state::<Arc<SharedState>>().inner().clone();
+    if state.shutting_down.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let stop = stop_capture_impl(app.clone(), state.clone());
+    if tokio::time::timeout(std::time::Duration::from_secs(3), stop)
+        .await
+        .is_err()
+    {
+        tracing::warn!("停止采集超时，继续退出");
+    }
+    state.outputs.shutdown();
+}
+
+pub(crate) fn quit_app(app: &AppHandle) {
+    let app_handle = app.clone();
+    tauri::async_runtime::spawn(async move {
+        shutdown_once(&app_handle).await;
+        app_handle.exit(0);
+    });
 }
 
 /// 确保有可写的配置文件（内置默认配置时首次保存到用户目录）
@@ -533,10 +586,8 @@ fn mirror_profile(state: &SharedState) {
 }
 
 fn emit_config(app: &AppHandle, config: &AppConfig) {
-    let _ = app.emit_all(
-        CONFIG_EVENT,
-        OverlayConfigPayload::new(&config.subtitle, config.translate.enabled),
-    );
+    let payload = OverlayConfigPayload::from_config(config);
+    let _ = app.emit_all(CONFIG_EVENT, payload);
 }
 
 fn emit_output_status(app: &AppHandle, state: &SharedState) {
@@ -568,15 +619,20 @@ fn emit_subtitle_reset(app: &AppHandle) {
     let _ = app.emit_all(SUBTITLE_EVENT, SubtitlePayload::empty());
 }
 
-async fn emit_subtitle(app: &AppHandle, state: &SharedState) {
+async fn emit_subtitle_with_config(app: &AppHandle, state: &SharedState, config: &AppConfig) {
     let registry = state.sources.lock().await;
     let active = registry.active_sources_payload();
     drop(registry);
     let subtitle_state = state.subtitle_state.lock().await;
     // 历史长度取各输出的最大值，但浮窗只能按 subtitle.max_lines 显示，
     // 否则切一下「显示来源」就会把 SteamVR/OSC 的多余行泄到浮窗上。
-    let entries = desktop_entries(subtitle_state.display_lines(), &state.config());
+    let entries = desktop_entries(subtitle_state.display_lines(), config);
     let _ = app.emit_all(SUBTITLE_EVENT, SubtitlePayload::new(&entries, active));
+}
+
+async fn emit_subtitle(app: &AppHandle, state: &SharedState) {
+    let config = state.config();
+    emit_subtitle_with_config(app, state, &config).await;
 }
 
 /// 应用热更新字段（样式 / 输出 / 翻译开关 / 语言 / 窗口属性）
@@ -607,7 +663,10 @@ async fn apply_hot_config(app: &AppHandle, state: &SharedState, old: &AppConfig,
             registry.set_translate_all(false);
         }
     }
-    if old.asr.language != new.asr.language || old.asr.edge.language != new.asr.edge.language {
+    if old.asr.backend != new.asr.backend
+        || old.asr.language != new.asr.language
+        || old.asr.edge.language != new.asr.edge.language
+    {
         let language = global_language(new);
         let _ = state.language_tx.send(language.clone());
         let mut registry = state.sources.lock().await;
@@ -934,10 +993,7 @@ async fn get_overlay_config(
     state: State<'_, Arc<SharedState>>,
 ) -> Result<OverlayConfigPayload, String> {
     let config = state.config();
-    Ok(OverlayConfigPayload::new(
-        &config.subtitle,
-        config.translate.enabled,
-    ))
+    Ok(OverlayConfigPayload::from_config(&config))
 }
 
 #[tauri::command]
@@ -1518,26 +1574,24 @@ async fn save_settings(
     state.set_config(saved.clone());
     apply_hot_config(&app, &state, &old, &saved).await;
 
-    if restart {
-        let running = state.pipeline.lock().await.is_running();
-        if running {
-            // 已经持着 lifecycle 锁，不能再走 restart_capture_impl（会重复加锁死锁）
-            stop_capture_locked(app.clone(), state.inner().clone()).await?;
-            start_capture_locked(app.clone(), state.inner().clone()).await?;
-        }
+    let running = state.pipeline.lock().await.is_running();
+    if restart && running {
+        // 已经持着 lifecycle 锁，不能再走 restart_capture_impl（会重复加锁死锁）
+        stop_capture_locked(app.clone(), state.inner().clone()).await?;
+        start_capture_locked(app.clone(), state.inner().clone()).await?;
     }
 
     tracing::info!(
-        "Settings saved ({} changes, restart={restart})",
+        "Settings saved ({} changes, restart={restart}, running={running})",
         changes.len()
     );
     Ok(SaveResult {
         applied: changes.len(),
-        restart_required: restart,
-        message: if restart {
-            "已保存；部分修改需要重启采集后生效".to_string()
-        } else {
-            "已保存并立即生效".to_string()
+        restart_required: false,
+        message: match (restart, running) {
+            (true, true) => "已保存并自动重启采集".to_string(),
+            (true, false) => "已保存（下次开始采集时生效）".to_string(),
+            (false, _) => "已保存并立即生效".to_string(),
         },
     })
 }
@@ -1549,7 +1603,9 @@ async fn preview_settings(
     state: State<'_, Arc<SharedState>>,
     changes: Vec<SettingChange>,
 ) -> Result<(), String> {
-    let mut preview = state.config();
+    let _config_guard = state.config_update.lock().await;
+    let saved = state.config();
+    let mut preview = saved.clone();
     apply_settings_changes(&mut preview, &changes)?;
     state.outputs.apply_config(&preview.output);
     {
@@ -1558,11 +1614,18 @@ async fn preview_settings(
         subtitle_state.set_show_source(preview.subtitle.show_source);
         subtitle_state.set_label_mode(preview.subtitle.label_sources);
     }
-    let _ = app.emit_all(
-        CONFIG_EVENT,
-        OverlayConfigPayload::new(&preview.subtitle, preview.translate.enabled),
-    );
-    emit_subtitle(&app, &state).await;
+    // 仅覆盖纯视觉预览字段，不伪造点击穿透、翻译开关、识别语言等运行态按钮状态
+    let mut payload = OverlayConfigPayload::from_config(&saved);
+    payload.font_size = preview.subtitle.font_size;
+    payload.text_color = preview.subtitle.text_color.clone();
+    payload.stroke_color = preview.subtitle.stroke_color.clone();
+    payload.background = preview.subtitle.background.clone();
+    payload.toolbar_background = preview.subtitle.toolbar_background.clone();
+    payload.show_source = preview.subtitle.show_source;
+    payload.max_lines = preview.subtitle.max_lines;
+    payload.label_sources = preview.subtitle.label_sources.as_str().to_string();
+    let _ = app.emit_all(CONFIG_EVENT, payload);
+    emit_subtitle_with_config(&app, &state, &preview).await;
     emit_output_status(&app, &state);
     Ok(())
 }
@@ -1574,6 +1637,7 @@ async fn cancel_preview(app: AppHandle, state: State<'_, Arc<SharedState>>) -> R
 
 /// 撤销实时预览（也用于设置窗口关闭时，避免运行态与配置长期不一致）
 async fn cancel_preview_impl(app: AppHandle, state: Arc<SharedState>) -> Result<(), String> {
+    let _config_guard = state.config_update.lock().await;
     let config = state.config();
     state.outputs.apply_config(&config.output);
     {
@@ -1583,7 +1647,7 @@ async fn cancel_preview_impl(app: AppHandle, state: Arc<SharedState>) -> Result<
         subtitle_state.set_label_mode(config.subtitle.label_sources);
     }
     emit_config(&app, &config);
-    emit_subtitle(&app, &state).await;
+    emit_subtitle_with_config(&app, &state, &config).await;
     emit_output_status(&app, &state);
     Ok(())
 }
@@ -1595,16 +1659,17 @@ async fn save_config_raw(
     text: String,
 ) -> Result<SaveResult, String> {
     let _lifecycle = state.lifecycle.lock().await;
+    let _config_guard = state.config_update.lock().await;
     let old = state.config();
     let path = ensure_config_path(state.inner())?;
     // 先解析/校验能力，避免非法或不可用的配置落盘
     let parsed = AppConfig::from_str(&text).map_err(|e| e.to_string())?;
     parsed.validate()?;
     let (cap_steamvr, cap_osc) = output::capabilities();
-    if !cap_steamvr && parsed.output.steamvr.enabled {
+    if !cap_steamvr && parsed.output.steamvr.enabled && !old.output.steamvr.enabled {
         return Err("当前构建为标准版，未包含 SteamVR 支持，请下载 Full 版".to_string());
     }
-    if !cap_osc && parsed.output.osc.enabled {
+    if !cap_osc && parsed.output.osc.enabled && !old.output.osc.enabled {
         return Err("当前构建为标准版，未包含 OSC 支持，请下载 Full 版".to_string());
     }
     let new = writer::save_raw(&path, &text)?;
@@ -1624,7 +1689,11 @@ async fn save_config_raw(
     // 未知键会被 serde 静默丢弃：提示出来，否则用户会以为改了但没生效
     let unknown = writer::unknown_keys(&text);
     let message = if unknown.is_empty() {
-        "原始配置已保存并校验通过".to_string()
+        if running {
+            "原始配置已保存并自动重启采集".to_string()
+        } else {
+            "原始配置已保存并校验通过".to_string()
+        }
     } else {
         format!(
             "原始配置已保存，但以下配置项未被识别（不会生效）: {}",
@@ -1633,7 +1702,7 @@ async fn save_config_raw(
     };
     Ok(SaveResult {
         applied: 1,
-        restart_required: true,
+        restart_required: false,
         message,
     })
 }
@@ -1644,6 +1713,7 @@ async fn reload_config(
     state: State<'_, Arc<SharedState>>,
 ) -> Result<SaveResult, String> {
     let _lifecycle = state.lifecycle.lock().await;
+    let _config_guard = state.config_update.lock().await;
     let path = state
         .config_path()
         .ok_or_else(|| "当前没有配置文件".to_string())?;
@@ -1663,8 +1733,12 @@ async fn reload_config(
     }
     Ok(SaveResult {
         applied: 1,
-        restart_required: true,
-        message: "配置已重新加载".to_string(),
+        restart_required: false,
+        message: if running {
+            "配置已重新加载并自动重启采集".to_string()
+        } else {
+            "配置已重新加载".to_string()
+        },
     })
 }
 
@@ -1751,6 +1825,7 @@ async fn switch_profile(
 ) -> Result<SaveResult, String> {
     let inner = state.inner().clone();
     let _lifecycle = inner.lifecycle.lock().await;
+    let _config_guard = inner.config_update.lock().await;
     let config_path = require_profile_path(&inner)?;
     // 先校验目标配置档，再停采集，避免校验失败白白中断字幕
     let text = profiles::switch(&config_path, &name)?;
@@ -1784,7 +1859,7 @@ async fn switch_profile(
     emit_status(&app, was_running, format!("已切换到配置档「{name}」"));
     Ok(SaveResult {
         applied: 1,
-        restart_required: true,
+        restart_required: false,
         message: format!("已切换到配置档「{name}」"),
     })
 }
@@ -1802,7 +1877,12 @@ async fn restart_pipeline(
     app: AppHandle,
     state: State<'_, Arc<SharedState>>,
 ) -> Result<(), String> {
-    restart_capture_impl(app, state.inner().clone()).await
+    let _lifecycle = state.lifecycle.lock().await;
+    if !state.pipeline.lock().await.is_running() {
+        return Ok(());
+    }
+    stop_capture_locked(app.clone(), state.inner().clone()).await?;
+    start_capture_locked(app, state.inner().clone()).await
 }
 
 // ---------------- 原有窗口命令 ----------------
@@ -1818,8 +1898,9 @@ async fn stop_capture(app: AppHandle, state: State<'_, Arc<SharedState>>) -> Res
 }
 
 #[tauri::command]
-fn close_overlay(window: Window) -> Result<(), String> {
-    window.close().map_err(|e| e.to_string())
+fn close_overlay(app: AppHandle) -> Result<(), String> {
+    quit_app(&app);
+    Ok(())
 }
 
 #[tauri::command]
@@ -1919,10 +2000,63 @@ async fn set_click_through(
 
 // ---------------- 系统集成 ----------------
 
-pub(crate) fn open_config_dir() -> Result<(), String> {
-    let dir = AppConfig::user_config_dir().map_err(|e| e.to_string())?;
-    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    open_path(&dir)
+pub(crate) fn open_config_dir(app: &AppHandle) -> Result<(), String> {
+    let state = app.state::<Arc<SharedState>>();
+    let path = ensure_config_path(&state)?;
+    match path.parent() {
+        Some(dir) => {
+            std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+            open_path(dir)
+        }
+        None => Err("无法定位配置目录".to_string()),
+    }
+}
+
+fn schedule_persist_main_position(window: &Window) {
+    let app = window.app_handle();
+    let state = app.state::<Arc<SharedState>>().inner().clone();
+    if state.shutting_down.load(Ordering::SeqCst) {
+        return;
+    }
+    let seq = state.move_seq.fetch_add(1, Ordering::SeqCst) + 1;
+    let window = window.clone();
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+        if state.move_seq.load(Ordering::SeqCst) != seq
+            || state.shutting_down.load(Ordering::SeqCst)
+        {
+            return;
+        }
+        let (Ok(scale), Ok(pos)) = (window.scale_factor(), window.outer_position()) else {
+            return;
+        };
+        let x = (pos.x as f64 / scale).round() as i32;
+        let y = (pos.y as f64 / scale).round() as i32;
+        let current = state.config();
+        if (x - current.subtitle.position_x).abs() <= 1
+            && (y - current.subtitle.position_y).abs() <= 1
+        {
+            return;
+        }
+        if state
+            .update_config(|config| {
+                config.subtitle.position_x = x;
+                config.subtitle.position_y = y;
+                Ok(())
+            })
+            .await
+            .is_ok()
+        {
+            persist_or_report(
+                &app,
+                &state,
+                &[
+                    ("subtitle.position_x", x.into()),
+                    ("subtitle.position_y", y.into()),
+                ],
+            );
+        }
+    });
 }
 
 fn open_path(path: &std::path::Path) -> Result<(), String> {
@@ -2187,23 +2321,33 @@ fn run(args: Args) -> anyhow::Result<()> {
         .system_tray(tray::create_system_tray())
         .on_system_tray_event(tray::handle_system_tray_event)
         .manage(shared)
-        .on_window_event(|event| {
-            if let tauri::WindowEvent::CloseRequested { api, .. } = event.event() {
-                if event.window().label() == "settings" {
+        .on_window_event(|event| match event.event() {
+            tauri::WindowEvent::CloseRequested { api, .. } => match event.window().label() {
+                "settings" => {
                     // 关闭设置页时只隐藏，保留窗口与前端状态；
-                    // 但预览是直接进运行态的，必须随手撑销，否则关闭后
-                    // 运行态会一直停在未保存的预览值上。
+                    // 通知前端清掉防抖预览定时器，并把运行态回滚到持久配置。
                     api.prevent_close();
                     let _ = event.window().hide();
                     let app = event.window().app_handle();
+                    let _ = app.emit_all(SETTINGS_HIDDEN_EVENT, ());
                     let state = app.state::<Arc<SharedState>>().inner().clone();
                     tauri::async_runtime::spawn(async move {
                         if let Err(e) = cancel_preview_impl(app, state).await {
-                            tracing::warn!("撑销设置预览失败: {e}");
+                            tracing::warn!("撤销设置预览失败: {e}");
                         }
                     });
                 }
+                "main" => {
+                    // 隐藏的 settings 窗口会阻止 Tauri 自动触发退出，主窗口关闭时统一走完整退场
+                    api.prevent_close();
+                    quit_app(&event.window().app_handle());
+                }
+                _ => {}
+            },
+            tauri::WindowEvent::Moved(_) if event.window().label() == "main" => {
+                schedule_persist_main_position(event.window());
             }
+            _ => {}
         })
         .setup(move |app| {
             #[cfg(target_os = "macos")]
@@ -2218,10 +2362,8 @@ fn run(args: Args) -> anyhow::Result<()> {
             if let Err(e) = apply_window_config(&window, &config) {
                 tracing::warn!("Failed to apply window config: {e}");
             }
-            if let Err(e) = window.emit(
-                CONFIG_EVENT,
-                OverlayConfigPayload::new(&config.subtitle, config.translate.enabled),
-            ) {
+            let payload = OverlayConfigPayload::from_config(&config);
+            if let Err(e) = window.emit(CONFIG_EVENT, payload) {
                 tracing::warn!("Failed to emit config event: {e}");
             }
             if let Err(e) = tray::register_global_shortcuts(&app.handle()) {
@@ -2301,18 +2443,10 @@ fn run(args: Args) -> anyhow::Result<()> {
 
     app.run(|app_handle, event| {
         if let tauri::RunEvent::Exit = event {
-            let state = app_handle.state::<Arc<SharedState>>().inner().clone();
-            // 退出前先停采集：否则 SteamVR 覆层会留最后一句字幕、OSC typing 不复位
+            // 退出前先停采集并回收外部输出（与 quit_app 共用单次门闩）
             let handle = app_handle.clone();
             tauri::async_runtime::block_on(async move {
-                let stop = stop_capture_impl(handle, state.clone());
-                if tokio::time::timeout(std::time::Duration::from_secs(3), stop)
-                    .await
-                    .is_err()
-                {
-                    tracing::warn!("停止采集超时，继续退出");
-                }
-                state.outputs.shutdown();
+                shutdown_once(&handle).await;
             });
         }
     });
@@ -2443,5 +2577,10 @@ mod tests {
         config.audio.sources.remove(1);
         registry.sync_config(&config);
         assert_eq!(registry.runtimes.len(), 1);
+
+        // 全局翻译关闭时，status_items 仍保留单源自身的翻译偏好供浮窗开关展示
+        registry.set_translate_all(false);
+        assert!(registry.status_items()[0].translate);
+        assert!(!registry.runtimes[0].translate_enabled());
     }
 }

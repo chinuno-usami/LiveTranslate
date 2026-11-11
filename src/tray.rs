@@ -33,14 +33,10 @@ pub fn handle_system_tray_event(app: &AppHandle, event: SystemTrayEvent) {
                 show_main_window(app);
             }
             "start" => {
-                if let Some(window) = app.get_window("main") {
-                    let _ = window.emit("tray://command", "start");
-                }
+                crate::start_capture_bg(app);
             }
             "stop" => {
-                if let Some(window) = app.get_window("main") {
-                    let _ = window.emit("tray://command", "stop");
-                }
+                crate::stop_capture_bg(app);
             }
             "through" => {
                 // 关闭点击穿透的唯一可靠入口：穿透开启后窗口不再接收鼠标事件
@@ -50,12 +46,12 @@ pub fn handle_system_tray_event(app: &AppHandle, event: SystemTrayEvent) {
                 crate::open_settings_window(app);
             }
             "config_dir" => {
-                if let Err(e) = crate::open_config_dir() {
+                if let Err(e) = crate::open_config_dir(app) {
                     tracing::error!("Failed to open config dir: {}", e);
                 }
             }
             "quit" => {
-                app.exit(0);
+                crate::quit_app(app);
             }
             _ => {}
         },
@@ -103,21 +99,13 @@ pub fn register_global_shortcuts(app: &AppHandle) -> tauri::Result<()> {
     let app_handle = app.clone();
     register(
         "CmdOrCtrl+Alt+R",
-        Box::new(move || {
-            if let Some(window) = app_handle.get_window("main") {
-                let _ = window.emit("shortcut://command", "start");
-            }
-        }),
+        Box::new(move || crate::start_capture_bg(&app_handle)),
     );
 
     let app_handle = app.clone();
     register(
         "CmdOrCtrl+Alt+E",
-        Box::new(move || {
-            if let Some(window) = app_handle.get_window("main") {
-                let _ = window.emit("shortcut://command", "stop");
-            }
-        }),
+        Box::new(move || crate::stop_capture_bg(&app_handle)),
     );
 
     // 切换点击穿透（穿透开启后这是关闭它的快捷键）
@@ -134,7 +122,10 @@ pub fn register_global_shortcuts(app: &AppHandle) -> tauri::Result<()> {
     );
 
     let app_handle = app.clone();
-    register("CmdOrCtrl+Alt+Q", Box::new(move || app_handle.exit(0)));
+    register(
+        "CmdOrCtrl+Alt+Q",
+        Box::new(move || crate::quit_app(&app_handle)),
+    );
 
     tracing::info!("Global shortcuts registration finished");
     Ok(())

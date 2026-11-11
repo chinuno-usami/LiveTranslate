@@ -1,4 +1,5 @@
-use crate::config::SubtitleConfig;
+use crate::asr;
+use crate::config::AppConfig;
 use crate::subtitle::DisplayLine;
 use serde::Serialize;
 
@@ -12,6 +13,8 @@ pub const NOTICE_EVENT: &str = "notice://message";
 pub const CLICK_THROUGH_EVENT: &str = "click-through://update";
 /// 设置窗口被显示（它只会 hide，前端需要据此重新拉取配置）
 pub const SETTINGS_SHOWN_EVENT: &str = "settings://shown";
+/// 设置窗口被隐藏（前端清理预览定时器）
+pub const SETTINGS_HIDDEN_EVENT: &str = "settings://hidden";
 
 #[derive(Debug, Clone, Serialize)]
 pub struct SubtitleEntryPayload {
@@ -105,6 +108,8 @@ pub struct OverlayConfigPayload {
     pub translate_enabled: bool,
     pub max_lines: usize,
     pub label_sources: String,
+    pub asr_backend: String,
+    pub asr_language: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -146,7 +151,15 @@ pub struct SaveResult {
 }
 
 impl OverlayConfigPayload {
-    pub fn new(value: &SubtitleConfig, translate_enabled: bool) -> Self {
+    pub fn from_config(config: &AppConfig) -> Self {
+        let value = &config.subtitle;
+        let backend = &config.asr.backend;
+        let raw_language = if asr::languages::is_edge_backend(backend) {
+            &config.asr.edge.language
+        } else {
+            &config.asr.language
+        };
+        let asr_language = asr::languages::normalize_for_backend(backend, raw_language);
         Self {
             font_size: value.font_size,
             text_color: value.text_color.clone(),
@@ -157,9 +170,11 @@ impl OverlayConfigPayload {
             window_width: value.window_width,
             window_height: value.window_height,
             click_through: value.click_through,
-            translate_enabled,
+            translate_enabled: config.translate.enabled,
             max_lines: value.max_lines,
             label_sources: value.label_sources.as_str().to_string(),
+            asr_backend: config.asr.backend.clone(),
+            asr_language,
         }
     }
 }
