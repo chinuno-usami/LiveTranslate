@@ -166,7 +166,7 @@ toolbar_background = "rgba(10, 12, 18, 0.42)"
 show_source = false
 # 窗口尺寸和位置（手动拖动窗口或拖拽边缘缩放后会自动写回）
 window_width = 1200
-window_height = 220
+window_height = 260
 position_x = 200
 position_y = 760
 # 始终置顶
@@ -203,7 +203,7 @@ height_offset_m = -0.28
 font_size_px = 34
 line_alphas = [1.0, 0.72, 0.48]
 
-[output.osc]                    # 仅 Full 版
+[output.osc]                    # 仅 Windows Full 版预编译包（源码可单独启用 osc feature）
 enabled = false
 target = "127.0.0.1:9000"
 mode = "rolling"                # rolling / latest
@@ -281,7 +281,7 @@ send_typing = true
 - 可调：锚点（hmd/world）、距离、高度偏移、宽度、曲率、透明度、字号、颜色、行透明度。
 - 使用系统字体渲染 CJK，无需内置字体包；SteamVR 仅支持 Windows。
 
-### VRChat OSC Chatbox（Full 版）
+### VRChat OSC Chatbox（Windows Full 版 / 源码启用 osc）
 
 1. VRChat：`Action Menu → Options → OSC → Enabled`
 2. 设置页 → **OSC / VRChat** → 启用，目标地址默认 `127.0.0.1:9000`。
