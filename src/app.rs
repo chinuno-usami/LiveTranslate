@@ -375,10 +375,7 @@ async fn process_segment(
 
             if tx
                 .send(PipelineEvent::Subtitle(SubtitleLine::new(
-                    source_id,
-                    label,
-                    clean_text,
-                    translated,
+                    source_id, label, clean_text, translated,
                 )))
                 .await
                 .is_err()

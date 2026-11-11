@@ -167,10 +167,11 @@ pub fn validate_name(name: &str) -> Result<(), String> {
     if name.starts_with('.') || name.ends_with('.') {
         return Err("配置档名不能以点开头或结尾".to_string());
     }
-    if !chars
-        .iter()
-        .all(|c| (c.is_alphanumeric() && !matches!(c, '\u{00B2}' | '\u{00B3}' | '\u{00B9}')) || *c == '_' || *c == '-')
-    {
+    if !chars.iter().all(|c| {
+        (c.is_alphanumeric() && !matches!(c, '\u{00B2}' | '\u{00B3}' | '\u{00B9}'))
+            || *c == '_'
+            || *c == '-'
+    }) {
         return Err("配置档名只能包含字母、数字、中文、下划线和短横线".to_string());
     }
     let upper = name.to_ascii_uppercase();

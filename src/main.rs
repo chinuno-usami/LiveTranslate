@@ -2002,8 +2002,7 @@ fn require_profile_path(state: &SharedState) -> Result<PathBuf, String> {
 fn reject_if_config_degraded(state: &SharedState) -> Result<(), String> {
     if state.is_config_degraded() {
         return Err(
-            "当前配置文件存在待修复项并处于回退保护状态，请先在「设置」中修复并保存"
-                .to_string(),
+            "当前配置文件存在待修复项并处于回退保护状态，请先在「设置」中修复并保存".to_string(),
         );
     }
     Ok(())

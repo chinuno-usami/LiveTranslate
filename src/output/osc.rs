@@ -382,7 +382,8 @@ mod imp {
                 status.enabled = config.enabled;
                 if !config.enabled {
                     status.message = "未启用".to_string();
-                } else if !previous.enabled && !status.message.starts_with("无法创建 UDP socket") {
+                } else if !previous.enabled && !status.message.starts_with("无法创建 UDP socket")
+                {
                     status.message = "等待字幕".to_string();
                 }
             }
@@ -1145,7 +1146,10 @@ mod tests {
     #[test]
     fn strip_nul_and_utf16_limit_protect_osc_packets() {
         let dirty = line(Some("麦\n\0克风"), "hel\0lo", "你\0好");
-        assert_eq!(format_entry(&dirty, OscContent::Both), "[麦 克风] hello | 你好");
+        assert_eq!(
+            format_entry(&dirty, OscContent::Both),
+            "[麦 克风] hello | 你好"
+        );
 
         // 140 个 ASCII + 4 个 Emoji = 144 个 char，但 UTF-16 为 148 > 144
         let emoji_heavy = format!("{}{}", "a".repeat(140), "🎉".repeat(4));
@@ -1223,7 +1227,10 @@ mod tests {
             }
             other => panic!("意外的 OSC 包: {other:?}"),
         }
-        assert!(new_peer.recv_from(&mut buf).is_err(), "新端点不应收到误发的清屏包");
+        assert!(
+            new_peer.recv_from(&mut buf).is_err(),
+            "新端点不应收到误发的清屏包"
+        );
         sink.shutdown();
     }
 }

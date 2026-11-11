@@ -413,7 +413,10 @@ fn set_sources(doc: &mut DocumentMut, sources: &[AudioSourceConfig]) {
     let (section_header, old_first_own) = match (first_changed, first_prefix.as_deref()) {
         (true, Some(prefix)) if !prefix.trim().is_empty() => match prefix.split_once("\n\n") {
             Some((header, rest)) => (Some(header.to_string()), format!("\n{rest}")),
-            None => (Some(prefix.trim_end_matches('\n').to_string()), "\n".to_string()),
+            None => (
+                Some(prefix.trim_end_matches('\n').to_string()),
+                "\n".to_string(),
+            ),
         },
         _ => (None, "\n".to_string()),
     };
@@ -1017,7 +1020,10 @@ devce = "mic:0"
         let text = fs::read_to_string(&path).unwrap();
         let header_pos = text.find("# 多输入源：每个源一条").expect("段头注释应保留");
         let first_arr_pos = text.find("\n[[audio.sources]]").unwrap();
-        assert!(header_pos < first_arr_pos, "段头注释应仍在首个源之前:\n{text}");
+        assert!(
+            header_pos < first_arr_pos,
+            "段头注释应仍在首个源之前:\n{text}"
+        );
         assert!(text.contains("# 回环采集仅 Windows 支持"));
 
         // 删除首项后，段头注释仍应保留在新首项上
