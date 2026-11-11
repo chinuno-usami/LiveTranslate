@@ -36,6 +36,8 @@ const MAX_FONT = 72;
 
 let clickThrough = false;
 let isCapturing = false;
+let pointerInside = true;
+let lastOutputSummary = '';
 
 /// 应用字号（同步 CSS 变量、滑块、数值显示）
 function applyFontSize(px) {
@@ -85,6 +87,11 @@ function applyTranslateEnabled(enabled) {
 function setStatus(running, message) {
   isCapturing = Boolean(running);
   els.statusText.textContent = message;
+  if (lastOutputSummary) {
+    els.statusText.title = lastOutputSummary;
+  } else {
+    els.statusText.removeAttribute('title');
+  }
   els.statusDot.classList.toggle('running', isCapturing);
   els.statusDot.classList.toggle('idle', !isCapturing);
 }
@@ -133,7 +140,11 @@ function renderLines(entries) {
         ? `<span class="source-chip" style="--chip-color:${colorForSource(entry.source_id)}">${escapeHtml(label)}</span>`
         : '';
       const body = lines
-        .map((line, index) => `<div class="subtitle-line${index === 0 ? '' : ' subtitle-line-sub'}">${line}</div>`)
+        .map((line, index) => {
+          // 双语模式下后端顺序为 [原文, 译文]，弱化上方原文、突出下方主译文
+          const isSub = lines.length > 1 && index < lines.length - 1;
+          return `<div class="subtitle-line${isSub ? ' subtitle-line-sub' : ''}">${line}</div>`;
+        })
         .join('');
       const entryClass = label ? 'subtitle-entry labeled' : 'subtitle-entry';
       return `<div class="${entryClass}">${chip}${body}</div>`;
@@ -198,17 +209,35 @@ function isHelpOpen() {
   return els.helpModal && !els.helpModal.classList.contains('hidden');
 }
 
+function closePopovers() {
+  if (els.sourcesPopover) {
+    els.sourcesPopover.classList.add('hidden');
+  }
+  if (els.sourcesBtn) {
+    els.sourcesBtn.setAttribute('aria-expanded', 'false');
+  }
+  if (els.helpModal) {
+    els.helpModal.classList.add('hidden');
+  }
+}
+
 /// 应用点击穿透对工具栏的影响
 ///
-/// 穿透开启时窗口收不到鼠标事件，无法靠悬停唤出，因此直接保持收起。
+/// 穿透开启时窗口收不到鼠标事件，无法靠悬停唤出，因此直接收起工具栏与打开的浮层。
 function applyClickThroughToToolbar() {
-  setToolbarVisible(!clickThrough);
+  if (clickThrough) {
+    closePopovers();
+    setToolbarVisible(false);
+  } else {
+    setToolbarVisible(pointerInside || isHelpOpen());
+  }
 }
 
 function bindToolbarAutoHide() {
   const root = document.documentElement;
 
   const hide = () => {
+    pointerInside = false;
     if (clickThrough || isHelpOpen()) {
       return;
     }
@@ -216,6 +245,7 @@ function bindToolbarAutoHide() {
   };
 
   const show = () => {
+    pointerInside = true;
     if (clickThrough || isHelpOpen()) {
       return;
     }
@@ -267,8 +297,8 @@ async function bindDrag() {
 ///
 /// Tauri v1 没有 start_resize_dragging，只能在 JS 里跟踪鼠标位移，
 /// 再反复调用 Rust 命令设置窗口尺寸/位置。热区比原生大，且压住面板边框。
-const RESIZE_MIN_WIDTH = 320;
-const RESIZE_MIN_HEIGHT = 120;
+const RESIZE_MIN_WIDTH = 160;
+const RESIZE_MIN_HEIGHT = 80;
 
 function bindResize() {
   if (typeof invoke !== 'function') {
@@ -789,9 +819,10 @@ async function bindEvents() {
     if (payload.osc && payload.osc.enabled) {
       messages.push(`OSC: ${payload.osc.message || '已启用'}`);
     }
-    if (messages.length > 0) {
-      els.statusText.title = messages.join(' / ');
-    } else {
+    lastOutputSummary = messages.join(' / ');
+    if (lastOutputSummary) {
+      els.statusText.title = lastOutputSummary;
+    } else if (els.statusText.title === '' || els.statusText.title.startsWith('SteamVR:') || els.statusText.title.startsWith('OSC:')) {
       els.statusText.removeAttribute('title');
     }
   });
@@ -802,6 +833,7 @@ async function bindEvents() {
 
   await listen('config://subtitle', async (event) => {
     const config = event.payload;
+    const prevClickThrough = clickThrough;
     lastConfig = { ...config };
     applyFontSize(Number(config.font_size) || 28);
     applyShowSource(config.show_source);
@@ -812,7 +844,9 @@ async function bindEvents() {
     applyToolbarBackground(config.toolbar_background);
     clickThrough = Boolean(config.click_through);
     updateClickThroughLabel();
-    applyClickThroughToToolbar();
+    if (prevClickThrough !== clickThrough) {
+      applyClickThroughToToolbar();
+    }
 
     const backendChanged = Boolean(config.asr_backend && config.asr_backend !== lastBackend);
     if (config.asr_backend) {

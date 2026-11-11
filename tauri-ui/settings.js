@@ -129,6 +129,9 @@ function openDialog({
       }
     };
     const onKeyDown = (event) => {
+      if (event.isComposing || event.keyCode === 229) {
+        return;
+      }
       if (event.key === 'Escape') {
         event.preventDefault();
         event.stopPropagation();
@@ -406,6 +409,8 @@ async function switchProfile(name) {
     return;
   }
   clearPreviewTimer();
+  els.save.disabled = true;
+  if (els.profileSwitch) els.profileSwitch.disabled = true;
   try {
     const result = await invoke('switch_profile', { name });
     // 旧配置档的未保存编辑不能带进新配置档
@@ -417,6 +422,9 @@ async function switchProfile(name) {
     console.error(error);
     showError(`切换配置档失败: ${error}`);
     renderProfileBar(name);
+  } finally {
+    els.save.disabled = false;
+    updateProfileActionButtons();
   }
 }
 
@@ -510,8 +518,9 @@ async function deleteProfile() {
       await loadAll();
       setStatus(`已切换回「${fallback}」并删除配置档「${name}」`, 'ok');
     } catch (error) {
-      showError(`删除配置档失败: ${error}`);
       await loadAll();
+      showError(`删除配置档失败: ${error}`);
+      setStatus('删除失败', 'err');
     }
     return;
   }
@@ -1006,6 +1015,10 @@ function markSourcesDirty() {
  */
 function collectSourceErrors(sources) {
   const errors = [];
+  if (!Array.isArray(sources) || sources.length === 0) {
+    errors.push('至少需要保留 1 个输入源（不需要采集时可取消勾选「启用」）');
+    return errors;
+  }
   const ids = new Set();
   const devices = new Set();
   sources.forEach((source, index) => {
@@ -1361,6 +1374,15 @@ async function save() {
     setStatus('没有需要保存的修改');
     return;
   }
+  if (state.rawDirty) {
+    const confirmed = await uiConfirm(
+      '保存表单修改将丢弃「高级 / 原始配置」中尚未保存的 TOML 编辑，继续？',
+      { title: '丢弃原始配置修改', okText: '继续保存', danger: true },
+    );
+    if (!confirmed) {
+      return;
+    }
+  }
 
   clearPreviewTimer();
   els.save.disabled = true;
@@ -1483,6 +1505,10 @@ async function reloadOnShow() {
       okText: '保留修改',
       cancelText: '丢弃并重新加载',
     });
+    if (choice === null) {
+      // 用户按 Esc 或直接关闭设置窗取消了确认：不继续重载、更不能重新下发预览
+      return;
+    }
     if (choice === false) {
       clearLocalEdits();
     } else {
@@ -1505,17 +1531,7 @@ window.addEventListener('DOMContentLoaded', async () => {
     return;
   }
   bindTopbar();
-  // 设置窗口在 app 启动时就创建（hidden），通过后端命令判断可见性（不依赖 window allowlist），
-  // 不可见时不做初始化查询，等第一次 settings://shown 再加载。
-  const visible = await invoke('is_window_visible').catch(() => true);
-  if (visible) {
-    state.hasLoaded = true;
-    await loadAll();
-  } else {
-    setStatus('就绪');
-  }
-  // 设置窗口关闭只是 hide()，前端状态会一直活着；
-  // 再次显示时重新拉取快照，同时支持直接跳到指定分组（如紧凑浮窗点击「源」直达输入源页）。
+  // 先挂好事件监听再探测初始可见性，消除首次打开设置窗恰逢异步探测期间的空白窗竞态
   if (window.__TAURI__?.event?.listen) {
     await window.__TAURI__.event.listen('settings://shown', (event) => {
       const targetGroup = event?.payload?.group || null;
@@ -1541,5 +1557,31 @@ window.addEventListener('DOMContentLoaded', async () => {
       clearPreviewTimer();
       closeActiveDialog();
     });
+    await window.__TAURI__.event.listen('source-status://update', async () => {
+      if (!state.hasLoaded || state.dirty.has('audio.sources')) return;
+      try {
+        const sources = await invoke('get_sources_config');
+        const fresh = deepClone(sources.sources || []);
+        const nextJson = JSON.stringify(fresh);
+        if (nextJson !== state.originalSourcesJson) {
+          state.sources = fresh;
+          state.originalSourcesJson = nextJson;
+          if (state.currentGroup === 'sources') {
+            renderContent();
+          }
+        }
+      } catch (error) {
+        console.warn('同步输入源配置失败', error);
+      }
+    });
+  }
+  // 设置窗口在 app 启动时就创建（hidden），通过后端命令判断可见性（不依赖 window allowlist），
+  // 不可见时不做初始化查询，等第一次 settings://shown 再加载。
+  const visible = await invoke('is_window_visible').catch(() => true);
+  if (visible && !state.hasLoaded) {
+    state.hasLoaded = true;
+    await loadAll();
+  } else if (!state.hasLoaded) {
+    setStatus('就绪');
   }
 });
