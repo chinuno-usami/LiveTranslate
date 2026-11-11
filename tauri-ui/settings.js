@@ -1336,8 +1336,17 @@ function updateDirtyIndicator() {
   }
 }
 
+// 实时预览只覆盖浮窗视觉（subtitle.*）；output.* 在后端故意不预览，
+// 避免未保存就连上 VR / 往 VRChat 发包，所以也别往里发无效的 preview 请求。
 function isPreviewablePath(path) {
-  return Boolean(path && (path.startsWith('subtitle.') || path.startsWith('output.')));
+  return Boolean(path && path.startsWith('subtitle.'));
+}
+
+// 保存/重载失败后脏值仍在，但预览已被 cancel_preview 回滚，需要重新推回浮窗
+function reschedulePreview() {
+  if (state.busy) return;
+  const previewable = [...state.dirty.keys()].find(isPreviewablePath);
+  if (previewable) schedulePreview(previewable);
 }
 
 function schedulePreview(changedPath) {
@@ -1359,7 +1368,7 @@ function schedulePreview(changedPath) {
     try {
       await invoke('preview_settings', { changes });
     } catch (error) {
-      // 预览失败不阻塞编辑（例如标准版拒绝 output.*）
+      // 预览失败不阻塞编辑
       console.warn('preview_settings 失败', error);
     }
   }, 300);
@@ -1445,9 +1454,11 @@ async function save() {
     if (state.schema?.warning) {
       clearPreviewTimer();
       state.previewToken += 1;
+      let saved = false;
       setBusy(true);
       try {
         const result = await invoke('save_settings', { changes: [] });
+        saved = true;
         clearLocalEdits();
         setStatus(result.message || '已确认恢复配置并退出保护态', 'ok');
         showError('');
@@ -1459,6 +1470,7 @@ async function save() {
         setStatus('保存失败', 'err');
       } finally {
         setBusy(false);
+        if (!saved) reschedulePreview();
       }
       return;
     }
@@ -1477,11 +1489,13 @@ async function save() {
 
   clearPreviewTimer();
   state.previewToken += 1;
+  let saved = false;
   setBusy(true);
   try {
     let result;
     try {
       result = await invoke('save_settings', { changes });
+      saved = true;
     } catch (error) {
       console.error(error);
       showError(`保存失败: ${error}`);
@@ -1508,29 +1522,35 @@ async function save() {
     }
   } finally {
     setBusy(false);
+    if (!saved) reschedulePreview();
   }
 }
 
 async function cancel() {
   clearPreviewTimer();
   state.previewToken += 1;
-  clearLocalEdits();
-  state.sources = JSON.parse(state.originalSourcesJson);
+  setBusy(true);
   try {
-    await invoke('cancel_preview');
-  } catch (error) {
-    console.warn(error);
+    clearLocalEdits();
+    state.sources = JSON.parse(state.originalSourcesJson);
+    try {
+      await invoke('cancel_preview');
+    } catch (error) {
+      console.warn(error);
+    }
+    els.restartBanner.classList.add('hidden');
+    showError('');
+    try {
+      await refreshSchemaOnly();
+    } catch (error) {
+      console.warn(error);
+      showError('已恢复配置，但界面刷新失败，请点「重新加载」');
+    }
+    updateDirtyIndicator();
+    setStatus('已放弃未保存的修改');
+  } finally {
+    setBusy(false);
   }
-  els.restartBanner.classList.add('hidden');
-  showError('');
-  try {
-    await refreshSchemaOnly();
-  } catch (error) {
-    console.warn(error);
-    showError('已恢复配置，但界面刷新失败，请点「重新加载」');
-  }
-  updateDirtyIndicator();
-  setStatus('已放弃未保存的修改');
 }
 
 async function reload() {
@@ -1546,11 +1566,13 @@ async function reload() {
   }
   clearPreviewTimer();
   state.previewToken += 1;
+  let reloaded = false;
   setBusy(true);
   await invoke('cancel_preview').catch(() => {});
   try {
     const result = await invoke('reload_config');
     // 仅在后端重载成功后再清脏标记，失败时保留表单与「保存（N 项）」状态
+    reloaded = true;
     clearLocalEdits();
     await loadAll();
     setStatus(result.message || '已重新加载', 'ok');
@@ -1559,6 +1581,8 @@ async function reload() {
     updateDirtyIndicator();
   } finally {
     setBusy(false);
+    // 重载失败时脏值仍在，但 cancel_preview 已经把浮窗回滚了，重新推一次预览
+    if (!reloaded) reschedulePreview();
   }
 }
 
