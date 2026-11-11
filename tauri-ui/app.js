@@ -35,6 +35,7 @@ const MIN_FONT = 12;
 const MAX_FONT = 72;
 
 let clickThrough = false;
+let isCapturing = false;
 
 /// 应用字号（同步 CSS 变量、滑块、数值显示）
 function applyFontSize(px) {
@@ -82,9 +83,19 @@ function applyTranslateEnabled(enabled) {
 }
 
 function setStatus(running, message) {
+  isCapturing = Boolean(running);
   els.statusText.textContent = message;
-  els.statusDot.classList.toggle('running', running);
-  els.statusDot.classList.toggle('idle', !running);
+  els.statusDot.classList.toggle('running', isCapturing);
+  els.statusDot.classList.toggle('idle', !isCapturing);
+}
+
+/// 显示操作或运行提示错误，但不篡改当前真实采集中的圆点状态
+function showActionError(message) {
+  const text = String(message || '出现错误');
+  els.statusText.textContent = text;
+  els.statusText.title = text;
+  els.statusDot.classList.toggle('running', isCapturing);
+  els.statusDot.classList.toggle('idle', !isCapturing);
 }
 
 /// 根据 source_id 稳定地映射到一个来源颜色（用于 chip）
@@ -116,7 +127,7 @@ function renderLines(entries) {
       const prefix = label ? `[${label}] ` : '';
       const lines = (entry.lines || []).map((line) => {
         const text = prefix && line.startsWith(prefix) ? line.slice(prefix.length) : line;
-        return escapeHtml(text);
+        return formatSubtitleHtml(text);
       });
       const chip = label
         ? `<span class="source-chip" style="--chip-color:${colorForSource(entry.source_id)}">${escapeHtml(label)}</span>`
@@ -130,17 +141,27 @@ function renderLines(entries) {
 }
 
 function escapeHtml(text) {
-  return text
+  return String(text == null ? '' : text)
     .replaceAll('&', '&amp;')
     .replaceAll('<', '&lt;')
     .replaceAll('>', '&gt;')
     .replaceAll('"', '&quot;')
-    .replaceAll("'", '&#39;')
-    .replaceAll('\n', '<br />');
+    .replaceAll("'", '&#39;');
+}
+
+function formatSubtitleHtml(text) {
+  return escapeHtml(text).replaceAll('\n', '<br />');
 }
 
 async function loadInitialConfig() {
   const config = await invoke('get_overlay_config');
+  lastConfig = { ...config };
+  if (config.asr_backend) {
+    lastBackend = config.asr_backend;
+  }
+  if (config.asr_language) {
+    lastLanguage = config.asr_language;
+  }
   applyFontSize(Number(config.font_size) || 28);
   applyShowSource(config.show_source);
   applyTranslateEnabled(config.translate_enabled);
@@ -291,12 +312,41 @@ function bindResize() {
       event.preventDefault();
       event.stopPropagation();
 
+      let ended = false;
+      let onMove = null;
+      let lastBounds = null;
+      const onUp = () => {
+        ended = true;
+        if (onMove) {
+          window.removeEventListener('mousemove', onMove, true);
+        }
+        window.removeEventListener('mouseup', onUp, true);
+
+        // 只是点了一下没拖动，不必写回
+        if (!lastBounds) {
+          return;
+        }
+
+        // 等最后一次尺寸真正应用后再把几何写回配置，避免存到拖拽中的旧值
+        pushBounds(lastBounds).then(() => {
+          invoke('persist_window_geometry').catch((error) => {
+            console.error('persist_window_geometry 失败', error);
+          });
+        });
+      };
+      // 先挂 mouseup：若用户在 window_geometry IPC 返回前就已松手，不至于泄漏监听
+      window.addEventListener('mouseup', onUp, true);
+
       let start;
       try {
         const [x, y, width, height] = await invoke('window_geometry');
         start = { x, y, width, height };
       } catch (error) {
+        window.removeEventListener('mouseup', onUp, true);
         console.error('window_geometry 失败', error);
+        return;
+      }
+      if (ended) {
         return;
       }
 
@@ -306,8 +356,7 @@ function bindResize() {
       const startY = event.screenY;
 
       // 按下鼠标后系统会把鼠标事件锁定到本窗口，指针移出窗口仍能收到 move/up
-      let lastBounds = null;
-      const onMove = (moveEvent) => {
+      onMove = (moveEvent) => {
         const dx = moveEvent.screenX - startX;
         const dy = moveEvent.screenY - startY;
 
@@ -347,25 +396,7 @@ function bindResize() {
         pushBounds(lastBounds);
       };
 
-      const onUp = () => {
-        window.removeEventListener('mousemove', onMove, true);
-        window.removeEventListener('mouseup', onUp, true);
-
-        // 只是点了一下没拖动，不必写回
-        if (!lastBounds) {
-          return;
-        }
-
-        // 等最后一次尺寸真正应用后再把几何写回配置，避免存到拖拽中的旧值
-        pushBounds(lastBounds).then(() => {
-          invoke('persist_window_geometry').catch((error) => {
-            console.error('persist_window_geometry 失败', error);
-          });
-        });
-      };
-
       window.addEventListener('mousemove', onMove, true);
-      window.addEventListener('mouseup', onUp, true);
     });
   });
 }
@@ -386,7 +417,8 @@ function fatal(message) {
 let lastSourcesPayload = null;
 /// 后端当前生效的浮窗配置（用于失败时回滚乐观更新）
 let lastConfig = {};
-/// 后端当前生效的识别语言
+/// 后端当前生效的 ASR 后端与识别语言
+let lastBackend = '';
 let lastLanguage = '';
 
 function sourceRow(source, devices) {
@@ -421,8 +453,16 @@ function sourceRow(source, devices) {
     </div>`;
 }
 
-/// 按 id 就地更新状态点与提示，不重建 DOM
+/// 按 id 就地更新状态点与控件状态；若设置页增删重排了输入源则整块刷新
 function updateSourceRows(sources) {
+  const rows = Array.from(els.sourcesList.querySelectorAll('.source-row'));
+  const sameShape =
+    rows.length === sources.length &&
+    rows.every((row, index) => row.dataset.id === String(sources[index].id));
+  if (!sameShape) {
+    refreshSources();
+    return;
+  }
   if (lastSourcesPayload) {
     lastSourcesPayload = { ...lastSourcesPayload, sources };
   }
@@ -434,7 +474,23 @@ function updateSourceRows(sources) {
     const dot = row.querySelector('.status-dot');
     if (dot) dot.className = `status-dot ${source.running ? 'running' : 'idle'}`;
     const label = row.querySelector('.source-label');
-    if (label) label.title = source.message || '';
+    if (label) {
+      label.textContent = source.label || '';
+      label.title = source.message || '';
+    }
+    const translate = row.querySelector('.source-translate');
+    if (translate) translate.checked = Boolean(source.translate);
+    const enabled = row.querySelector('.source-enabled');
+    if (enabled) enabled.checked = Boolean(source.enabled);
+    const device = row.querySelector('.source-device');
+    if (device && document.activeElement !== device && device.value !== source.device) {
+      if (Array.from(device.options).some((opt) => opt.value === source.device)) {
+        device.value = source.device;
+      } else {
+        refreshSources();
+        return;
+      }
+    }
   }
 }
 
@@ -469,7 +525,7 @@ function renderSources(payload, devices) {
         await invoke('set_source_device', { id, spec: event.target.value });
       } catch (error) {
         console.error('切换设备失败', error);
-        setStatus(false, `切换设备失败: ${error}`);
+        showActionError(`切换设备失败: ${error}`);
       }
       refreshSources();
     });
@@ -478,7 +534,7 @@ function renderSources(payload, devices) {
         await invoke('set_source_translate', { id, enabled: event.target.checked });
       } catch (error) {
         console.error('切换翻译失败', error);
-        setStatus(false, `切换翻译失败: ${error}`);
+        showActionError(`切换翻译失败: ${error}`);
         event.target.checked = !event.target.checked;
       }
       refreshSources();
@@ -488,7 +544,7 @@ function renderSources(payload, devices) {
         await invoke('set_source_enabled', { id, enabled: event.target.checked });
       } catch (error) {
         console.error('切换启用失败', error);
-        setStatus(false, `切换启用失败: ${error}`);
+        showActionError(`切换启用失败: ${error}`);
       }
       refreshSources();
     });
@@ -527,18 +583,34 @@ async function loadLanguages() {
 
 async function bindActions() {
   els.startBtn.addEventListener('click', async () => {
-    await invoke('start_capture');
+    try {
+      await invoke('start_capture');
+    } catch (error) {
+      console.error('启动采集失败', error);
+      showActionError(`启动采集失败: ${error}`);
+    }
   });
 
   els.stopBtn.addEventListener('click', async () => {
-    await invoke('stop_capture');
+    try {
+      await invoke('stop_capture');
+    } catch (error) {
+      console.error('停止采集失败', error);
+      showActionError(`停止采集失败: ${error}`);
+    }
   });
 
   els.throughBtn.addEventListener('click', async () => {
-    clickThrough = !clickThrough;
-    await invoke('set_click_through', { enabled: clickThrough });
-    updateClickThroughLabel();
-    applyClickThroughToToolbar();
+    const next = !clickThrough;
+    try {
+      await invoke('set_click_through', { enabled: next });
+      clickThrough = next;
+      updateClickThroughLabel();
+      applyClickThroughToToolbar();
+    } catch (error) {
+      console.error('切换点击穿透失败', error);
+      showActionError(`切换穿透失败: ${error}`);
+    }
   });
 
   els.sourcesBtn.addEventListener('click', async () => {
@@ -554,10 +626,12 @@ async function bindActions() {
   });
   els.addSourceBtn.addEventListener('click', async () => {
     els.sourcesPopover.classList.add('hidden');
+    els.sourcesBtn.setAttribute('aria-expanded', 'false');
     try {
       await invoke('open_settings');
     } catch (error) {
       console.error('打开设置失败', error);
+      showActionError(`打开设置失败: ${error}`);
     }
   });
   els.settingsBtn.addEventListener('click', async () => {
@@ -565,7 +639,7 @@ async function bindActions() {
       await invoke('open_settings');
     } catch (error) {
       console.error('打开设置失败', error);
-      setStatus(false, `打开设置失败: ${error}`);
+      showActionError(`打开设置失败: ${error}`);
     }
   });
 
@@ -574,15 +648,21 @@ async function bindActions() {
     const code = els.languageSelect.value;
     try {
       await invoke('set_language', { code });
+      lastLanguage = code;
     } catch (error) {
       console.error('切换语言失败', error);
       if (lastLanguage) els.languageSelect.value = lastLanguage;
-      setStatus(false, `切换语言失败: ${error}`);
+      showActionError(`切换语言失败: ${error}`);
     }
   });
 
   els.closeBtn.addEventListener('click', async () => {
-    await invoke('close_overlay');
+    try {
+      await invoke('close_overlay');
+    } catch (error) {
+      console.error('关闭浮窗失败', error);
+      showActionError(`关闭浮窗失败: ${error}`);
+    }
   });
 
   // 字号滑块：拖动时实时预览，松手后持久化到配置文件
@@ -593,35 +673,41 @@ async function bindActions() {
     const size = Number(els.fontSlider.value);
     try {
       await invoke('set_font_size', { size });
+      lastConfig.font_size = size;
     } catch (error) {
       console.error('保存字号失败', error);
       // 浮窗已经按新字号渲染了，回退到后端仍生效的值，避免“幽灵设置”
       applyFontSize(lastConfig.font_size || 28);
-      setStatus(false, `保存字号失败: ${error}`);
+      showActionError(`保存字号失败: ${error}`);
     }
   });
 
   // 显示原文开关
   els.sourceToggle.addEventListener('change', async () => {
     const enabled = els.sourceToggle.checked;
+    const previous = Boolean(lastConfig.show_source);
     try {
       await invoke('set_show_source', { enabled });
+      lastConfig.show_source = enabled;
     } catch (error) {
       console.error('切换原文失败', error);
-      setStatus(false, `切换原文失败: ${error}`);
+      applyShowSource(previous);
+      showActionError(`切换原文失败: ${error}`);
     }
   });
 
   // 翻译开关：关闭即仅识别模式，立即生效
   els.translateToggle.addEventListener('change', async () => {
     const enabled = els.translateToggle.checked;
+    const previous = lastConfig.translate_enabled !== false;
     applyTranslateEnabled(enabled);
     try {
       await invoke('set_translate_enabled', { enabled });
+      lastConfig.translate_enabled = enabled;
     } catch (error) {
       console.error('切换翻译失败', error);
-      applyTranslateEnabled(!enabled);
-      setStatus(false, `切换翻译失败: ${error}`);
+      applyTranslateEnabled(previous);
+      showActionError(`切换翻译失败: ${error}`);
     }
   });
 
@@ -695,7 +781,7 @@ async function bindEvents() {
     setStatus(event.payload.running, event.payload.message);
   });
 
-  await listen('config://subtitle', (event) => {
+  await listen('config://subtitle', async (event) => {
     const config = event.payload;
     lastConfig = { ...config };
     applyFontSize(Number(config.font_size) || 28);
@@ -708,6 +794,26 @@ async function bindEvents() {
     clickThrough = Boolean(config.click_through);
     updateClickThroughLabel();
     applyClickThroughToToolbar();
+
+    const backendChanged = Boolean(config.asr_backend && config.asr_backend !== lastBackend);
+    if (config.asr_backend) {
+      lastBackend = config.asr_backend;
+    }
+    if (backendChanged) {
+      await loadLanguages();
+    } else if (config.asr_language && config.asr_language !== lastLanguage) {
+      lastLanguage = config.asr_language;
+      if (els.languageSelect) {
+        const exists = Array.from(els.languageSelect.options).some(
+          (opt) => opt.value === config.asr_language,
+        );
+        if (!exists) {
+          await loadLanguages();
+        } else {
+          els.languageSelect.value = config.asr_language;
+        }
+      }
+    }
   });
 
   // 托盘 / 快捷键切换点击穿透时同步按钮文案与工具栏
@@ -727,26 +833,7 @@ async function bindEvents() {
   });
 
   await listen('error://message', (event) => {
-    setStatus(false, String(event.payload || '出现错误'));
-  });
-
-  // 系统托盘和快捷键事件
-  await listen('tray://command', (event) => {
-    const command = event.payload;
-    if (command === 'start') {
-      els.startBtn.click();
-    } else if (command === 'stop') {
-      els.stopBtn.click();
-    }
-  });
-
-  await listen('shortcut://command', (event) => {
-    const command = event.payload;
-    if (command === 'start') {
-      els.startBtn.click();
-    } else if (command === 'stop') {
-      els.stopBtn.click();
-    }
+    showActionError(event.payload || '出现错误');
   });
 }
 
@@ -802,6 +889,6 @@ window.addEventListener('DOMContentLoaded', async () => {
     await invoke('start_capture');
   } catch (error) {
     console.error('start_capture 失败', error);
-    setStatus(false, `启动采集失败: ${error}`);
+    showActionError(`启动采集失败: ${error}`);
   }
 });

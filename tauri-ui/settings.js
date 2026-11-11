@@ -4,6 +4,7 @@ const invoke = tauriApi.invoke || (tauriApi.tauri && tauriApi.tauri.invoke);
 
 const els = {
   profileSelect: document.getElementById('profile-select'),
+  profileSwitch: document.getElementById('profile-switch'),
   profileNew: document.getElementById('profile-new'),
   profileDup: document.getElementById('profile-dup'),
   profileRename: document.getElementById('profile-rename'),
@@ -29,14 +30,44 @@ const state = {
   profiles: null,
   rawPath: null,
   rawText: '',
+  rawDirty: false,
   devices: [],
   languages: [],
   sources: [],
   currentGroup: 'sources',
   dirty: new Map(),
+  invalidInputs: new Map(),
   originalSourcesJson: '[]',
   previewTimer: null,
 };
+
+function clearPreviewTimer() {
+  if (state.previewTimer) {
+    clearTimeout(state.previewTimer);
+    state.previewTimer = null;
+  }
+}
+
+function dirtyCount() {
+  return state.dirty.size + (state.rawDirty ? 1 : 0);
+}
+
+function escapeControlChars(value) {
+  return String(value == null ? '' : value)
+    .replaceAll('\\', '\\\\')
+    .replaceAll('\n', '\\n')
+    .replaceAll('\r', '\\r')
+    .replaceAll('\t', '\\t');
+}
+
+function unescapeControlChars(value) {
+  return String(value == null ? '' : value).replace(/\\([\\nrt])/g, (_, ch) => {
+    if (ch === 'n') return '\n';
+    if (ch === 'r') return '\r';
+    if (ch === 't') return '\t';
+    return '\\';
+  });
+}
 
 function escapeHtml(text) {
   return String(text == null ? '' : text)
@@ -91,7 +122,9 @@ async function loadAll() {
     state.capabilities = capabilities;
     state.profiles = profiles;
     state.rawPath = raw.path;
-    state.rawText = raw.text || '';
+    if (!state.rawDirty) {
+      state.rawText = raw.text || '';
+    }
     // 输入源表：本地有未保存的改动时以本地为准，否则会被这份快照覆盖
     const keepLocalSources = state.dirty.has('audio.sources');
     const freshSources = deepClone(sources.sources || []);
@@ -102,6 +135,7 @@ async function loadAll() {
     // 注意：这里**不能** state.dirty.clear()。
     // 设置窗口在 await 期间仍然可交互，清空会把用户刚输入的内容吞掉；
     // 丢弃修改只应该在 reloadOnShow 的确认框里显式发生。
+    state.invalidInputs.clear();
     pruneDirty();
 
     els.configPath.textContent = raw.path || '（内置默认配置，首次保存时创建）';
@@ -109,7 +143,9 @@ async function loadAll() {
     renderNav();
     renderContent();
     updateDirtyIndicator();
-    setStatus('就绪');
+    if (dirtyCount() === 0) {
+      setStatus('就绪');
+    }
     els.restartBanner.classList.add('hidden');
   } catch (error) {
     console.error(error);
@@ -132,7 +168,7 @@ function pruneDirty() {
   }
 }
 
-async function refreshSchemaOnly() {
+async function refreshSchemaOnly(preferredProfile) {
   const [schema, raw, sources, devices, languages, profiles] = await Promise.all([
     invoke('get_settings_schema'),
     invoke('get_config_raw'),
@@ -143,39 +179,55 @@ async function refreshSchemaOnly() {
   ]);
   state.schema = schema;
   state.profiles = profiles;
-  renderProfileBar();
+  renderProfileBar(preferredProfile);
   state.rawPath = raw.path;
-  state.rawText = raw.text || '';
+  if (!state.rawDirty) {
+    state.rawText = raw.text || '';
+  }
+  els.configPath.textContent = raw.path || '（内置默认配置，首次保存时创建）';
   state.sources = deepClone(sources.sources || []);
   state.originalSourcesJson = JSON.stringify(state.sources);
   state.devices = devices.devices || [];
   state.languages = languages.options || [];
+  state.invalidInputs.clear();
   renderContent();
 }
 
 // ---------------- 配置档 ----------------
 
-function renderProfileBar() {
+function updateProfileActionButtons() {
   const status = state.profiles || { enabled: false, profiles: [], active: null };
-  const options = (status.profiles || [])
+  const enabled = Boolean(status.enabled);
+  const selected = selectedProfile();
+  els.profileSelect.disabled = !enabled;
+  if (els.profileSwitch) {
+    els.profileSwitch.disabled = !enabled || !selected || selected === status.active;
+  }
+  els.profileNew.disabled = !enabled;
+  els.profileDup.disabled = !enabled || !selected;
+  els.profileRename.disabled = !enabled || !selected || selected === 'default';
+  els.profileDelete.disabled = !enabled || !selected || selected === 'default';
+  els.profileOpen.disabled = !enabled;
+}
+
+function renderProfileBar(preferredSelected) {
+  const status = state.profiles || { enabled: false, profiles: [], active: null };
+  const list = status.profiles || [];
+  const target =
+    preferredSelected && list.some((profile) => profile.name === preferredSelected)
+      ? preferredSelected
+      : status.active;
+  const options = list
     .map(
       (profile) =>
-        `<option value="${escapeHtml(profile.name)}"${profile.name === status.active ? ' selected' : ''}>` +
-        `${escapeHtml(profile.name)}${profile.valid ? '' : '（无效）'}</option>`,
+        `<option value="${escapeHtml(profile.name)}"${profile.name === target ? ' selected' : ''}>` +
+        `${escapeHtml(profile.name)}${profile.name === status.active ? '（当前）' : ''}${
+          profile.valid ? '' : '（无效）'
+        }</option>`,
     )
     .join('');
   els.profileSelect.innerHTML = options || '<option value="">（无）</option>';
-  els.profileSelect.disabled = !status.enabled;
-
-  for (const button of [
-    els.profileNew,
-    els.profileDup,
-    els.profileRename,
-    els.profileDelete,
-    els.profileOpen,
-  ]) {
-    button.disabled = !status.enabled;
-  }
+  updateProfileActionButtons();
   els.profileReason.textContent = status.enabled
     ? ''
     : status.reason || '当前配置路径不支持配置档';
@@ -186,33 +238,31 @@ function selectedProfile() {
 }
 
 async function switchProfile(name) {
-  if (!name) return;
-  if (state.dirty.size > 0) {
-    const ok = window.confirm(
-      `当前有 ${state.dirty.size} 项未保存的修改，切换配置档将丢弃它们。继续？`,
-    );
+  if (!name || name === state.profiles?.active) return;
+  const count = dirtyCount();
+  if (count > 0) {
+    const ok = window.confirm(`当前有 ${count} 项未保存的修改，切换配置档将丢弃它们。继续？`);
     if (!ok) {
-      renderProfileBar();
       return;
     }
   }
-  if (!window.confirm(`切换到配置档「${name}」将重启采集并替换当前配置，继续？`)) {
-    renderProfileBar();
+  if (!window.confirm(`切换到配置档「${name}」将替换当前配置（采集运行中会自动重启），继续？`)) {
     return;
   }
+  clearPreviewTimer();
   try {
     const result = await invoke('switch_profile', { name });
-    setStatus(result.message || '已切换配置档', 'ok');
-    state.profiles = await invoke('get_profiles');
-    renderProfileBar();
     // 旧配置档的未保存编辑不能带进新配置档
     state.dirty.clear();
-    await refreshSchemaOnly();
+    state.invalidInputs.clear();
+    state.rawDirty = false;
+    await refreshSchemaOnly(name);
     updateDirtyIndicator();
+    setStatus(result.message || '已切换配置档', 'ok');
   } catch (error) {
     console.error(error);
     showError(`切换配置档失败: ${error}`);
-    renderProfileBar();
+    renderProfileBar(name);
   }
 }
 
@@ -222,9 +272,12 @@ async function createProfile() {
   const copyCurrent = window.confirm('确定 = 从当前配置复制；取消 = 创建默认配置');
   try {
     await invoke('create_profile', { name, copyCurrent });
-    state.profiles = await invoke('get_profiles');
-    renderProfileBar();
-    setStatus(`已创建配置档「${name}」`, 'ok');
+    const [profiles, raw] = await Promise.all([invoke('get_profiles'), invoke('get_config_raw')]);
+    state.profiles = profiles;
+    state.rawPath = raw.path;
+    els.configPath.textContent = raw.path || '（内置默认配置，首次保存时创建）';
+    renderProfileBar(name);
+    setStatus(`已创建配置档「${name}」（可点击「切换」启用）`, 'ok');
   } catch (error) {
     showError(`创建配置档失败: ${error}`);
   }
@@ -238,8 +291,8 @@ async function duplicateProfile() {
   try {
     await invoke('duplicate_profile', { from, to });
     state.profiles = await invoke('get_profiles');
-    renderProfileBar();
-    setStatus(`已复制为「${to}」`, 'ok');
+    renderProfileBar(to);
+    setStatus(`已复制为「${to}」（可点击「切换」启用）`, 'ok');
   } catch (error) {
     showError(`复制配置档失败: ${error}`);
   }
@@ -247,14 +300,14 @@ async function duplicateProfile() {
 
 async function renameProfile() {
   const old = selectedProfile();
-  if (!old) return;
+  if (!old || old === 'default') return;
   const next = window.prompt(`把「${old}」重命名为`, old);
   if (!next || next === old) return;
   try {
     await invoke('rename_profile', { old, new: next });
     state.profiles = await invoke('get_profiles');
-    renderProfileBar();
-    setStatus('已重命名配置档', 'ok');
+    renderProfileBar(next);
+    setStatus(`已重命名为「${next}」`, 'ok');
   } catch (error) {
     showError(`重命名失败: ${error}`);
   }
@@ -262,7 +315,37 @@ async function renameProfile() {
 
 async function deleteProfile() {
   const name = selectedProfile();
-  if (!name) return;
+  if (!name || name === 'default') return;
+  const isActive = name === state.profiles?.active;
+  if (isActive) {
+    const fallback =
+      (state.profiles?.profiles || []).some((p) => p.name === 'default')
+        ? 'default'
+        : (state.profiles?.profiles || []).find((p) => p.name !== name)?.name || 'default';
+    const dirtyHint = dirtyCount() > 0 ? '，并丢弃当前未保存的修改' : '';
+    if (
+      !window.confirm(
+        `配置档「${name}」正在使用，删除前将自动切换回「${fallback}」${dirtyHint}。此操作不可恢复，确定删除？`,
+      )
+    ) {
+      return;
+    }
+    clearPreviewTimer();
+    try {
+      await invoke('switch_profile', { name: fallback });
+      state.dirty.clear();
+      state.invalidInputs.clear();
+      state.rawDirty = false;
+      await invoke('delete_profile', { name });
+      await loadAll();
+      setStatus(`已切换回「${fallback}」并删除配置档「${name}」`, 'ok');
+    } catch (error) {
+      showError(`删除配置档失败: ${error}`);
+      await loadAll();
+    }
+    return;
+  }
+
   if (!window.confirm(`删除配置档「${name}」？此操作不可恢复。`)) return;
   try {
     await invoke('delete_profile', { name });
@@ -288,9 +371,11 @@ function renderNav() {
   els.nav.querySelectorAll('.nav-item').forEach((button) => {
     button.addEventListener('click', () => {
       state.currentGroup = button.dataset.group;
+      state.invalidInputs.clear();
       els.search.value = '';
       renderNav();
       renderContent();
+      updateDirtyIndicator();
     });
   });
 }
@@ -390,9 +475,13 @@ function renderSearch(query) {
       )
       .join('')}`;
   bindFieldEvents();
-  els.content.querySelectorAll('.section-disabled input, .section-disabled select, .section-disabled textarea').forEach((element) => {
-    element.disabled = true;
-  });
+  els.content
+    .querySelectorAll(
+      '.section-disabled input, .section-disabled select, .section-disabled textarea, .section-disabled button',
+    )
+    .forEach((element) => {
+      element.disabled = true;
+    });
 }
 
 // ---------------- 字段渲染 ----------------
@@ -471,9 +560,12 @@ function renderControl(field, value) {
     case 'device':
       return `<select data-path="${path}">${renderDeviceOptions(value)}</select>`;
     case 'language':
-      return `<select data-path="${path}">${renderLanguageOptions(value)}</select>`;
-    default:
-      return `<input type="text" data-path="${path}" value="${escapeHtml(value)}" />`;
+      return `<select data-path="${path}">${renderLanguageOptions(value, field.options)}</select>`;
+    default: {
+      const displayValue =
+        field.path === 'output.osc.separator' ? escapeControlChars(value) : value;
+      return `<input type="text" data-path="${path}" value="${escapeHtml(displayValue)}" />`;
+    }
   }
 }
 
@@ -506,11 +598,14 @@ function renderDeviceOptions(current) {
     .join('');
 }
 
-function renderLanguageOptions(current) {
-  const entries = state.languages.map((language) => ({
-    value: language.code,
-    label: language.label,
-  }));
+function renderLanguageOptions(current, fieldOptions) {
+  const entries =
+    Array.isArray(fieldOptions) && fieldOptions.length > 0
+      ? fieldOptions.map((option) => ({ value: option.value, label: option.label }))
+      : state.languages.map((language) => ({
+          value: language.code,
+          label: language.label,
+        }));
   if (current && !entries.some((entry) => entry.value === current)) {
     entries.unshift({ value: current, label: current });
   }
@@ -523,11 +618,16 @@ function renderLanguageOptions(current) {
     .join('');
 }
 
+function formatTomlKey(key) {
+  const text = String(key);
+  return /^[A-Za-z0-9_-]+$/.test(text) ? text : JSON.stringify(text);
+}
+
 function objectToToml(value) {
   if (value == null) return '';
   if (typeof value !== 'object') return String(value);
   return Object.entries(value)
-    .map(([key, item]) => `${key} = ${tomlInline(item)}`)
+    .map(([key, item]) => `${formatTomlKey(key)} = ${tomlInline(item)}`)
     .join('\n');
 }
 
@@ -537,7 +637,7 @@ function tomlInline(value) {
   }
   if (value && typeof value === 'object') {
     return `{ ${Object.entries(value)
-      .map(([key, item]) => `${key} = ${tomlInline(item)}`)
+      .map(([key, item]) => `${formatTomlKey(key)} = ${tomlInline(item)}`)
       .join(', ')} }`;
   }
   if (typeof value === 'string') return JSON.stringify(value);
@@ -746,11 +846,47 @@ function renderRawGroup() {
     </div>`;
 }
 
+async function saveRawConfig() {
+  if (
+    state.dirty.size > 0 &&
+    !window.confirm('保存原始 TOML 将覆盖其它分组尚未保存的表单修改，继续？')
+  ) {
+    return;
+  }
+  clearPreviewTimer();
+  const saveRawBtn = document.getElementById('save-raw-btn');
+  if (saveRawBtn) saveRawBtn.disabled = true;
+  els.save.disabled = true;
+  try {
+    const result = await invoke('save_config_raw', { text: state.rawText });
+    state.dirty.clear();
+    state.invalidInputs.clear();
+    state.rawDirty = false;
+    showError('');
+    if (result.restart_required) {
+      els.restartBanner.classList.remove('hidden');
+    } else {
+      els.restartBanner.classList.add('hidden');
+    }
+    setStatus(result.message || '已保存', 'ok');
+    await refreshSchemaOnly();
+    updateDirtyIndicator();
+  } catch (error) {
+    showError(`保存失败: ${error}`);
+    setStatus('保存失败', 'err');
+  } finally {
+    if (saveRawBtn) saveRawBtn.disabled = false;
+    els.save.disabled = false;
+  }
+}
+
 function bindRawGroup() {
   const editor = document.getElementById('raw-editor');
   if (editor) {
     editor.addEventListener('input', () => {
       state.rawText = editor.value;
+      state.rawDirty = true;
+      updateDirtyIndicator();
     });
   }
   const openFile = document.getElementById('open-config-file');
@@ -767,16 +903,7 @@ function bindRawGroup() {
   }
   const saveRaw = document.getElementById('save-raw-btn');
   if (saveRaw) {
-    saveRaw.addEventListener('click', async () => {
-      try {
-        const result = await invoke('save_config_raw', { text: state.rawText });
-        setStatus(result.message || '已保存', 'ok');
-        await refreshSchemaOnly();
-      } catch (error) {
-        showError(`保存失败: ${error}`);
-        setStatus('保存失败', 'err');
-      }
-    });
+    saveRaw.addEventListener('click', saveRawConfig);
   }
 }
 
@@ -787,32 +914,47 @@ function bindFieldEvents() {
     const handler = () => {
       const path = element.dataset.path;
       let value;
-      if (element.type === 'checkbox') {
+      if (element.dataset.arrayIndex !== undefined) {
+        const inputs = Array.from(
+          els.content.querySelectorAll(`[data-path="${CSS.escape(path)}"][data-array-index]`),
+        );
+        if (inputs.some((input) => input.validity && input.validity.badInput)) {
+          state.invalidInputs.set(path, findField(path)?.label || path);
+          updateDirtyIndicator();
+          return;
+        }
+        state.invalidInputs.delete(path);
+        const values = inputs.map((input) => input.value);
+        if (values.some((raw) => raw === '')) {
+          if (state.dirty.delete(path)) {
+            updateDirtyIndicator();
+            schedulePreview(path);
+          }
+          return;
+        }
+        value = values.map(Number);
+      } else if (element.type === 'checkbox') {
         value = element.checked;
       } else if (element.type === 'number') {
+        if (element.validity && element.validity.badInput) {
+          state.invalidInputs.set(path, findField(path)?.label || path);
+          updateDirtyIndicator();
+          return;
+        }
+        state.invalidInputs.delete(path);
         // 清空输入框时不要当成 0（position_x 之类会被真的写成 0），
         // 视为「这项先不改」，等用户输入真正的值。
         if (element.value === '') {
-          state.dirty.delete(path);
-          updateDirtyIndicator();
+          if (state.dirty.delete(path)) {
+            updateDirtyIndicator();
+            schedulePreview(path);
+          }
           return;
         }
         value = Number(element.value);
       } else {
-        value = element.value;
-      }
-
-      if (element.dataset.arrayIndex !== undefined) {
-        const inputs = els.content.querySelectorAll(
-          `[data-path="${CSS.escape(path)}"][data-array-index]`,
-        );
-        const values = Array.from(inputs).map((input) => input.value);
-        if (values.some((raw) => raw === '')) {
-          state.dirty.delete(path);
-          updateDirtyIndicator();
-          return;
-        }
-        value = values.map(Number);
+        value =
+          path === 'output.osc.separator' ? unescapeControlChars(element.value) : element.value;
       }
 
       state.dirty.set(path, value);
@@ -820,6 +962,11 @@ function bindFieldEvents() {
 
       if (element.type === 'text' && path && isColorPath(path)) {
         updateColorPreview(path, element.value);
+        const trimmed = element.value.trim();
+        if (/^#[0-9a-fA-F]{6}([0-9a-fA-F]{2})?$/.test(trimmed)) {
+          const picker = els.content.querySelector(`[data-color-picker="${CSS.escape(path)}"]`);
+          if (picker) picker.value = trimmed.slice(0, 7);
+        }
       }
 
       schedulePreview(path);
@@ -830,16 +977,19 @@ function bindFieldEvents() {
     );
   });
 
-  // 颜色选择器：同步到同路径的文本框
+  // 颜色选择器：同步到同路径的文本框（原值含 #RRGGBBAA 时保留 alpha 分量）
   els.content.querySelectorAll('[data-color-picker]').forEach((picker) => {
     picker.addEventListener('input', () => {
       const path = picker.dataset.colorPicker;
       const text = els.content.querySelector(`[data-path="${CSS.escape(path)}"]`);
+      const current = text ? text.value.trim() : '';
+      const alpha = /^#[0-9a-fA-F]{8}$/.test(current) ? current.slice(7, 9) : '';
+      const nextColor = `${picker.value}${alpha}`;
       if (text) {
-        text.value = picker.value;
+        text.value = nextColor;
       }
-      state.dirty.set(path, picker.value);
-      updateColorPreview(path, picker.value);
+      state.dirty.set(path, nextColor);
+      updateColorPreview(path, nextColor);
       updateDirtyIndicator();
       schedulePreview(path);
     });
@@ -864,12 +1014,12 @@ function isColorPath(path) {
 function updateColorPreview(path, value) {
   const preview = els.content.querySelector(`[data-color-preview="${CSS.escape(path)}"]`);
   if (preview) {
-    preview.style.background = value || 'transparent';
+    preview.style.background = cssColor(value);
   }
 }
 
 function updateDirtyIndicator() {
-  const count = state.dirty.size;
+  const count = dirtyCount();
   els.save.textContent = count > 0 ? `保存（${count} 项修改）` : '保存';
   els.save.classList.toggle('primary', count > 0);
   const wasDirty = state.wasDirty === true;
@@ -884,24 +1034,24 @@ function updateDirtyIndicator() {
   }
 }
 
+function isPreviewablePath(path) {
+  return Boolean(path && (path.startsWith('subtitle.') || path.startsWith('output.')));
+}
+
 function schedulePreview(changedPath) {
-  const hot =
-    changedPath &&
-    (changedPath.startsWith('subtitle.') ||
-      changedPath.startsWith('output.') ||
-      changedPath === 'translate.enabled');
-  if (!hot) return;
-  clearTimeout(state.previewTimer);
+  if (!isPreviewablePath(changedPath)) return;
+  clearPreviewTimer();
   state.previewTimer = setTimeout(async () => {
+    state.previewTimer = null;
     const changes = [...state.dirty]
-      .filter(
-        ([path]) =>
-          path.startsWith('subtitle.') ||
-          path.startsWith('output.') ||
-          path === 'translate.enabled',
-      )
+      .filter(([path]) => isPreviewablePath(path))
       .map(([path, value]) => ({ path, value }));
-    if (changes.length === 0) return;
+    if (changes.length === 0) {
+      await invoke('cancel_preview').catch((error) => {
+        console.warn('cancel_preview 失败', error);
+      });
+      return;
+    }
     try {
       await invoke('preview_settings', { changes });
     } catch (error) {
@@ -928,7 +1078,7 @@ function findField(path) {
  * 一条非法值会让后端整批保存失败，用户还得逐项排查。
  */
 function validateNumbers(changes) {
-  const errors = [];
+  const errors = [...state.invalidInputs.values()].map((label) => `${label} 输入不是有效数字`);
   for (const change of changes) {
     const field = findField(change.path);
     if (!field || !['int', 'float', 'number'].includes(field.kind)) continue;
@@ -966,6 +1116,10 @@ function validateNumbers(changes) {
 }
 
 async function save() {
+  if (state.currentGroup === 'advanced' && state.rawDirty && state.dirty.size === 0) {
+    await saveRawConfig();
+    return;
+  }
   const changes = [...state.dirty].map(([path, value]) => ({ path, value }));
   const errors = [...collectSourceErrors(state.sources), ...validateNumbers(changes)];
   if (errors.length > 0) {
@@ -974,10 +1128,15 @@ async function save() {
     return;
   }
   if (changes.length === 0) {
+    if (state.rawDirty) {
+      await saveRawConfig();
+      return;
+    }
     setStatus('没有需要保存的修改');
     return;
   }
 
+  clearPreviewTimer();
   els.save.disabled = true;
   try {
     let result;
@@ -990,6 +1149,8 @@ async function save() {
       return;
     }
     state.dirty.clear();
+    state.invalidInputs.clear();
+    state.rawDirty = false;
     state.originalSourcesJson = JSON.stringify(state.sources);
     setStatus(result.message || '已保存', 'ok');
     showError('');
@@ -1013,7 +1174,10 @@ async function save() {
 }
 
 async function cancel() {
+  clearPreviewTimer();
   state.dirty.clear();
+  state.invalidInputs.clear();
+  state.rawDirty = false;
   state.sources = JSON.parse(state.originalSourcesJson);
   try {
     await invoke('cancel_preview');
@@ -1033,10 +1197,19 @@ async function cancel() {
 }
 
 async function reload() {
+  const count = dirtyCount();
+  if (count > 0 && !window.confirm(`当前有 ${count} 项未保存的修改，重新加载将丢弃它们。继续？`)) {
+    return;
+  }
+  clearPreviewTimer();
+  state.dirty.clear();
+  state.invalidInputs.clear();
+  state.rawDirty = false;
+  await invoke('cancel_preview').catch(() => {});
   try {
     const result = await invoke('reload_config');
-    setStatus(result.message || '已重新加载', 'ok');
     await loadAll();
+    setStatus(result.message || '已重新加载', 'ok');
   } catch (error) {
     showError(`重新加载失败: ${error}`);
   }
@@ -1045,7 +1218,10 @@ async function reload() {
 // ---------------- 绑定 ----------------
 
 function bindTopbar() {
-  els.profileSelect.addEventListener('change', () => switchProfile(els.profileSelect.value));
+  els.profileSelect.addEventListener('change', () => updateProfileActionButtons());
+  if (els.profileSwitch) {
+    els.profileSwitch.addEventListener('click', () => switchProfile(selectedProfile()));
+  }
   els.profileNew.addEventListener('click', createProfile);
   els.profileDup.addEventListener('click', duplicateProfile);
   els.profileRename.addEventListener('click', renameProfile);
@@ -1054,7 +1230,10 @@ function bindTopbar() {
     invoke('open_profiles_dir').catch((error) => showError(`打开目录失败: ${error}`)),
   );
 
-  els.search.addEventListener('input', () => renderContent());
+  els.search.addEventListener('input', () => {
+    state.invalidInputs.clear();
+    renderContent();
+  });
   els.save.addEventListener('click', save);
   els.cancel.addEventListener('click', cancel);
   els.reload.addEventListener('click', reload);
@@ -1070,13 +1249,18 @@ function bindTopbar() {
 }
 
 async function reloadOnShow() {
-  if (state.dirty.size > 0) {
+  clearPreviewTimer();
+  const count = dirtyCount();
+  if (count > 0) {
     const keep = window.confirm(
-      `有 ${state.dirty.size} 项未保存的修改。确定 = 保留并继续编辑；取消 = 丢弃并重新加载。`,
+      `有 ${count} 项未保存的修改。确定 = 保留并继续编辑；取消 = 丢弃并重新加载。`,
     );
-    if (keep) return;
+    if (!keep) {
+      state.dirty.clear();
+      state.invalidInputs.clear();
+      state.rawDirty = false;
+    }
   }
-  state.dirty.clear();
   await loadAll();
 }
 
@@ -1104,6 +1288,9 @@ window.addEventListener('DOMContentLoaded', async () => {
         console.error(error);
         showError(`重新加载失败: ${error}`);
       });
+    });
+    await window.__TAURI__.event.listen('settings://hidden', () => {
+      clearPreviewTimer();
     });
   }
 });
