@@ -126,7 +126,7 @@ timeout_secs = 15
 # 首次运行会从内置样例生成 config.toml；当前样例默认 DeepSeek（OpenAI 兼容）
 base_url = "https://api.deepseek.com/v1"
 # API Key
-api_key = "sk-your-api-key"
+api_key = "YOUR_API_KEY"
 # 模型（DeepSeek 控制台为准，如 deepseek-flash / deepseek-chat）
 model = "deepseek-flash"
 # 目标语言
@@ -135,8 +135,8 @@ target_language = "zh-CN"
 system_prompt = "You are a real-time subtitle translator. Translate naturally and concisely."
 # 超时时间（秒）
 timeout_secs = 20
-# 若改用 OpenAI 官方，请同步改 base_url/model，并删除下方 [translate.extra_body]
-# （DeepSeek 的 thinking 字段会被 OpenAI 拒绝，返回 HTTP 400）
+# 若改用 OpenAI 官方，请同步改 base_url/model，并删除样例 config.toml 里的
+# [translate.extra_body] 段（DeepSeek 的 thinking 字段会被 OpenAI 拒绝，返回 HTTP 400）
 
 [vad]
 # 是否启用 VAD 分段（推荐开启）

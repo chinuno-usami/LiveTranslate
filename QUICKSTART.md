@@ -49,7 +49,7 @@ curl http://127.0.0.1:8765/v1/models
 [translate]
 # 内置样例默认 DeepSeek；也可换成 OpenAI 或其他兼容服务
 base_url = "https://api.deepseek.com/v1"
-api_key = "sk-your-api-key-here"            # 替换为实际 API Key
+api_key = "YOUR_API_KEY"                     # 替换为实际 API Key
 model = "deepseek-flash"                    # 或其他可用模型
 target_language = "zh-CN"                   # 翻译目标语言
 system_prompt = "You are a real-time subtitle translator. Translate naturally and concisely."

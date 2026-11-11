@@ -61,18 +61,9 @@ livetranslate/
 │   │   ├── mod.rs                 # 多源字幕历史与来源标签格式化
 │   │   └── processor.rs           # 去重 / 固定分片重叠裁剪
 │   │
-│   ├── output/                    # 统一输出层
-│   │   ├── mod.rs                 # OutputManager
-│   │   ├── osc.rs                 # VRChat OSC Chatbox
-│   │   └── steamvr/               # SteamVR Overlay（Windows + feature）
-│   │
 │   └── ui/                        # 前后端事件名与 IPC 载荷
 │       ├── mod.rs
 │       └── overlay.rs             # 浮窗相关载荷辅助
-│
-├── tauri-ui/                      # 桌面浮窗与设置页前端
-│   ├── app.js / index.html / styles.css
-│   └── settings.js / settings.html / settings.css
 │
 └── docs/
     ├── ARCHITECTURE.md            # 架构说明
