@@ -86,41 +86,56 @@ fn show_main_window(app: &AppHandle) {
 pub fn register_global_shortcuts(app: &AppHandle) -> tauri::Result<()> {
     let mut manager = app.global_shortcut_manager();
 
-    let app_handle = app.clone();
-    manager.register("CmdOrCtrl+Alt+S", move || {
-        show_main_window(&app_handle);
-    })?;
+    // 逐个注册并各自记日志：一个组合被其它程序占用时，
+    // 不能让排在它后面的快捷键（尤其是退出）一起失效。
+    let mut register = |accelerator: &str, handler: Box<dyn Fn() + Send + Sync>| {
+        if let Err(e) = manager.register(accelerator, handler) {
+            tracing::warn!("快捷键 {accelerator} 注册失败（可能被其它程序占用）: {e}");
+        }
+    };
 
     let app_handle = app.clone();
-    manager.register("CmdOrCtrl+Alt+R", move || {
-        if let Some(window) = app_handle.get_window("main") {
-            let _ = window.emit("shortcut://command", "start");
-        }
-    })?;
+    register(
+        "CmdOrCtrl+Alt+S",
+        Box::new(move || show_main_window(&app_handle)),
+    );
 
     let app_handle = app.clone();
-    manager.register("CmdOrCtrl+Alt+E", move || {
-        if let Some(window) = app_handle.get_window("main") {
-            let _ = window.emit("shortcut://command", "stop");
-        }
-    })?;
+    register(
+        "CmdOrCtrl+Alt+R",
+        Box::new(move || {
+            if let Some(window) = app_handle.get_window("main") {
+                let _ = window.emit("shortcut://command", "start");
+            }
+        }),
+    );
+
+    let app_handle = app.clone();
+    register(
+        "CmdOrCtrl+Alt+E",
+        Box::new(move || {
+            if let Some(window) = app_handle.get_window("main") {
+                let _ = window.emit("shortcut://command", "stop");
+            }
+        }),
+    );
 
     // 切换点击穿透（穿透开启后这是关闭它的快捷键）
     let app_handle = app.clone();
-    manager.register("CmdOrCtrl+Alt+T", move || {
-        crate::toggle_click_through(&app_handle);
-    })?;
+    register(
+        "CmdOrCtrl+Alt+T",
+        Box::new(move || crate::toggle_click_through(&app_handle)),
+    );
 
     let app_handle = app.clone();
-    manager.register("CmdOrCtrl+Alt+Comma", move || {
-        crate::open_settings_window(&app_handle);
-    })?;
+    register(
+        "CmdOrCtrl+Alt+Comma",
+        Box::new(move || crate::open_settings_window(&app_handle)),
+    );
 
     let app_handle = app.clone();
-    manager.register("CmdOrCtrl+Alt+Q", move || {
-        app_handle.exit(0);
-    })?;
+    register("CmdOrCtrl+Alt+Q", Box::new(move || app_handle.exit(0)));
 
-    tracing::info!("Global shortcuts registered successfully");
+    tracing::info!("Global shortcuts registration finished");
     Ok(())
 }

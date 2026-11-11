@@ -410,11 +410,31 @@ impl SharedState {
     }
 }
 
-/// 切换窗口点击穿透，并同步到前端与托盘
+/// 切换窗口点击穿透，并同步到前端、持久配置与托盘
 pub(crate) fn toggle_click_through(app: &AppHandle) {
     let state = app.state::<Arc<SharedState>>();
     let new_value = !state.click_through.load(Ordering::SeqCst);
     apply_click_through(app, new_value);
+
+    // 必须写回配置：否则下一次 apply_window_config（窗口尺寸变化时）
+    // 会用配置里的旧值把穿透改回去，而前端仍然显示“穿透开”。
+    let state = state.inner().clone();
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        match state
+            .update_config(|config| {
+                config.subtitle.click_through = new_value;
+                Ok(())
+            })
+            .await
+        {
+            Ok(config) => {
+                persist_value(&app, &state, "subtitle", "click_through", new_value.into());
+                emit_config(&app, &config);
+            }
+            Err(e) => tracing::warn!("切换点击穿透失败: {e}"),
+        }
+    });
 }
 
 pub(crate) fn apply_click_through(app: &AppHandle, enabled: bool) {
@@ -432,12 +452,13 @@ pub(crate) fn apply_click_through(app: &AppHandle, enabled: bool) {
 pub(crate) fn open_settings_window(app: &AppHandle) {
     match app.get_window("settings") {
         Some(window) => {
+            // 先显示再通知，避免前端的确认框挂在一个还没显示的窗口上。
             // 窗口只是 hide()，前端状态会一直活着；通知它重新拉取一次配置，
             // 否则会拿启动时的快照去覆盖浮窗上的改动。
-            let _ = app.emit_all(SETTINGS_SHOWN_EVENT, ());
             let _ = window.show();
             let _ = window.unminimize();
             let _ = window.set_focus();
+            let _ = app.emit_all(SETTINGS_SHOWN_EVENT, ());
         }
         None => tracing::warn!("Settings window not found in tauri.conf.json"),
     }
@@ -454,33 +475,43 @@ fn ensure_config_path(state: &SharedState) -> Result<PathBuf, String> {
     Ok(path)
 }
 
-/// 把单个配置项写回文件（尽量保留注释）
-fn persist_json(state: &SharedState, path: &str, value: serde_json::Value) {
-    let config_path = match ensure_config_path(state) {
-        Ok(path) => path,
-        Err(e) => {
-            tracing::warn!("No config file to persist {path}: {e}");
-            return;
-        }
-    };
-    if let Err(e) = writer::apply_changes(&config_path, &[(path.to_string(), value)]) {
-        tracing::warn!("Failed to persist {path}: {e}");
-    } else {
-        mirror_profile(state);
+/// 把一批配置项一次性写回文件（尽量保留注释）
+fn persist_fields(state: &SharedState, fields: &[(&str, serde_json::Value)]) -> Result<(), String> {
+    let config_path = ensure_config_path(state)?;
+    let payload: Vec<(String, serde_json::Value)> = fields
+        .iter()
+        .map(|(path, value)| ((*path).to_string(), value.clone()))
+        .collect();
+    writer::apply_changes(&config_path, &payload)?;
+    mirror_profile(state);
+    Ok(())
+}
+
+/// 写入失败时同时在日志与界面错误条上告知用户
+///
+/// 只 `warn!` 的话，内存里已经生效的改动会在重启后静默消失，
+/// 用户以为保存成功了。
+fn persist_or_report(app: &AppHandle, state: &SharedState, fields: &[(&str, serde_json::Value)]) {
+    if let Err(e) = persist_fields(state, fields) {
+        tracing::warn!("Failed to persist config: {e}");
+        let _ = app.emit_all(ERROR_EVENT, format!("配置未能写入磁盘: {e}"));
     }
 }
 
-fn persist_value(state: &SharedState, section: &str, key: &str, value: serde_json::Value) {
-    persist_json(state, &format!("{section}.{key}"), value);
+fn persist_value(
+    app: &AppHandle,
+    state: &SharedState,
+    section: &str,
+    key: &str,
+    value: serde_json::Value,
+) {
+    persist_or_report(app, state, &[(&format!("{section}.{key}"), value)]);
 }
 
 fn persist_sources(state: &SharedState, config: &AppConfig) -> Result<(), String> {
-    let config_path = ensure_config_path(state)?;
     let sources = serde_json::to_value(&config.audio.sources)
         .map_err(|e| format!("序列化输入源失败: {e}"))?;
-    writer::apply_changes(&config_path, &[("audio.sources".to_string(), sources)])?;
-    mirror_profile(state);
-    Ok(())
+    persist_fields(state, &[("audio.sources", sources)])
 }
 
 fn mirror_profile(state: &SharedState) {
@@ -542,7 +573,9 @@ async fn emit_subtitle(app: &AppHandle, state: &SharedState) {
     let active = registry.active_sources_payload();
     drop(registry);
     let subtitle_state = state.subtitle_state.lock().await;
-    let entries = subtitle_state.display_lines();
+    // 历史长度取各输出的最大值，但浮窗只能按 subtitle.max_lines 显示，
+    // 否则切一下「显示来源」就会把 SteamVR/OSC 的多余行泄到浮窗上。
+    let entries = desktop_entries(subtitle_state.display_lines(), &state.config());
     let _ = app.emit_all(SUBTITLE_EVENT, SubtitlePayload::new(&entries, active));
 }
 
@@ -729,10 +762,24 @@ async fn start_capture_locked(app: AppHandle, state: Arc<SharedState>) -> Result
             });
         }
         drop(event_tx);
-        while let Some(joined) = set.join_next().await {
-            if let Err(e) = joined {
-                tracing::error!("Source task ended abnormally: {e}");
+        // 子任务可能在同步收尾里卡住（设备/驱动），给个上限：
+        // 超时就 abort 全部子任务并让用户知道“设备可能仍被占用”，
+        // 而不是让 stop_capture_locked 报成功、紧接着重开采集时设备冲突。
+        let drained = tokio::time::timeout(std::time::Duration::from_secs(6), async {
+            while let Some(joined) = set.join_next().await {
+                if let Err(e) = joined {
+                    tracing::error!("Source task ended abnormally: {e}");
+                }
             }
+        })
+        .await;
+        if drained.is_err() {
+            tracing::warn!("Some source tasks did not stop in time; aborting them");
+            set.abort_all();
+            let _ = app_for_runner.emit_all(
+                NOTICE_EVENT,
+                "部分输入源未能在 6 秒内停止，已强制中断（设备可能仍被占用）",
+            );
         }
     });
 
@@ -845,8 +892,16 @@ async fn stop_capture_locked(app: AppHandle, state: Arc<SharedState>) -> Result<
             }
         }
     }
-    if let Some(forwarder) = forwarder {
-        forwarder.abort();
+    if let Some(mut forwarder) = forwarder {
+        // supervisor 已 join，发送端全关，但通道里可能还排着已识别完的字幕。
+        // 直接 abort 会让最后一两句既不上屏也不进 OSC/SteamVR。
+        if tokio::time::timeout(std::time::Duration::from_secs(2), &mut forwarder)
+            .await
+            .is_err()
+        {
+            tracing::warn!("Subtitle forwarder did not finish in time; aborting");
+            forwarder.abort();
+        }
     }
 
     {
@@ -1027,7 +1082,7 @@ async fn set_font_size(
             Ok(())
         })
         .await?;
-    persist_value(&state, "subtitle", "font_size", size.into());
+    persist_value(&app, &state, "subtitle", "font_size", size.into());
     emit_config(&app, &config);
     Ok(())
 }
@@ -1049,7 +1104,7 @@ async fn set_show_source(
             Ok(())
         })
         .await?;
-    persist_value(&state, "subtitle", "show_source", enabled.into());
+    persist_value(&app, &state, "subtitle", "show_source", enabled.into());
     emit_config(&app, &config);
     emit_subtitle(&app, &state).await;
     Ok(())
@@ -1072,7 +1127,7 @@ async fn set_translate_enabled(
         let mut registry = state.sources.lock().await;
         registry.set_translate_all(enabled);
     }
-    persist_value(&state, "translate", "enabled", enabled.into());
+    persist_value(&app, &state, "translate", "enabled", enabled.into());
     emit_config(&app, &config);
     emit_source_status(&app, &state).await;
     tracing::info!(
@@ -1124,7 +1179,7 @@ async fn set_language(
         let mut registry = state.sources.lock().await;
         registry.set_language(&config, &normalized);
     }
-    persist_value(&state, section, key, normalized.clone().into());
+    persist_value(&app, &state, section, key, normalized.clone().into());
     emit_config(&app, &config);
     tracing::info!("ASR language set to: {}", normalized);
     Ok(())
@@ -1140,6 +1195,7 @@ async fn set_device(
     if spec.is_empty() {
         return Err("设备名不能为空".to_string());
     }
+    let was_running = state.pipeline.lock().await.is_running();
     let config = state
         .update_config(|config| {
             if config.audio.sources.is_empty() {
@@ -1153,9 +1209,23 @@ async fn set_device(
             Ok(())
         })
         .await?;
-    persist_value(&state, "audio", "device_name", spec.into());
-    persist_sources(&state, &config)?;
-    restart_capture_impl(app, state.inner().clone()).await
+    let sources = serde_json::to_value(&config.audio.sources)
+        .map_err(|e| format!("序列化输入源失败: {e}"))?;
+    persist_or_report(
+        &app,
+        &state,
+        &[
+            ("audio.device_name", spec.into()),
+            ("audio.sources", sources),
+        ],
+    );
+    // 只在本就在采集时重启：用户只是换了下设备就自己开麦会让人意外
+    if was_running {
+        restart_capture_impl(app, state.inner().clone()).await
+    } else {
+        emit_source_status(&app, &state).await;
+        Ok(())
+    }
 }
 
 #[tauri::command]
@@ -1361,7 +1431,7 @@ async fn set_output_enabled(
             Ok(())
         })
         .await?;
-    persist_value(&state, section, "enabled", enabled.into());
+    persist_value(&app, &state, section, "enabled", enabled.into());
     mirror_profile(&state);
     state.outputs.apply_config(&config.output);
     emit_output_status(&app, &state);
@@ -1551,10 +1621,20 @@ async fn save_config_raw(
         stop_capture_locked(app.clone(), state.inner().clone()).await?;
         start_capture_locked(app.clone(), state.inner().clone()).await?;
     }
+    // 未知键会被 serde 静默丢弃：提示出来，否则用户会以为改了但没生效
+    let unknown = writer::unknown_keys(&text);
+    let message = if unknown.is_empty() {
+        "原始配置已保存并校验通过".to_string()
+    } else {
+        format!(
+            "原始配置已保存，但以下配置项未被识别（不会生效）: {}",
+            unknown.join("、")
+        )
+    };
     Ok(SaveResult {
         applied: 1,
         restart_required: true,
-        message: "原始配置已保存并校验通过".to_string(),
+        message,
     })
 }
 
@@ -1780,7 +1860,8 @@ fn set_window_bounds(
 }
 
 #[tauri::command]
-fn persist_window_geometry(
+async fn persist_window_geometry(
+    app: AppHandle,
     state: State<'_, Arc<SharedState>>,
     window: Window,
 ) -> Result<(), String> {
@@ -1793,18 +1874,28 @@ fn persist_window_geometry(
     let width = (size.width as f64 / scale).round() as u32;
     let height = (size.height as f64 / scale).round() as u32;
 
-    let mut config = state.config();
-    config.subtitle.window_width = width;
-    config.subtitle.window_height = height;
-    config.subtitle.position_x = x;
-    config.subtitle.position_y = y;
-    state.set_config(config.clone());
+    // 走 config_update 锁：否则拖动窗口的回写会覆盖其它并发命令刚改的字段
+    state
+        .update_config(|config| {
+            config.subtitle.window_width = width;
+            config.subtitle.window_height = height;
+            config.subtitle.position_x = x;
+            config.subtitle.position_y = y;
+            Ok(())
+        })
+        .await?;
 
-    persist_value(&state, "subtitle", "window_width", width.into());
-    persist_value(&state, "subtitle", "window_height", height.into());
-    persist_value(&state, "subtitle", "position_x", x.into());
-    persist_value(&state, "subtitle", "position_y", y.into());
-    mirror_profile(&state);
+    // 四个字段一次落盘：每次 resize 读改写四遍整份配置太重
+    persist_or_report(
+        &app,
+        &state,
+        &[
+            ("subtitle.window_width", width.into()),
+            ("subtitle.window_height", height.into()),
+            ("subtitle.position_x", x.into()),
+            ("subtitle.position_y", y.into()),
+        ],
+    );
     Ok(())
 }
 
@@ -1814,12 +1905,15 @@ async fn set_click_through(
     state: State<'_, Arc<SharedState>>,
     enabled: bool,
 ) -> Result<(), String> {
-    let mut config = state.config();
-    config.subtitle.click_through = enabled;
-    state.set_config(config.clone());
+    let config = state
+        .update_config(|config| {
+            config.subtitle.click_through = enabled;
+            Ok(())
+        })
+        .await?;
     apply_click_through(&app, enabled);
-    persist_value(&state, "subtitle", "click_through", enabled.into());
-    mirror_profile(&state);
+    persist_value(&app, &state, "subtitle", "click_through", enabled.into());
+    emit_config(&app, &config);
     Ok(())
 }
 

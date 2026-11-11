@@ -96,7 +96,10 @@ impl SubtitleState {
         if line.translated.trim().is_empty() {
             lines.push(format!("{prefix}{}", line.source));
         } else if self.show_source {
-            lines.push(format!("{prefix}{}", line.source));
+            // 只有译文、原文为空时不能推一行空的原文，否则每条字幕都会多一行空白
+            if !line.source.trim().is_empty() {
+                lines.push(format!("{prefix}{}", line.source));
+            }
             lines.push(line.translated.clone());
         } else {
             lines.push(format!("{prefix}{}", line.translated));
@@ -155,9 +158,13 @@ impl SubtitleState {
         self.trim();
     }
 
+    /// 调整历史上限。
+    ///
+    /// 这里**不裁剪**已有历史：设置页的实时预览会临时把它调到很小，
+    /// 裁剪会让用户在点「取消」后永久丢掉那几行。真正的上限由 `push` 维持，
+    /// 展示侧（浮窗 / OSC / SteamVR）各自按自己的 max_lines 裁剪。
     pub fn set_max_lines(&mut self, max_lines: usize) {
         self.max_lines = max_lines.max(1);
-        self.trim();
     }
 
     pub fn set_label_mode(&mut self, mode: LabelMode) {
@@ -208,6 +215,30 @@ mod tests {
         assert_eq!(never.display_lines()[0].lines[0], "你好");
     }
 
+    /// 只有译文（原文被过滤/翻译-only 路径）时不能多出一行空白
+    #[test]
+    fn show_source_skips_empty_source_row() {
+        let mut state = SubtitleState::new(3, true, LabelMode::Always);
+        state.push(line("mic", "麦克风", "", "你好"));
+        let entry = &state.display_lines()[0];
+        assert_eq!(entry.lines, vec!["你好"]);
+        assert_eq!(entry.text, "你好");
+    }
+
+    /// 设置页实时预览会把 max_lines 调小；取消后历史不能因此永久丢失
+    #[test]
+    fn lowering_max_lines_keeps_existing_history() {
+        let mut state = SubtitleState::new(5, false, LabelMode::Never);
+        for i in 0..5 {
+            state.push(line("mic", "麦克风", &format!("line{i}"), ""));
+        }
+        state.set_max_lines(1);
+        assert_eq!(state.display_lines().len(), 5);
+        // 但下一次 push 会把上限收紧
+        state.push(line("mic", "麦克风", "next", ""));
+        assert_eq!(state.display_lines().len(), 1);
+    }
+
     #[test]
     fn prefix_only_on_first_line() {
         let mut state = SubtitleState::new(3, true, LabelMode::Always);
@@ -235,9 +266,12 @@ mod tests {
         assert_eq!(lines[0].text, "t3");
         assert_eq!(lines[1].text, "t4");
 
+        // 调小上限不裁剪已有历史（设置页预览会临时调小），下一次 push 才收紧
         state.set_max_lines(1);
+        assert_eq!(state.len(), 2);
+        state.push(line("mic", "麦", "s5", "t5"));
         assert_eq!(state.len(), 1);
-        assert_eq!(state.display_lines()[0].text, "t4");
+        assert_eq!(state.display_lines()[0].text, "t5");
     }
 
     #[test]
