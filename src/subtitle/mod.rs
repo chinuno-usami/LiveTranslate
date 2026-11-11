@@ -96,11 +96,14 @@ impl SubtitleState {
         if line.translated.trim().is_empty() {
             lines.push(format!("{prefix}{}", line.source));
         } else if self.show_source {
-            // 只有译文、原文为空时不能推一行空的原文，否则每条字幕都会多一行空白
-            if !line.source.trim().is_empty() {
+            // 只有译文、原文为空时不能推一行空的原文，否则每条字幕都会多一行空白；
+            // 此时译文成为首行，需补上 [来源] 前缀。
+            if line.source.trim().is_empty() {
+                lines.push(format!("{prefix}{}", line.translated));
+            } else {
                 lines.push(format!("{prefix}{}", line.source));
+                lines.push(line.translated.clone());
             }
-            lines.push(line.translated.clone());
         } else {
             lines.push(format!("{prefix}{}", line.translated));
         }
@@ -168,6 +171,10 @@ impl SubtitleState {
 
     pub fn set_show_source(&mut self, show_source: bool) {
         self.show_source = show_source;
+    }
+
+    /// 显式按当前 `max_lines` 裁剪历史（正式保存配置时调用；预览期间不调用以免丢历史）
+    pub fn trim_to_limit(&mut self) {
         self.trim();
     }
 
@@ -234,14 +241,30 @@ mod tests {
         assert_eq!(never.display_lines()[0].lines[0], "你好");
     }
 
-    /// 只有译文（原文被过滤/翻译-only 路径）时不能多出一行空白
+    /// 只有译文（原文被过滤/翻译-only 路径）时不能多出一行空白，且保留来源前缀
     #[test]
     fn show_source_skips_empty_source_row() {
         let mut state = SubtitleState::new(3, true, LabelMode::Always);
         state.push(line("mic", "麦克风", "", "你好"));
         let entry = &state.display_lines()[0];
-        assert_eq!(entry.lines, vec!["你好"]);
-        assert_eq!(entry.text, "你好");
+        assert_eq!(entry.lines, vec!["[麦克风] 你好"]);
+        assert_eq!(entry.text, "[麦克风] 你好");
+    }
+
+    /// 设置页实时预览同时调用 set_max_lines + set_show_source 时不能把旧字幕裁掉
+    #[test]
+    fn preview_set_max_lines_and_show_source_preserves_history() {
+        let mut state = SubtitleState::new(5, false, LabelMode::Never);
+        for i in 0..5 {
+            state.push(line("mic", "麦克风", &format!("s{i}"), &format!("t{i}")));
+        }
+        state.set_max_lines(1);
+        state.set_show_source(true);
+        assert_eq!(state.len(), 5);
+        // 撤销预览恢复上限后，5 条历史完整保留
+        state.set_max_lines(5);
+        state.set_show_source(false);
+        assert_eq!(state.display_lines().len(), 5);
     }
 
     /// 设置页实时预览会把 max_lines 调小；取消后历史不能因此永久丢失

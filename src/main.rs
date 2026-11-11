@@ -301,8 +301,11 @@ pub(crate) struct SharedState {
     pub(crate) click_through: AtomicBool,
     font_size: AtomicU32,
     show_source: AtomicBool,
-    /// 保证关闭浮窗、托盘退出、快捷键退出与 RunEvent::Exit 最多只执行一次停机清理
+    /// 通知后台监听与位置防抖立即可见停机意图
     shutting_down: AtomicBool,
+    /// 保证 quit_app 与 RunEvent::Exit 并发进入时等待清理真正完成再退出进程
+    shutdown_lock: Mutex<()>,
+    shutdown_done: AtomicBool,
     /// 浮窗拖动位置持久化的防抖序号
     move_seq: AtomicU64,
     /// 全局语言
@@ -387,6 +390,8 @@ impl SharedState {
             font_size: AtomicU32::new(font_size),
             show_source: AtomicBool::new(show_source),
             shutting_down: AtomicBool::new(false),
+            shutdown_lock: Mutex::new(()),
+            shutdown_done: AtomicBool::new(false),
             move_seq: AtomicU64::new(0),
             language_tx,
             _language_rx: language_rx,
@@ -476,16 +481,23 @@ impl SharedState {
         *self.config_path.write().unwrap_or_else(|e| e.into_inner()) = path;
     }
 
-    /// 原子地读改写配置，并保证写回时已校验通过
-    async fn update_config<F>(&self, mutate: F) -> Result<AppConfig, String>
+    /// 原子地读改写配置并同步落盘（全程持有 `config_update` 锁，防止并发浮窗命令乱序覆盖磁盘）
+    async fn update_and_persist_config<F>(
+        &self,
+        app: &AppHandle,
+        mutate: F,
+    ) -> Result<AppConfig, String>
     where
-        F: FnOnce(&mut AppConfig) -> Result<(), String>,
+        F: FnOnce(&mut AppConfig) -> Result<Vec<(&'static str, serde_json::Value)>, String>,
     {
         let _guard = self.config_update.lock().await;
         let mut config = self.config();
-        mutate(&mut config)?;
+        let fields = mutate(&mut config)?;
         config.validate()?;
         self.set_config(config.clone());
+        if !fields.is_empty() {
+            persist_or_report(app, self, &fields);
+        }
         Ok(config)
     }
 }
@@ -502,16 +514,13 @@ pub(crate) fn toggle_click_through(app: &AppHandle) {
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
         match state
-            .update_config(|config| {
+            .update_and_persist_config(&app, |config| {
                 config.subtitle.click_through = new_value;
-                Ok(())
+                Ok(vec![("subtitle.click_through", new_value.into())])
             })
             .await
         {
-            Ok(config) => {
-                persist_value(&app, &state, "subtitle", "click_through", new_value.into());
-                emit_config(&app, &config);
-            }
+            Ok(config) => emit_config(&app, &config),
             Err(e) => tracing::warn!("切换点击穿透失败: {e}"),
         }
     });
@@ -574,7 +583,9 @@ pub(crate) fn stop_capture_bg(app: &AppHandle) {
 
 async fn shutdown_once(app: &AppHandle) {
     let state = app.state::<Arc<SharedState>>().inner().clone();
-    if state.shutting_down.swap(true, Ordering::SeqCst) {
+    state.shutting_down.store(true, Ordering::SeqCst);
+    let _guard = state.shutdown_lock.lock().await;
+    if state.shutdown_done.swap(true, Ordering::SeqCst) {
         return;
     }
     let stop = stop_capture_impl(app.clone(), state.clone());
@@ -596,8 +607,18 @@ pub(crate) fn quit_app(app: &AppHandle) {
     });
 }
 
-/// 确保有可写的配置文件（内置默认配置时首次保存到用户目录）
+/// 确保有可写的配置文件（浮窗常规增量写回路径：降级保护态下拒绝局部覆盖原文件）
 fn ensure_config_path(state: &SharedState) -> Result<PathBuf, String> {
+    if state.is_config_degraded() {
+        return Err(
+            "当前配置文件存在待修复项并处于回退保护状态，请先在「设置」中修复并保存".to_string(),
+        );
+    }
+    ensure_config_path_for_repair(state)
+}
+
+/// 设置页显式修复保存或打开配置文件/目录时解析路径（允许定位已有降级路径）
+fn ensure_config_path_for_repair(state: &SharedState) -> Result<PathBuf, String> {
     if let Some(path) = state.config_path() {
         return Ok(path);
     }
@@ -633,16 +654,6 @@ fn persist_or_report(app: &AppHandle, state: &SharedState, fields: &[(&str, serd
         tracing::warn!("Failed to persist config: {e}");
         let _ = app.emit_all(ERROR_EVENT, format!("配置未能写入磁盘: {e}"));
     }
-}
-
-fn persist_value(
-    app: &AppHandle,
-    state: &SharedState,
-    section: &str,
-    key: &str,
-    value: serde_json::Value,
-) {
-    persist_or_report(app, state, &[(&format!("{section}.{key}"), value)]);
 }
 
 fn persist_sources(state: &SharedState, config: &AppConfig) -> Result<(), String> {
@@ -727,6 +738,7 @@ async fn apply_hot_config(app: &AppHandle, state: &SharedState, old: &AppConfig,
         subtitle_state.set_max_lines(history_limit(new));
         subtitle_state.set_show_source(new.subtitle.show_source);
         subtitle_state.set_label_mode(new.subtitle.label_sources);
+        subtitle_state.trim_to_limit();
     }
     state
         .font_size
@@ -786,7 +798,47 @@ async fn apply_hot_config(app: &AppHandle, state: &SharedState, old: &AppConfig,
 // ---------------- 配置档辅助 ----------------
 
 fn profiles_status(state: &SharedState) -> profiles::ProfilesStatus {
-    profiles::list_status(state.config_path().as_deref())
+    profiles::list_status_with_init(state.config_path().as_deref(), !state.is_config_degraded())
+}
+
+/// 监督所有输入源子任务：正常运行期等待停止信号（同时回收自然退出的源），
+/// 收到停止信号后给有限时间收尾，超时则强制 abort 全部残留子任务并返回 `true`。
+async fn supervise_source_tasks(
+    mut set: tokio::task::JoinSet<()>,
+    mut stop_rx: watch::Receiver<bool>,
+    drain_timeout: std::time::Duration,
+) -> bool {
+    while !set.is_empty() && !*stop_rx.borrow() {
+        tokio::select! {
+            joined = set.join_next() => {
+                if let Some(Err(e)) = joined {
+                    tracing::error!("Source task ended abnormally: {e}");
+                }
+            }
+            changed = stop_rx.changed() => {
+                if changed.is_err() || *stop_rx.borrow() {
+                    break;
+                }
+            }
+        }
+    }
+    if set.is_empty() {
+        return false;
+    }
+    let drained = tokio::time::timeout(drain_timeout, async {
+        while let Some(joined) = set.join_next().await {
+            if let Err(e) = joined {
+                tracing::error!("Source task ended abnormally: {e}");
+            }
+        }
+    })
+    .await;
+    if drained.is_err() {
+        tracing::warn!("Some source tasks did not stop in time; aborting them");
+        set.abort_all();
+        return true;
+    }
+    false
 }
 
 // ---------------- 生命周期 ----------------
@@ -893,7 +945,11 @@ async fn start_capture_locked(app: AppHandle, state: Arc<SharedState>) -> Result
     pipeline.generation = pipeline.generation.wrapping_add(1);
     let generation = pipeline.generation;
     // 停止时要能取消各源任务，否则超时后它们会脱管并继续占用音频设备
+    let last_source_error: Arc<std::sync::Mutex<Option<String>>> =
+        Arc::new(std::sync::Mutex::new(None));
+    let error_for_supervisor = last_source_error.clone();
     let app_for_runner = app.clone();
+    let supervisor_stop = stop_rx.clone();
     let supervisor = tauri::async_runtime::spawn(async move {
         let mut set = tokio::task::JoinSet::new();
         for context in contexts {
@@ -901,30 +957,21 @@ async fn start_capture_locked(app: AppHandle, state: Arc<SharedState>) -> Result
             let source_tx = event_tx.clone();
             let source_stop = stop_rx.clone();
             let app = app_for_runner.clone();
+            let error_slot = error_for_supervisor.clone();
             set.spawn(async move {
                 if let Err(e) =
                     app::run_source(source_config, context, source_tx, source_stop).await
                 {
-                    tracing::error!("Audio processing error: {}", e);
-                    let _ = app.emit_all(ERROR_EVENT, e.to_string());
+                    let msg = e.to_string();
+                    tracing::error!("Audio processing error: {}", msg);
+                    *error_slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(msg.clone());
+                    let _ = app.emit_all(ERROR_EVENT, msg);
                 }
             });
         }
         drop(event_tx);
-        // 子任务可能在同步收尾里卡住（设备/驱动），给个上限：
-        // 超时就 abort 全部子任务并让用户知道“设备可能仍被占用”，
-        // 而不是让 stop_capture_locked 报成功、紧接着重开采集时设备冲突。
-        let drained = tokio::time::timeout(std::time::Duration::from_secs(6), async {
-            while let Some(joined) = set.join_next().await {
-                if let Err(e) = joined {
-                    tracing::error!("Source task ended abnormally: {e}");
-                }
-            }
-        })
-        .await;
-        if drained.is_err() {
-            tracing::warn!("Some source tasks did not stop in time; aborting them");
-            set.abort_all();
+        // 仅在收到停止信号后才启动 6 秒收尾倒计时；超时则 abort 全部子任务并告知用户
+        if supervise_source_tasks(set, supervisor_stop, std::time::Duration::from_secs(6)).await {
             let _ = app_for_runner.emit_all(
                 NOTICE_EVENT,
                 "部分输入源未能在 6 秒内停止，已强制中断（设备可能仍被占用）",
@@ -974,13 +1021,23 @@ async fn start_capture_locked(app: AppHandle, state: Arc<SharedState>) -> Result
                     running,
                     message,
                 } => {
-                    {
+                    let running_count = {
                         let mut registry = state_for_forwarder.sources.lock().await;
                         registry.set_running(&source_id, running, message.clone());
                         let labels = registry.active_labels();
+                        let count = registry.running_count();
                         let mut subtitle_state = state_for_forwarder.subtitle_state.lock().await;
                         subtitle_state.set_active_labels(labels);
+                        count
+                    };
+                    if running_count > 0 {
+                        let status_msg = match running_count {
+                            1 => "字幕采集中".to_string(),
+                            n => format!("{n} 源采集中"),
+                        };
+                        emit_status(&app_for_forwarder, true, status_msg);
                     }
+                    emit_subtitle(&app_for_forwarder, &state_for_forwarder).await;
                     emit_source_status(&app_for_forwarder, &state_for_forwarder).await;
                 }
             }
@@ -993,7 +1050,14 @@ async fn start_capture_locked(app: AppHandle, state: Arc<SharedState>) -> Result
             registry.mark_all_stopped();
             drop(registry);
             state_for_forwarder.outputs.set_capture_active(false);
-            emit_status(&app_for_forwarder, false, "字幕流已停止");
+            let fatal_err = last_source_error
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take();
+            match fatal_err {
+                Some(err) => emit_status(&app_for_forwarder, false, format!("采集已停止: {err}")),
+                None => emit_status(&app_for_forwarder, false, "字幕流已停止"),
+            }
             pipeline.stop_tx = None;
             pipeline.supervisor = None;
             pipeline.forwarder = None;
@@ -1218,12 +1282,11 @@ async fn set_font_size(
     let size = size.clamp(12, 72);
     state.font_size.store(size, Ordering::SeqCst);
     let config = state
-        .update_config(|config| {
+        .update_and_persist_config(&app, |config| {
             config.subtitle.font_size = size;
-            Ok(())
+            Ok(vec![("subtitle.font_size", size.into())])
         })
         .await?;
-    persist_value(&app, &state, "subtitle", "font_size", size.into());
     emit_config(&app, &config);
     Ok(())
 }
@@ -1240,12 +1303,11 @@ async fn set_show_source(
         subtitle_state.set_show_source(enabled);
     }
     let config = state
-        .update_config(|config| {
+        .update_and_persist_config(&app, |config| {
             config.subtitle.show_source = enabled;
-            Ok(())
+            Ok(vec![("subtitle.show_source", enabled.into())])
         })
         .await?;
-    persist_value(&app, &state, "subtitle", "show_source", enabled.into());
     publish_subtitle_snapshot(&state).await;
     emit_config(&app, &config);
     emit_subtitle(&app, &state).await;
@@ -1259,9 +1321,9 @@ async fn set_translate_enabled(
     enabled: bool,
 ) -> Result<(), String> {
     let config = state
-        .update_config(|config| {
+        .update_and_persist_config(&app, |config| {
             config.translate.enabled = enabled;
-            Ok(())
+            Ok(vec![("translate.enabled", enabled.into())])
         })
         .await?;
     let _ = state.translate_tx.send(enabled);
@@ -1269,7 +1331,6 @@ async fn set_translate_enabled(
         let mut registry = state.sources.lock().await;
         registry.set_translate_all(enabled);
     }
-    persist_value(&app, &state, "translate", "enabled", enabled.into());
     emit_config(&app, &config);
     emit_source_status(&app, &state).await;
     tracing::info!(
@@ -1290,9 +1351,8 @@ async fn set_language(
     code: String,
 ) -> Result<(), String> {
     let mut resolved_lang = String::new();
-    let mut resolved_section = "asr";
     let config = state
-        .update_config(|config| {
+        .update_and_persist_config(&app, |config| {
             let normalized = asr::languages::normalize_for_backend(&config.asr.backend, &code);
             if normalized.is_empty()
                 || normalized.len() > 32
@@ -1302,15 +1362,15 @@ async fn set_language(
             {
                 return Err(format!("非法语言代码: {code}"));
             }
-            if asr::languages::is_edge_backend(&config.asr.backend) {
-                resolved_section = "asr.edge";
+            let key = if asr::languages::is_edge_backend(&config.asr.backend) {
                 config.asr.edge.language = normalized.clone();
+                "asr.edge.language"
             } else {
-                resolved_section = "asr";
                 config.asr.language = normalized.clone();
-            }
-            resolved_lang = normalized;
-            Ok(())
+                "asr.language"
+            };
+            resolved_lang = normalized.clone();
+            Ok(vec![(key, normalized.into())])
         })
         .await?;
 
@@ -1319,13 +1379,6 @@ async fn set_language(
         let mut registry = state.sources.lock().await;
         registry.set_language(&config, &resolved_lang);
     }
-    persist_value(
-        &app,
-        &state,
-        resolved_section,
-        "language",
-        resolved_lang.clone().into(),
-    );
     emit_config(&app, &config);
     tracing::info!("ASR language set to: {}", resolved_lang);
     Ok(())
@@ -1342,10 +1395,15 @@ async fn set_device(
         return Err("设备名不能为空".to_string());
     }
     let inner = state.inner().clone();
+    if inner.is_config_degraded() {
+        return Err(
+            "当前配置文件存在待修复项并处于回退保护状态，请先在「设置」中修复并保存".to_string(),
+        );
+    }
     let _lifecycle = inner.lifecycle.lock().await;
     let was_running = inner.pipeline.lock().await.is_running();
     let config = inner
-        .update_config(|config| {
+        .update_and_persist_config(&app, |config| {
             if config.audio.sources.is_empty() {
                 config.audio.sources = config.audio.effective_sources(config.translate.enabled);
             }
@@ -1354,19 +1412,14 @@ async fn set_device(
             }
             // 兼容旧版本的单源字段（sources 非空时 effective_sources 会忽略它）
             config.audio.device_name = spec.clone();
-            Ok(())
+            let sources = serde_json::to_value(&config.audio.sources)
+                .map_err(|e| format!("序列化输入源失败: {e}"))?;
+            Ok(vec![
+                ("audio.device_name", spec.clone().into()),
+                ("audio.sources", sources),
+            ])
         })
         .await?;
-    let sources = serde_json::to_value(&config.audio.sources)
-        .map_err(|e| format!("序列化输入源失败: {e}"))?;
-    persist_or_report(
-        &app,
-        &inner,
-        &[
-            ("audio.device_name", spec.into()),
-            ("audio.sources", sources),
-        ],
-    );
     {
         let mut registry = inner.sources.lock().await;
         registry.sync_config(&config);
@@ -1388,6 +1441,11 @@ async fn set_source_translate(
     id: String,
     enabled: bool,
 ) -> Result<(), String> {
+    if state.is_config_degraded() {
+        return Err(
+            "当前配置文件存在待修复项并处于回退保护状态，请先在「设置」中修复并保存".to_string(),
+        );
+    }
     let config = {
         let _guard = state.config_update.lock().await;
         let mut next = state.config();
@@ -1417,6 +1475,11 @@ async fn mutate_sources<F>(app: AppHandle, state: Arc<SharedState>, mutate: F) -
 where
     F: FnOnce(&mut AppConfig) -> Result<(), String>,
 {
+    if state.is_config_degraded() {
+        return Err(
+            "当前配置文件存在待修复项并处于回退保护状态，请先在「设置」中修复并保存".to_string(),
+        );
+    }
     let _lifecycle = state.lifecycle.lock().await;
     let was_running = state.pipeline.lock().await.is_running();
 
@@ -1533,6 +1596,9 @@ async fn remove_source(
 ) -> Result<(), String> {
     let inner = state.inner().clone();
     mutate_sources(app, inner, |config| {
+        if config.audio.sources.len() <= 1 && config.audio.sources.iter().any(|s| s.id == id) {
+            return Err("至少保留 1 个输入源（不需要采集时可将其停用）".to_string());
+        }
         let before = config.audio.sources.len();
         config.audio.sources.retain(|s| s.id != id);
         if config.audio.sources.len() == before {
@@ -1576,21 +1642,20 @@ async fn set_output_enabled(
         return Err("当前构建未包含该输出，请下载 Full 版".to_string());
     }
 
-    let section = match kind.as_str() {
-        "steamvr" => "output.steamvr",
-        "osc" => "output.osc",
+    let key = match kind.as_str() {
+        "steamvr" => "output.steamvr.enabled",
+        "osc" => "output.osc.enabled",
         other => return Err(format!("未知输出类型: {other}")),
     };
     let config = state
-        .update_config(|config| {
+        .update_and_persist_config(&app, |config| {
             match kind.as_str() {
                 "steamvr" => config.output.steamvr.enabled = enabled,
                 _ => config.output.osc.enabled = enabled,
             }
-            Ok(())
+            Ok(vec![(key, enabled.into())])
         })
         .await?;
-    persist_value(&app, &state, section, "enabled", enabled.into());
     state.outputs.apply_config(&config.output).await;
     if enabled {
         publish_subtitle_snapshot(&state).await;
@@ -1647,7 +1712,7 @@ async fn write_config_changes(
     state: &SharedState,
     changes: &[SettingChange],
 ) -> Result<AppConfig, String> {
-    let path = ensure_config_path(state)?;
+    let path = ensure_config_path_for_repair(state)?;
 
     let payload: Vec<(String, serde_json::Value)> = changes
         .iter()
@@ -1670,9 +1735,11 @@ async fn save_settings(
     // 锁顺序固定为 lifecycle -> config_update，不存在反向嵌套。
     let _lifecycle = state.lifecycle.lock().await;
     let _config_guard = state.config_update.lock().await;
+    let was_degraded = state.is_config_degraded();
     let old = state.config();
     let (mut new, _) = state.settings_base_config();
-    let restart = apply_settings_changes(&mut new, &changes)?;
+    // 若此前因配置降级运行在内存默认值上，恢复真实磁盘配置后冷字段与运行态必然可能不同，需重启采集
+    let restart = apply_settings_changes(&mut new, &changes)? || was_degraded;
     new.validate()?;
 
     // 以落盘后重新解析的结果为准（writer 可能做过归一化）
@@ -1710,8 +1777,14 @@ async fn preview_settings(
     changes: Vec<SettingChange>,
 ) -> Result<(), String> {
     let _config_guard = state.config_update.lock().await;
+    // 若设置窗已在 IPC 飞行期间关闭隐藏，直接丢弃迟到的预览请求，避免覆盖 cancel_preview 回滚结果
+    if let Some(window) = app.get_window("settings") {
+        if !window.is_visible().unwrap_or(false) {
+            return Ok(());
+        }
+    }
     let saved = state.config();
-    let mut preview = saved.clone();
+    let (mut preview, _) = state.settings_base_config();
     apply_settings_changes(&mut preview, &changes)?;
     preview.validate()?;
     state.outputs.apply_config(&preview.output).await;
@@ -1770,7 +1843,7 @@ async fn save_config_raw(
     let _lifecycle = state.lifecycle.lock().await;
     let _config_guard = state.config_update.lock().await;
     let old = state.config();
-    let path = ensure_config_path(state.inner())?;
+    let path = ensure_config_path_for_repair(state.inner())?;
     // 先解析/校验能力，避免非法或不可用的配置落盘
     let parsed = AppConfig::from_str(&text).map_err(|e| e.to_string())?;
     parsed.validate()?;
@@ -1836,6 +1909,7 @@ async fn reload_config(
         let mut registry = state.sources.lock().await;
         registry.sync_config(&new);
     }
+    mirror_profile(&state);
     apply_hot_config(&app, &state, &old, &new).await;
     let running = state.pipeline.lock().await.is_running();
     if running {
@@ -1855,13 +1929,13 @@ async fn reload_config(
 
 #[tauri::command]
 async fn open_config_file(state: State<'_, Arc<SharedState>>) -> Result<(), String> {
-    let path = ensure_config_path(state.inner())?;
+    let path = ensure_config_path_for_repair(state.inner())?;
     open_path(&path)
 }
 
 #[tauri::command]
 async fn open_config_folder(state: State<'_, Arc<SharedState>>) -> Result<(), String> {
-    let path = ensure_config_path(state.inner())?;
+    let path = ensure_config_path_for_repair(state.inner())?;
     match path.parent() {
         Some(dir) => open_path(dir),
         None => Err("无法定位配置目录".to_string()),
@@ -2067,12 +2141,20 @@ fn set_window_bounds(
     Ok(())
 }
 
+fn is_valid_window_pos(x: i32, y: i32) -> bool {
+    // Windows 最小化（如 Win+D）会把无边框窗口移到 (-32000, -32000)，不能写回配置
+    (-20_000..=20_000).contains(&x) && (-20_000..=20_000).contains(&y)
+}
+
 #[tauri::command]
 async fn persist_window_geometry(
     app: AppHandle,
     state: State<'_, Arc<SharedState>>,
     window: Window,
 ) -> Result<(), String> {
+    if window.is_minimized().unwrap_or(false) || state.is_config_degraded() {
+        return Ok(());
+    }
     let scale = window.scale_factor().map_err(|e| e.to_string())?;
     let pos = window.outer_position().map_err(|e| e.to_string())?;
     let size = window.outer_size().map_err(|e| e.to_string())?;
@@ -2081,29 +2163,25 @@ async fn persist_window_geometry(
     let y = (pos.y as f64 / scale).round() as i32;
     let width = (size.width as f64 / scale).round() as u32;
     let height = (size.height as f64 / scale).round() as u32;
+    if !is_valid_window_pos(x, y) {
+        return Ok(());
+    }
 
-    // 走 config_update 锁：否则拖动窗口的回写会覆盖其它并发命令刚改的字段
+    // 走 config_update 锁并一次性原子写回四个字段，避免并发命令互相覆盖
     state
-        .update_config(|config| {
+        .update_and_persist_config(&app, |config| {
             config.subtitle.window_width = width;
             config.subtitle.window_height = height;
             config.subtitle.position_x = x;
             config.subtitle.position_y = y;
-            Ok(())
+            Ok(vec![
+                ("subtitle.window_width", width.into()),
+                ("subtitle.window_height", height.into()),
+                ("subtitle.position_x", x.into()),
+                ("subtitle.position_y", y.into()),
+            ])
         })
         .await?;
-
-    // 四个字段一次落盘：每次 resize 读改写四遍整份配置太重
-    persist_or_report(
-        &app,
-        &state,
-        &[
-            ("subtitle.window_width", width.into()),
-            ("subtitle.window_height", height.into()),
-            ("subtitle.position_x", x.into()),
-            ("subtitle.position_y", y.into()),
-        ],
-    );
     Ok(())
 }
 
@@ -2114,13 +2192,12 @@ async fn set_click_through(
     enabled: bool,
 ) -> Result<(), String> {
     let config = state
-        .update_config(|config| {
+        .update_and_persist_config(&app, |config| {
             config.subtitle.click_through = enabled;
-            Ok(())
+            Ok(vec![("subtitle.click_through", enabled.into())])
         })
         .await?;
     apply_click_through(&app, enabled);
-    persist_value(&app, &state, "subtitle", "click_through", enabled.into());
     emit_config(&app, &config);
     Ok(())
 }
@@ -2129,7 +2206,7 @@ async fn set_click_through(
 
 pub(crate) fn open_config_dir(app: &AppHandle) -> Result<(), String> {
     let state = app.state::<Arc<SharedState>>();
-    let path = ensure_config_path(&state)?;
+    let path = ensure_config_path_for_repair(&state)?;
     match path.parent() {
         Some(dir) => {
             std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
@@ -2142,7 +2219,7 @@ pub(crate) fn open_config_dir(app: &AppHandle) -> Result<(), String> {
 fn schedule_persist_main_position(window: &Window) {
     let app = window.app_handle();
     let state = app.state::<Arc<SharedState>>().inner().clone();
-    if state.shutting_down.load(Ordering::SeqCst) {
+    if state.shutting_down.load(Ordering::SeqCst) || state.is_config_degraded() {
         return;
     }
     let seq = state.move_seq.fetch_add(1, Ordering::SeqCst) + 1;
@@ -2151,6 +2228,8 @@ fn schedule_persist_main_position(window: &Window) {
         tokio::time::sleep(std::time::Duration::from_millis(600)).await;
         if state.move_seq.load(Ordering::SeqCst) != seq
             || state.shutting_down.load(Ordering::SeqCst)
+            || state.is_config_degraded()
+            || window.is_minimized().unwrap_or(false)
         {
             return;
         }
@@ -2159,30 +2238,25 @@ fn schedule_persist_main_position(window: &Window) {
         };
         let x = (pos.x as f64 / scale).round() as i32;
         let y = (pos.y as f64 / scale).round() as i32;
+        if !is_valid_window_pos(x, y) {
+            return;
+        }
         let current = state.config();
         if (x - current.subtitle.position_x).abs() <= 1
             && (y - current.subtitle.position_y).abs() <= 1
         {
             return;
         }
-        if state
-            .update_config(|config| {
+        let _ = state
+            .update_and_persist_config(&app, |config| {
                 config.subtitle.position_x = x;
                 config.subtitle.position_y = y;
-                Ok(())
-            })
-            .await
-            .is_ok()
-        {
-            persist_or_report(
-                &app,
-                &state,
-                &[
+                Ok(vec![
                     ("subtitle.position_x", x.into()),
                     ("subtitle.position_y", y.into()),
-                ],
-            );
-        }
+                ])
+            })
+            .await;
     });
 }
 
@@ -2330,6 +2404,12 @@ fn attach_parent_console() {}
 fn install_panic_hook() {
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
+        let recoverable_bg_thread = std::thread::current().name() == Some("steamvr-overlay");
+        if recoverable_bg_thread {
+            // 受 catch_unwind 保护的后台线程只记日志，不弹模态框，避免阻塞栈展开导致 VR 线程死锁
+            tracing::error!("Caught recoverable background thread panic: {info}");
+            return;
+        }
         tracing::error!("PANIC: {info}");
         default_hook(info);
 
@@ -2759,19 +2839,77 @@ mod tests {
     }
 
     #[test]
-    fn degraded_shared_state_blocks_unconfigured_ensure_and_clears_cleanly() {
+    fn degraded_shared_state_blocks_ensure_even_with_path_and_clears_cleanly() {
         let state = SharedState::new(
             AppConfig::default(),
-            None,
+            Some(PathBuf::from("/tmp/portable-default.toml")),
             Some("便携配置损坏".to_string()),
             true,
         );
         assert!(state.is_config_degraded());
         assert_eq!(state.degraded_warning().as_deref(), Some("便携配置损坏"));
-        assert!(ensure_config_path(&state).is_err());
+        assert!(
+            ensure_config_path(&state).is_err(),
+            "存在路径时常规局部持久化也必须受降级保护阻拦"
+        );
+        assert_eq!(
+            ensure_config_path_for_repair(&state).unwrap(),
+            PathBuf::from("/tmp/portable-default.toml")
+        );
 
         state.clear_config_degraded();
         assert!(!state.is_config_degraded());
         assert!(state.degraded_warning().is_none());
+        assert_eq!(
+            ensure_config_path(&state).unwrap(),
+            PathBuf::from("/tmp/portable-default.toml")
+        );
+
+        let unconfigured = SharedState::new(AppConfig::default(), None, None, true);
+        assert!(ensure_config_path(&unconfigured).is_err());
+        assert!(ensure_config_path_for_repair(&unconfigured).is_err());
+    }
+
+    #[tokio::test]
+    async fn supervisor_waits_for_stop_signal_before_starting_drain_timeout() {
+        let (stop_tx, stop_rx) = watch::channel(false);
+        let mut set = tokio::task::JoinSet::new();
+        let mut task_stop = stop_rx.clone();
+        set.spawn(async move {
+            let _ = task_stop.changed().await;
+        });
+
+        let handle = tokio::spawn(supervise_source_tasks(
+            set,
+            stop_rx,
+            std::time::Duration::from_millis(40),
+        ));
+        // 未发停止信号时，超过 drain_timeout 也绝不能提前强杀采集任务
+        tokio::time::sleep(std::time::Duration::from_millis(90)).await;
+        assert!(!handle.is_finished(), "采集未停止时不应触发排空超时");
+
+        stop_tx.send(true).unwrap();
+        let timed_out = handle.await.unwrap();
+        assert!(!timed_out, "响应停止信号的任务应正常排空退出");
+    }
+
+    #[tokio::test]
+    async fn supervisor_aborts_hung_tasks_after_stop_signal() {
+        let (stop_tx, stop_rx) = watch::channel(false);
+        let mut set = tokio::task::JoinSet::new();
+        set.spawn(async move {
+            std::future::pending::<()>().await;
+        });
+
+        stop_tx.send(true).unwrap();
+        let timed_out =
+            supervise_source_tasks(set, stop_rx, std::time::Duration::from_millis(40)).await;
+        assert!(timed_out, "卡死的源任务应在超时后被强制中断");
+    }
+
+    #[test]
+    fn minimized_offscreen_coordinates_are_rejected() {
+        assert!(!is_valid_window_pos(-32_000, -32_000));
+        assert!(is_valid_window_pos(100, 200));
     }
 }

@@ -789,10 +789,6 @@ impl AppConfig {
     /// 2. 若当前激活配置档（`profiles/<active>.toml`）存在且校验合法，优先从该快照恢复，避免丢失 `api_key` 等设置；
     /// 3. 否则回退到内置默认配置，并标记 `degraded = true` 以阻止后续运行期自动镜像覆盖完好的配置档文件。
     pub(crate) fn recover_user_config(user_path: &Path, err_msg: &str) -> ResolvedConfig {
-        // 保留坏文件（用户可手动修复），并继续用配置路径运行，
-        // 否则配置档功能会静默消失、下次保存会覆盖原文件。
-        let quarantined = Self::quarantine(user_path);
-
         if let Some(active) = profiles::read_active(user_path) {
             if profiles::validate_name(&active).is_ok() {
                 let snap = profiles::profiles_dir(user_path).join(format!("{active}.toml"));
@@ -801,6 +797,7 @@ impl AppConfig {
                         cfg.validate().map_err(AppError::Config)?;
                         Ok(cfg)
                     }) {
+                        let quarantined = Self::quarantine(user_path);
                         let restored =
                             quarantined.is_some() && writer::write_atomic(user_path, &text).is_ok();
                         let warning = match (&quarantined, restored) {
@@ -831,6 +828,24 @@ impl AppConfig {
             }
         }
 
+        // 若 TOML 结构本身可解析（仅字段范围/组合校验未通过），保留原文件不覆盖为默认模板，
+        // 让用户在「设置」页仍能看到自己的 api_key / 输入源并直接修正越界项。
+        if Self::from_file(user_path).is_ok() {
+            let warning = format!(
+                "配置 {} 存在待修正项（{err_msg}），本次暂用内置默认配置运行；请打开「设置」修正后保存",
+                user_path.display()
+            );
+            tracing::error!("{warning}");
+            return ResolvedConfig {
+                config: AppConfig::default(),
+                path: Some(user_path.to_path_buf()),
+                warning: Some(warning),
+                degraded: true,
+            };
+        }
+
+        // 语法损坏且无可用配置档快照：备份坏文件并写入默认模板兜底
+        let quarantined = Self::quarantine(user_path);
         let warning = match quarantined {
             Some(bad) => format!(
                 "配置 {} 无法加载（{err_msg}），已备份为 {} 并恢复默认配置",
@@ -1548,6 +1563,26 @@ mod tests {
         assert!(resolved.degraded);
         assert!(resolved.warning.is_some());
         assert!(path.exists());
+
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn recover_user_config_keeps_parseable_invalid_config_for_settings_repair() {
+        let path = temp_config_path("recover-validation-only");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut cfg = AppConfig::default();
+        cfg.translate.api_key = "sk-precious".to_string();
+        cfg.subtitle.font_size = 999; // 仅单个字段越界，TOML 语法完好
+        fs::write(&path, cfg.to_toml_string().unwrap()).unwrap();
+
+        let resolved = AppConfig::recover_user_config(&path, "subtitle.font_size 越界");
+        assert!(resolved.degraded);
+        assert_eq!(resolved.config.subtitle.font_size, 28);
+        // 磁盘原文件未被默认模板覆盖，设置页仍可回读 sk-precious 并修正 font_size
+        let on_disk = AppConfig::from_file(&path).unwrap();
+        assert_eq!(on_disk.translate.api_key, "sk-precious");
+        assert_eq!(on_disk.subtitle.font_size, 999);
 
         let _ = fs::remove_dir_all(path.parent().unwrap());
     }

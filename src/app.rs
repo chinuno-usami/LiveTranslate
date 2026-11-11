@@ -189,7 +189,8 @@ pub async fn start_console(config: AppConfig) -> AppResult<()> {
             languages::normalize_for_backend(&config.asr.backend, &source.language)
         };
         let (language_tx, language_rx) = watch::channel(language);
-        let (translate_tx, translate_rx) = watch::channel(source.translate);
+        let (translate_tx, translate_rx) =
+            watch::channel(source.translate && config.translate.enabled);
         let context = SourceContext {
             id: source.id.clone(),
             label: source.label.clone(),
@@ -568,6 +569,16 @@ async fn run_source_inner(
             }
         }
     });
+    // 若外层任务被 supervisor 超时强行 abort，连带取消 worker，防止飞行中的识别/翻译请求泄漏
+    struct AbortWorkerOnDrop(Option<tokio::task::JoinHandle<()>>);
+    impl Drop for AbortWorkerOnDrop {
+        fn drop(&mut self) {
+            if let Some(handle) = self.0.take() {
+                handle.abort();
+            }
+        }
+    }
+    let mut worker_guard = AbortWorkerOnDrop(Some(worker));
 
     let mut pushed_chunks: u64 = 0;
     let mut dropped_segments: u64 = 0;
@@ -648,17 +659,19 @@ async fn run_source_inner(
         }
     }
 
-    // 先停止系统音频流释放硬件句柄，再排空已在队列中的识别/翻译请求
+    // 先显式析构 AudioCapture 以关闭底层 cpal::Stream 硬件句柄，再排空已在队列中的识别/翻译请求
     audio_capture.stop();
+    drop(audio_capture);
 
     drop(utterance_tx);
-    let mut worker = worker;
-    if tokio::time::timeout(std::time::Duration::from_secs(2), &mut worker)
-        .await
-        .is_err()
-    {
-        tracing::info!("[{}] Worker did not finish in time, aborting", source.label);
-        worker.abort();
+    if let Some(mut worker) = worker_guard.0.take() {
+        if tokio::time::timeout(std::time::Duration::from_secs(2), &mut worker)
+            .await
+            .is_err()
+        {
+            tracing::info!("[{}] Worker did not finish in time, aborting", source.label);
+            worker.abort();
+        }
     }
 
     tracing::info!("[{}] Audio pipeline stopped", source.label);

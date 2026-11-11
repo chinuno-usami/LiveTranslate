@@ -124,7 +124,24 @@ pub fn backup(path: &Path) -> Result<Option<PathBuf>, String> {
     let mut name = path.as_os_str().to_os_string();
     name.push(".bak");
     let backup = PathBuf::from(name);
+    // 若上一轮备份继承了原文件的只读位，先放开写权限以免二次备份失败
+    if let Ok(meta) = fs::metadata(&backup) {
+        let mut perms = meta.permissions();
+        if perms.readonly() {
+            #[allow(clippy::permissions_set_readonly_false)]
+            perms.set_readonly(false);
+            let _ = fs::set_permissions(&backup, perms);
+        }
+    }
     fs::copy(path, &backup).map_err(|e| format!("备份配置失败: {e}"))?;
+    if let Ok(meta) = fs::metadata(&backup) {
+        let mut perms = meta.permissions();
+        if perms.readonly() {
+            #[allow(clippy::permissions_set_readonly_false)]
+            perms.set_readonly(false);
+            let _ = fs::set_permissions(&backup, perms);
+        }
+    }
     Ok(Some(backup))
 }
 
@@ -226,8 +243,24 @@ fn collect_unknown(
         } else {
             format!("{prefix}.{key}")
         };
-        // 这两处的键名由程序结构化处理，不做白名单
-        if path == "audio.sources" || path == "translate.extra_body" {
+        // extra_body 允许用户传入任意扩展参数；audio.sources 单独校验每个源的字段名
+        if path == "translate.extra_body" {
+            continue;
+        }
+        if path == "audio.sources" {
+            const SOURCE_KEYS: &[&str] =
+                &["id", "label", "device", "enabled", "translate", "language"];
+            if let Some(items) = child.as_array() {
+                for (index, item) in items.iter().enumerate() {
+                    if let Some(src_table) = item.as_table() {
+                        for src_key in src_table.keys() {
+                            if !SOURCE_KEYS.contains(&src_key.as_str()) {
+                                out.push(format!("audio.sources[{index}].{src_key}"));
+                            }
+                        }
+                    }
+                }
+            }
             continue;
         }
         if child.is_table() {
@@ -307,6 +340,9 @@ fn parse_sources(value: &JsonValue) -> Result<Vec<AudioSourceConfig>, String> {
     let array = value
         .as_array()
         .ok_or_else(|| "audio.sources 必须是数组".to_string())?;
+    if array.is_empty() {
+        return Err("至少保留 1 个输入源（不需要采集时可将其停用）".to_string());
+    }
     array
         .iter()
         .map(|item| {
@@ -368,18 +404,29 @@ fn set_sources(doc: &mut DocumentMut, sources: &[AudioSourceConfig]) {
         update_table_scalar(&mut table, "language", Value::from(source.language.clone()));
         tables.push(table);
     }
-    let audio = doc
+    let entry = doc
         .entry("audio")
-        .or_insert_with(|| Item::Table(Table::new()))
-        .as_table_mut();
-    if let Some(audio) = audio {
-        audio.set_dotted(false);
-        // 若之前被写成普通数组，直接替换为 array of tables
-        audio.insert("sources", Item::ArrayOfTables(tables));
-    } else {
-        let mut table = Table::new();
-        table.insert("sources", Item::ArrayOfTables(tables));
-        doc.insert("audio", Item::Table(table));
+        .or_insert_with(|| Item::Table(Table::new()));
+    match entry {
+        Item::Table(audio) => {
+            audio.set_dotted(false);
+            audio.insert("sources", Item::ArrayOfTables(tables));
+        }
+        Item::Value(Value::InlineTable(inline)) => {
+            let mut expanded = Table::new();
+            for (key, value) in inline.iter() {
+                if key != "sources" {
+                    expanded.insert(key, Item::Value(value.clone()));
+                }
+            }
+            expanded.insert("sources", Item::ArrayOfTables(tables));
+            *entry = Item::Table(expanded);
+        }
+        _ => {
+            let mut table = Table::new();
+            table.insert("sources", Item::ArrayOfTables(tables));
+            *entry = Item::Table(table);
+        }
     }
 }
 
@@ -831,5 +878,55 @@ mod tests {
         let array = text.find("[[audio.sources]]").expect("应保留数组表");
         assert!(key < array, "device_name 落在了数组表之后:\n{text}");
         let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn set_sources_preserves_inline_audio_keys_and_rejects_empty_sources() {
+        let path = temp_path("inline-audio");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut doc: DocumentMut = AppConfig::default()
+            .to_toml_string()
+            .unwrap()
+            .parse()
+            .unwrap();
+        let mut inline = toml_edit::InlineTable::new();
+        inline.insert("device_name", Value::from("default"));
+        inline.insert("sample_rate", Value::from(24000));
+        inline.insert("channels", Value::from(1));
+        inline.insert("chunk_seconds", Value::from(2.0));
+        inline.insert("silence_threshold", Value::from(0.008));
+        inline.insert("max_active_sources", Value::from(4));
+        doc["audio"] = Item::Value(Value::InlineTable(inline));
+        fs::write(&path, doc.to_string()).unwrap();
+
+        assert!(apply_changes(&path, &[("audio.sources".into(), json!([]))]).is_err());
+
+        let sources = vec![AudioSourceConfig::new("mic", "麦克风", "mic:0")];
+        let cfg = apply_changes(
+            &path,
+            &[(
+                "audio.sources".into(),
+                serde_json::to_value(&sources).unwrap(),
+            )],
+        )
+        .unwrap();
+        assert_eq!(cfg.audio.sample_rate, 24000);
+        assert_eq!(cfg.audio.sources.len(), 1);
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn unknown_keys_detects_typos_inside_audio_sources() {
+        let toml = r#"
+[audio]
+device_name = "default"
+
+[[audio.sources]]
+id = "mic"
+label = "麦克风"
+devce = "mic:0"
+"#;
+        let unknown = unknown_keys(toml);
+        assert_eq!(unknown, vec!["audio.sources[0].devce"]);
     }
 }

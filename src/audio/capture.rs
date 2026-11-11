@@ -366,7 +366,7 @@ impl AudioCapture {
         self.receiver.recv().await
     }
 
-    /// 停止采集
+    /// 标记停止采集（彻底释放系统音频句柄请直接 `drop` 本实例）
     pub fn stop(&self) {
         self.is_running.store(false, Ordering::SeqCst);
     }

@@ -175,7 +175,9 @@ pub fn validate_name(name: &str) -> Result<(), String> {
     Ok(())
 }
 
-pub fn list_status(config_path: Option<&Path>) -> ProfilesStatus {
+/// 列出配置档状态；当 `allow_init` 为 `false`（当前配置处于损坏/待修复降级态）时，
+/// 不主动把损坏的 `config.toml` 拷贝初始化成 `profiles/default.toml`。
+pub fn list_status_with_init(config_path: Option<&Path>, allow_init: bool) -> ProfilesStatus {
     let (enabled, reason) = profiles_enabled(config_path);
     let Some(config_path) = config_path else {
         return ProfilesStatus {
@@ -193,10 +195,19 @@ pub fn list_status(config_path: Option<&Path>) -> ProfilesStatus {
             profiles: Vec::new(),
         };
     }
-    if let Err(e) = ensure_initialized(config_path) {
+    if allow_init {
+        if let Err(e) = ensure_initialized(config_path) {
+            return ProfilesStatus {
+                enabled: false,
+                reason: Some(e),
+                active: None,
+                profiles: Vec::new(),
+            };
+        }
+    } else if !meta_path(config_path).exists() || !profiles_dir(config_path).exists() {
         return ProfilesStatus {
             enabled: false,
-            reason: Some(e),
+            reason: Some("当前配置文件存在待修复项，保存修复后自动启用配置档".to_string()),
             active: None,
             profiles: Vec::new(),
         };
@@ -610,6 +621,19 @@ mod tests {
             );
             assert!(profile_path(&config, "vr").exists());
         }
+        let _ = fs::remove_dir_all(config.parent().unwrap());
+    }
+
+    #[test]
+    fn list_status_without_init_does_not_seed_broken_config_into_default_profile() {
+        let config = setup("degraded-no-init");
+        fs::write(&config, "broken toml [[[").unwrap();
+
+        let status = list_status_with_init(Some(&config), false);
+        assert!(!status.enabled);
+        assert!(!profiles_dir(&config).exists());
+        assert!(!meta_path(&config).exists());
+
         let _ = fs::remove_dir_all(config.parent().unwrap());
     }
 }
