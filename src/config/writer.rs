@@ -34,6 +34,11 @@ pub fn read_text(path: &Path) -> Result<String, String> {
     }
 }
 
+/// `toml_edit` 的 `Display` 会把出错行的原文拼进去（可能含 `api_key`），这里只留消息。
+fn toml_edit_error_text(e: &toml_edit::TomlError) -> String {
+    e.message().to_string()
+}
+
 fn tmp_path_for(path: &Path) -> PathBuf {
     let seq = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
     let file_name = path
@@ -47,17 +52,19 @@ fn tmp_path_for(path: &Path) -> PathBuf {
     }
 }
 
-/// 原子写入：先写同目录临时文件，再 rename 覆盖
+/// 原子写入：先写同目录临时文件，fsync，再 rename 覆盖
 ///
 /// 保留原文件权限位（配置文件里有 api_key，用户可能已 `chmod 600`）。
-pub fn write_atomic(path: &Path, content: &str) -> Result<(), String> {
+/// 调用方需自行持有 [`lock_writes`]（`apply_changes` / `save_raw` 已经在锁内，
+/// 不能重复加锁——`std::sync::Mutex` 不可重入）。
+fn write_atomic_unlocked(path: &Path, content: &str) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
             fs::create_dir_all(parent).map_err(|e| format!("创建目录失败: {e}"))?;
         }
     }
     let tmp = tmp_path_for(path);
-    fs::write(&tmp, content).map_err(|e| format!("写入临时文件失败: {e}"))?;
+    write_file_durable(&tmp, content).map_err(|e| format!("写入临时文件失败: {e}"))?;
     // 新建文件默认走 umask（通常 0644）；原文件存在时沿用其权限，
     // 否则收紧到 0600（配置里有 api_key）
     match fs::metadata(path) {
@@ -76,7 +83,36 @@ pub fn write_atomic(path: &Path, content: &str) -> Result<(), String> {
         let _ = fs::remove_file(&tmp);
         return Err(format!("替换配置文件失败: {e}"));
     }
+    // rename 只保证「名字切换」原子，落盘还要同步父目录，
+    // 否则掉电后可能留下一个长度为 0 的配置文件（里面存着 api_key）。
+    sync_parent_dir(path);
     Ok(())
+}
+
+fn write_file_durable(path: &Path, content: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut file = fs::File::create(path)?;
+    file.write_all(content.as_bytes())?;
+    file.sync_all()?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn sync_parent_dir(path: &Path) {
+    if let Some(parent) = path.parent() {
+        if let Ok(dir) = fs::File::open(parent) {
+            let _ = dir.sync_all();
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn sync_parent_dir(_path: &Path) {}
+
+/// 原子写入（自行加锁）。供配置档等外部模块使用。
+pub fn write_atomic(path: &Path, content: &str) -> Result<(), String> {
+    let _guard = lock_writes();
+    write_atomic_unlocked(path, content)
 }
 
 /// 备份到 `<file>.bak`，返回备份路径（源文件不存在时不备份）
@@ -103,11 +139,11 @@ pub fn apply_changes(path: &Path, changes: &[(String, JsonValue)]) -> Result<App
             .to_toml_string()
             .map_err(|e| format!("生成默认配置失败: {e}"))?
             .parse()
-            .map_err(|e| format!("解析默认配置失败: {e}"))?
+            .map_err(|e| format!("解析默认配置失败: {}", toml_edit_error_text(&e)))?
     } else {
         original
             .parse()
-            .map_err(|e| format!("解析 {} 失败: {e}", path.display()))?
+            .map_err(|e| format!("解析 {} 失败: {}", path.display(), toml_edit_error_text(&e)))?
     };
 
     for (dotted, value) in changes {
@@ -145,8 +181,62 @@ pub fn apply_changes(path: &Path, changes: &[(String, JsonValue)]) -> Result<App
     }
 
     backup(path)?;
-    write_atomic(path, &updated)?;
+    write_atomic_unlocked(path, &updated)?;
     Ok(cfg)
+}
+
+/// 收集 TOML 里 schema 不认识的配置项。
+///
+/// `serde` 会默默忽略未知键，所以原始配置编辑器写 `[osc]`、
+/// `max_line = 4` 这类拼写错误时会「保存成功但从来没生效」。
+/// 返回的点分路径用于提示用户（不阻止保存：历史配置里可能真有旧字段）。
+pub fn unknown_keys(text: &str) -> Vec<String> {
+    let Ok(root) = text.parse::<toml::Value>() else {
+        return Vec::new();
+    };
+    let known: std::collections::HashSet<String> =
+        crate::config::schema::build(&AppConfig::default())
+            .groups
+            .iter()
+            .flat_map(|group| group.fields.iter())
+            .map(|field| field.path.trim_end_matches("[]").to_string())
+            .collect();
+    let mut found = Vec::new();
+    collect_unknown(&root, "", &known, &mut found);
+    found
+}
+
+fn collect_unknown(
+    value: &toml::Value,
+    prefix: &str,
+    known: &std::collections::HashSet<String>,
+    out: &mut Vec<String>,
+) {
+    let Some(table) = value.as_table() else {
+        return;
+    };
+    for (key, child) in table {
+        let path = if prefix.is_empty() {
+            key.clone()
+        } else {
+            format!("{prefix}.{key}")
+        };
+        // 这两处的键名由程序结构化处理，不做白名单
+        if path == "audio.sources" || path == "translate.extra_body" {
+            continue;
+        }
+        if child.is_table() {
+            collect_unknown(child, &path, known, out);
+            continue;
+        }
+        let is_known = known.contains(&path)
+            || known
+                .iter()
+                .any(|known| known.starts_with(&format!("{path}.")));
+        if !is_known {
+            out.push(path);
+        }
+    }
 }
 
 /// 确认某个改动真的落到了结构体里（而不是被 serde 当作未知键丢掉）
@@ -166,10 +256,24 @@ fn verify_change_applied(cfg: &AppConfig, dotted: &str, value: &JsonValue) -> Re
     }
 }
 
+/// 浮点比较必须用相对容差。
+///
+/// 配置里的浮点字段是 `f32`（0.93 / 0.9 / 0.85 …），写盘回读后是
+/// `f64::from(f32)`，与前端发来的 `f64` 天然差 1e-8 量级；用绝对 1e-9 会把
+/// 几乎所有浮点配置项判成「不一致」，设置页保存直接失败。
+fn floats_close(x: f64, y: f64) -> bool {
+    if x == y {
+        return true;
+    }
+    let diff = (x - y).abs();
+    let scale = x.abs().max(y.abs()).max(1.0);
+    diff <= 1e-6 * scale
+}
+
 fn json_equivalent(a: &JsonValue, b: &JsonValue) -> bool {
     match (a, b) {
         (JsonValue::Number(x), JsonValue::Number(y)) => match (x.as_f64(), y.as_f64()) {
-            (Some(x), Some(y)) => (x - y).abs() < 1e-9,
+            (Some(x), Some(y)) => floats_close(x, y),
             _ => x == y,
         },
         (JsonValue::Array(x), JsonValue::Array(y)) => {
@@ -190,7 +294,7 @@ pub fn save_raw(path: &Path, text: &str) -> Result<AppConfig, String> {
     let cfg = AppConfig::from_str(text).map_err(|e| format!("TOML 解析失败: {e}"))?;
     cfg.validate()?;
     backup(path)?;
-    write_atomic(path, text)?;
+    write_atomic_unlocked(path, text)?;
     Ok(cfg)
 }
 
@@ -387,6 +491,43 @@ mod tests {
             .replace("font_size = 28", "# 字号\nfont_size = 28")
             .replace("api_key = \"YOUR_API_KEY\"", "api_key = \"sk-old\"");
         fs::write(path, format!("# 顶部注释\n{text}")).unwrap();
+    }
+
+    /// 浮点字段是 f32，前端发来的是 f64；回读校验不能用绝对容差。
+    /// 回归：0.93、0.9、0.85 这些刻度值会被判成「不一致」，整批保存失败。
+    #[test]
+    fn accepts_f32_quantized_floats() {
+        let path = temp_path("float");
+        seed(&path);
+        for (path_key, value) in [
+            ("translate.temperature", json!(0.93)),
+            ("audio.silence_threshold", json!(0.15)),
+            ("output.steamvr.opacity", json!(0.85)),
+            ("output.steamvr.line_alphas", json!([1.0, 0.72, 0.48])),
+            ("output.steamvr.world_position", json!([0.0, 1.35, -2.4])),
+        ] {
+            apply_changes(&path, &[(path_key.to_string(), value)])
+                .unwrap_or_else(|e| panic!("{path_key} 应可保存: {e}"));
+        }
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// 随包默认配置必须全部是「已知键」，否则新装用户的原始编辑器会立刻报一堆未知项
+    #[test]
+    fn shipped_default_has_no_unknown_keys() {
+        assert_eq!(
+            unknown_keys(AppConfig::SHIPPED_DEFAULT),
+            Vec::<String>::new()
+        );
+    }
+
+    /// 拼错的键必须被点名（serde 会静默忽略）
+    #[test]
+    fn unknown_keys_are_reported() {
+        let mut text = AppConfig::default().to_toml_string().unwrap();
+        text.push_str("\n[osc]\nmax_line = 4\n");
+        let unknown = unknown_keys(&text);
+        assert_eq!(unknown, vec!["osc.max_line".to_string()]);
     }
 
     #[test]

@@ -341,11 +341,16 @@ pub fn switch(config_path: &Path, name: &str) -> Result<String, String> {
 pub fn switch_to(config_path: &Path, name: &str) -> Result<String, String> {
     let text = switch(config_path, name)?;
     let previous = read_active(config_path);
-    write_active(config_path, name)?;
+    // 先备份：备份失败时 profiles.toml 还没动。
+    // 若先写 active 再备份，中途失败会留下「active 指向新档、config 还是旧内容」，
+    // 下一次 mirror 就会把旧内容写进新档，把用户刚切的配置毁掉。
     writer::backup(config_path)?;
+    write_active(config_path, name)?;
     if let Err(e) = writer::write_atomic(config_path, &text) {
         if let Some(previous) = previous {
-            let _ = write_active(config_path, &previous);
+            if let Err(revert) = write_active(config_path, &previous) {
+                tracing::warn!("回滚 profiles.toml 失败: {revert}");
+            }
         }
         return Err(e);
     }

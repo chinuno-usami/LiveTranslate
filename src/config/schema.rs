@@ -199,8 +199,8 @@ pub fn build(config: &AppConfig) -> SettingsSchema {
                     "vad.max_speech_ms",
                     "单段最长（毫秒）",
                     "超过则强制切分。",
-                    1000.0,
-                    60000.0,
+                    500.0,
+                    30000.0,
                 ),
                 int_adv(
                     config,
@@ -445,16 +445,16 @@ pub fn build(config: &AppConfig) -> SettingsSchema {
                     "subtitle.window_width",
                     "窗口宽度",
                     "逻辑像素。",
-                    200.0,
-                    10000.0,
+                    160.0,
+                    7680.0,
                 ),
                 int_adv(
                     config,
                     "subtitle.window_height",
                     "窗口高度",
                     "逻辑像素。",
-                    100.0,
-                    10000.0,
+                    80.0,
+                    4320.0,
                 ),
                 int_adv(
                     config,
@@ -597,18 +597,24 @@ pub fn build(config: &AppConfig) -> SettingsSchema {
                     "output.steamvr.world_position[]",
                     "世界坐标",
                     "三个数：x, y, z（米）。",
+                    -100.0,
+                    100.0,
                 ),
                 float_adv(
                     config,
                     "output.steamvr.world_rotation_deg[]",
                     "世界旋转（度）",
                     "三个数：x, y, z。",
+                    -360.0,
+                    360.0,
                 ),
                 float_adv(
                     config,
                     "output.steamvr.line_alphas[]",
                     "逐行不透明度",
                     "三个数（0–1）：最新一行到更早行的淡出系数。",
+                    0.0,
+                    1.0,
                 ),
             ],
         },
@@ -736,7 +742,8 @@ pub fn apply_change(config: &mut AppConfig, path: &str, value: &JsonValue) -> Re
     let toml_value = json_to_toml(value, path)?;
     set_toml_path(&mut root, &key_path, toml_value)?;
     let text = toml::to_string(&root).map_err(|e| format!("序列化配置失败: {e}"))?;
-    *config = toml::from_str(&text).map_err(|e| format!("配置类型不匹配: {e}"))?;
+    *config = toml::from_str(&text)
+        .map_err(|e| format!("配置类型不匹配: {}", crate::config::toml_error_text(&e)))?;
     Ok(is_restart_required(path))
 }
 
@@ -798,7 +805,12 @@ fn json_to_toml(value: &JsonValue, path: &str) -> Result<toml::Value, String> {
             if s.trim().is_empty() {
                 return Ok(toml::Value::Table(Default::default()));
             }
-            toml::from_str(s).map_err(|e| format!("extra_body TOML 解析失败: {e}"))?
+            toml::from_str(s).map_err(|e| {
+                format!(
+                    "extra_body TOML 解析失败: {}",
+                    crate::config::toml_error_text(&e)
+                )
+            })?
         }
         JsonValue::String(s) => toml::Value::String(s.clone()),
         JsonValue::Array(items) => {
@@ -918,10 +930,17 @@ fn float(
         ..base(config, path, label, FieldKind::Float)
     }
 }
-fn float_adv(config: &AppConfig, path: &str, label: &str, help: &str) -> SettingsField {
+fn float_adv(
+    config: &AppConfig,
+    path: &str,
+    label: &str,
+    help: &str,
+    min: f64,
+    max: f64,
+) -> SettingsField {
     SettingsField {
         advanced: true,
-        ..float(config, path, label, help, -1000.0, 1000.0, 0.01)
+        ..float(config, path, label, help, min, max, 0.01)
     }
 }
 fn string(config: &AppConfig, path: &str, label: &str, help: &str) -> SettingsField {
@@ -1001,6 +1020,7 @@ fn enum_(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn every_schema_path_maps_to_config() {
@@ -1027,6 +1047,46 @@ mod tests {
                 let mut copy = cfg.clone();
                 if let Err(e) = apply_change(&mut copy, &field.path, &field.value) {
                     failures.push(format!("{} 写入失败: {e}", field.path));
+                }
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    /// schema 给出的 min/max 必须真能保存。
+    /// 回归：vad.max_speech_ms / window_width / window_height 的滑块上限
+    /// 超过 `validate()` 允许的范围，line_alphas 干脆没有范围，
+    /// 于是 UI 能选出的值一保存就被后端拒。
+    #[test]
+    fn schema_ranges_pass_validation() {
+        let base = AppConfig::default();
+        let schema = build(&base);
+        let mut failures = Vec::new();
+        for group in &schema.groups {
+            for field in &group.fields {
+                let (Some(min), Some(max)) = (field.min, field.max) else {
+                    continue;
+                };
+                if !matches!(field.kind, FieldKind::Int | FieldKind::Float) {
+                    continue;
+                }
+                let is_array = field.path.ends_with("[]");
+                for edge in [min, max] {
+                    let value = match (field.kind, is_array) {
+                        (FieldKind::Int, false) => json!(edge as i64),
+                        (FieldKind::Int, true) => json!([edge as i64, edge as i64, edge as i64]),
+                        (FieldKind::Float, false) => json!(edge),
+                        (FieldKind::Float, true) => json!([edge, edge, edge]),
+                        _ => continue,
+                    };
+                    let mut cfg = AppConfig::default();
+                    if let Err(e) = apply_change(&mut cfg, &field.path, &value) {
+                        failures.push(format!("{}={edge} 写入失败: {e}", field.path));
+                        continue;
+                    }
+                    if let Err(e) = cfg.validate() {
+                        failures.push(format!("{}={edge} 未通过 validate: {e}", field.path));
+                    }
                 }
             }
         }

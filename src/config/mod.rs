@@ -577,13 +577,18 @@ impl AppConfig {
     pub fn from_file(path: &Path) -> AppResult<Self> {
         let content = fs::read_to_string(path)
             .map_err(|e| AppError::Config(format!("读取 {} 失败: {e}", path.display())))?;
-        toml::from_str(&content)
-            .map_err(|e| AppError::Config(format!("解析 {} 失败: {e}", path.display())))
+        toml::from_str(&content).map_err(|e| {
+            AppError::Config(format!(
+                "解析 {} 失败: {}",
+                path.display(),
+                toml_error_text(&e)
+            ))
+        })
     }
 
     /// 从 TOML 文本解析配置
     pub fn from_str(content: &str) -> AppResult<Self> {
-        Ok(toml::from_str(content)?)
+        toml::from_str(content).map_err(|e| AppError::TomlDeserialize(toml_error_text(&e)))
     }
 
     /// 序列化为 TOML 文本
@@ -609,9 +614,13 @@ impl AppConfig {
             Ok(_) => Self::SHIPPED_DEFAULT.to_string(),
             Err(_) => AppConfig::default().to_toml_string()?,
         };
-        // 文件里有 api_key，尽量不留其他用户可读的窗口
-        write_private(path, &content)?;
-        Ok(true)
+        // 文件里有 api_key，尽量不留其他用户可读的窗口；
+        // 用 create_new 消除「检查存在 → 截断写入」之间的竞态（另一个实例刚写好的配置会被清空）。
+        match write_private_if_absent(path, &content) {
+            Ok(true) => Ok(true),
+            Ok(false) => Ok(false),
+            Err(e) => Err(AppError::Io(e)),
+        }
     }
 
     /// 用户配置损坏时的收尾：把坏文件改名保留，返回备份路径
@@ -864,6 +873,44 @@ impl AppConfig {
             2.0,
         );
 
+        // 识别（原始配置编辑器只有 from_str + validate 两道关，这里不能留空）
+        if !matches!(self.asr.backend.as_str(), "whisper" | "edge") {
+            errors.push("asr.backend 只能是 whisper 或 edge".to_string());
+        }
+        if !(3..=300).contains(&self.asr.timeout_secs) {
+            errors.push("asr.timeout_secs 必须在 3–300 之间".to_string());
+        }
+        if self.asr.backend == "whisper" {
+            if self.asr.base_url.trim().is_empty() {
+                errors.push("asr.base_url 不能为空（whisper 后端）".to_string());
+            }
+            if self.asr.model.trim().is_empty() {
+                errors.push("asr.model 不能为空（whisper 后端）".to_string());
+            }
+            if !self.asr.request_path.starts_with('/') {
+                errors.push("asr.request_path 必须以 / 开头".to_string());
+            }
+        } else if self.asr.edge.language.trim().is_empty() {
+            errors.push("asr.edge.language 不能为空（edge 后端）".to_string());
+        }
+        if !(3..=120).contains(&self.asr.edge.timeout_secs) {
+            errors.push("asr.edge.timeout_secs 必须在 3–120 之间".to_string());
+        }
+        check_range(
+            &mut errors,
+            "vad.pre_pad_ms",
+            self.vad.pre_pad_ms as f32,
+            0.0,
+            2000.0,
+        );
+        check_range(
+            &mut errors,
+            "vad.post_pad_ms",
+            self.vad.post_pad_ms as f32,
+            0.0,
+            2000.0,
+        );
+
         let vr = &self.output.steamvr;
         if !matches!(vr.anchor.as_str(), "hmd" | "world") {
             errors.push("output.steamvr.anchor 只能是 hmd 或 world".to_string());
@@ -1022,20 +1069,35 @@ impl Default for AppConfig {
     }
 }
 
-/// 创建/覆盖文件，并尽量收紧权限（配置里有 api_key）
-fn write_private(path: &Path, content: &str) -> AppResult<()> {
+/// 写入默认配置，但只在文件不存在时创建。
+///
+/// 返回 `Ok(false)` 表示文件已存在（说明别的实例/用户抢先创建了），不覆盖。
+fn write_private_if_absent(path: &Path, content: &str) -> std::io::Result<bool> {
     let mut options = fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
+    options.write(true).create_new(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
-    let mut file = options.open(path)?;
+    let mut file = match options.open(path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Ok(false),
+        Err(e) => return Err(e),
+    };
     use std::io::Write;
     file.write_all(content.as_bytes())?;
-    file.flush()?;
-    Ok(())
+    file.sync_all()?;
+    Ok(true)
+}
+
+/// TOML 解析错误的可展示文本。
+///
+/// `toml` / `toml_edit` 的 `Display` 会把出错那一行的**原文**拼进去，
+/// 而配置文件里有 `api_key`（少写一个引号就会把密钥打进日志、
+/// 设置页的错误条和 IPC 返回值）。这里只保留错误消息本身。
+pub fn toml_error_text(e: &toml::de::Error) -> String {
+    e.message().to_string()
 }
 
 fn check_range(errors: &mut Vec<String>, name: &str, value: f32, min: f32, max: f32) {

@@ -23,8 +23,8 @@ pub enum AppError {
     #[error("Serialization error: {0}")]
     Serialization(#[from] serde_json::Error),
 
-    #[error("TOML deserialize error: {0}")]
-    TomlDeserialize(#[from] toml::de::Error),
+    #[error("TOML 解析失败: {0}")]
+    TomlDeserialize(String),
 
     #[error("TOML serialize error: {0}")]
     TomlSerialize(#[from] toml::ser::Error),
