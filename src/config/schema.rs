@@ -606,7 +606,7 @@ pub fn build(config: &AppConfig) -> SettingsSchema {
                     config,
                     "output.steamvr.world_rotation_deg[]",
                     "世界旋转（度）",
-                    "三个数：x, y, z。",
+                    "三个数：x, y, z（当前仅应用绕 Y 轴偏航角 y）。",
                     -360.0,
                     360.0,
                 ),

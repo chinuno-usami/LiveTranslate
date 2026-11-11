@@ -6,7 +6,7 @@
 use crate::config::SteamVrConfig;
 use crate::subtitle::DisplayLine;
 use serde::Serialize;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -63,10 +63,10 @@ pub struct SteamVrSink {
 }
 
 impl SteamVrSink {
-    pub fn new(config: &SteamVrConfig) -> Self {
+    pub fn new(config: &SteamVrConfig, notify: Arc<tokio::sync::Notify>) -> Self {
         Self {
             lifecycle: Mutex::new(()),
-            inner: Mutex::new(imp::SteamVrSink::new(config)),
+            inner: Mutex::new(imp::SteamVrSink::new(config, notify)),
         }
     }
 

@@ -1,14 +1,16 @@
 use super::SteamVrStatus;
 use crate::config::SteamVrConfig;
 use crate::subtitle::DisplayLine;
+use std::sync::Arc;
 use std::thread::JoinHandle;
 
 pub struct SteamVrSink {
     status: SteamVrStatus,
+    notify: Arc<tokio::sync::Notify>,
 }
 
 impl SteamVrSink {
-    pub fn new(config: &SteamVrConfig) -> Self {
+    pub fn new(config: &SteamVrConfig, notify: Arc<tokio::sync::Notify>) -> Self {
         let message = if cfg!(all(feature = "steamvr", target_os = "windows")) {
             "SteamVR 输出不可用".to_string()
         } else if cfg!(target_os = "windows") {
@@ -23,11 +25,15 @@ impl SteamVrSink {
                 connected: false,
                 message,
             },
+            notify,
         }
     }
 
     pub fn apply_config(&mut self, config: &SteamVrConfig) -> Option<JoinHandle<()>> {
-        self.status.enabled = config.enabled;
+        if self.status.enabled != config.enabled {
+            self.status.enabled = config.enabled;
+            self.notify.notify_one();
+        }
         None
     }
 

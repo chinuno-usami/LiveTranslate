@@ -21,7 +21,7 @@ static WRITE_LOCK: Mutex<()> = Mutex::new(());
 /// 临时文件名去重计数（保证并发写入者不会撞名）
 static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-fn lock_writes() -> std::sync::MutexGuard<'static, ()> {
+pub(crate) fn lock_writes() -> std::sync::MutexGuard<'static, ()> {
     WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
 
@@ -57,27 +57,20 @@ fn tmp_path_for(path: &Path) -> PathBuf {
 /// 保留原文件权限位（配置文件里有 api_key，用户可能已 `chmod 600`）。
 /// 调用方需自行持有 [`lock_writes`]（`apply_changes` / `save_raw` 已经在锁内，
 /// 不能重复加锁——`std::sync::Mutex` 不可重入）。
-fn write_atomic_unlocked(path: &Path, content: &str) -> Result<(), String> {
+pub(crate) fn write_atomic_unlocked(path: &Path, content: &str) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
             fs::create_dir_all(parent).map_err(|e| format!("创建目录失败: {e}"))?;
         }
     }
     let tmp = tmp_path_for(path);
-    write_file_durable(&tmp, content).map_err(|e| format!("写入临时文件失败: {e}"))?;
-    // 新建文件默认走 umask（通常 0644）；原文件存在时沿用其权限，
-    // 否则收紧到 0600（配置里有 api_key）
-    match fs::metadata(path) {
-        Ok(meta) => {
-            let _ = fs::set_permissions(&tmp, meta.permissions());
-        }
-        Err(_) => {
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let _ = fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600));
-            }
-        }
+    if let Err(e) = write_file_durable(&tmp, content) {
+        let _ = fs::remove_file(&tmp);
+        return Err(format!("写入临时文件失败: {e}"));
+    }
+    // 临时文件在 Unix 上已按 0600 创建；若原文件存在则沿用用户自定义权限位
+    if let Ok(meta) = fs::metadata(path) {
+        let _ = fs::set_permissions(&tmp, meta.permissions());
     }
     if let Err(e) = fs::rename(&tmp, path) {
         let _ = fs::remove_file(&tmp);
@@ -91,7 +84,15 @@ fn write_atomic_unlocked(path: &Path, content: &str) -> Result<(), String> {
 
 fn write_file_durable(path: &Path, content: &str) -> std::io::Result<()> {
     use std::io::Write;
-    let mut file = fs::File::create(path)?;
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        // 配置含 api_key，创建即收紧为 0600，消除先 0644 后 chmod 的明文暴露窗口
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
     file.write_all(content.as_bytes())?;
     file.sync_all()?;
     Ok(())
@@ -109,7 +110,8 @@ fn sync_parent_dir(path: &Path) {
 #[cfg(not(unix))]
 fn sync_parent_dir(_path: &Path) {}
 
-/// 原子写入（自行加锁）。供配置档等外部模块使用。
+/// 原子写入（自行加锁）。供单测直接调用。
+#[cfg(test)]
 pub fn write_atomic(path: &Path, content: &str) -> Result<(), String> {
     let _guard = lock_writes();
     write_atomic_unlocked(path, content)

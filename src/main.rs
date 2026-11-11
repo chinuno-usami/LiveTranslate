@@ -311,6 +311,8 @@ pub(crate) struct SharedState {
     /// 全局翻译开关
     translate_tx: watch::Sender<bool>,
     _translate_rx: watch::Receiver<bool>,
+    /// 启动阶段的配置回退/修复提示，在主界面就绪后展示一次
+    startup_warning: std::sync::Mutex<Option<String>>,
 }
 
 /// 字幕历史保留上限：桌面浮窗与 SteamVR 的 max_lines 独立，取较大者
@@ -344,7 +346,11 @@ fn global_language(config: &AppConfig) -> String {
 }
 
 impl SharedState {
-    fn new(config: AppConfig, config_path: Option<PathBuf>) -> Self {
+    fn new(
+        config: AppConfig,
+        config_path: Option<PathBuf>,
+        startup_warning: Option<String>,
+    ) -> Self {
         let subtitle_state = SubtitleState::new(
             history_limit(&config),
             config.subtitle.show_source,
@@ -377,7 +383,15 @@ impl SharedState {
             _language_rx: language_rx,
             translate_tx,
             _translate_rx: translate_rx,
+            startup_warning: std::sync::Mutex::new(startup_warning),
         }
+    }
+
+    fn take_startup_warning(&self) -> Option<String> {
+        self.startup_warning
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
     }
 
     fn config(&self) -> AppConfig {
@@ -455,17 +469,21 @@ pub(crate) fn apply_click_through(app: &AppHandle, enabled: bool) {
     tracing::info!("Click-through set to: {}", enabled);
 }
 
-pub(crate) fn open_settings_window(app: &AppHandle) {
+pub(crate) fn open_settings_window(app: &AppHandle, group: Option<&str>) {
     match app.get_window("settings") {
         Some(window) => {
             let was_visible = window.is_visible().unwrap_or(false);
             // 先显示再通知，避免前端的确认框挂在一个还没显示的窗口上。
-            // 仅在由隐藏转为显示时通知重新拉取配置，避免已打开时重复点「设置」清掉脏编辑。
+            // 仅在由隐藏转为显示（或显式指定了跳转分组）时通知前端。
             let _ = window.show();
             let _ = window.unminimize();
             let _ = window.set_focus();
-            if !was_visible {
-                let _ = app.emit_all(SETTINGS_SHOWN_EVENT, ());
+            if !was_visible || group.is_some() {
+                let payload = serde_json::json!({
+                    "was_visible": was_visible,
+                    "group": group,
+                });
+                let _ = app.emit_all(SETTINGS_SHOWN_EVENT, payload);
             }
         }
         None => tracing::warn!("Settings window not found in tauri.conf.json"),
@@ -507,6 +525,7 @@ async fn shutdown_once(app: &AppHandle) {
         tracing::warn!("停止采集超时，继续退出");
     }
     state.outputs.shutdown();
+    state.outputs.notify_status();
 }
 
 pub(crate) fn quit_app(app: &AppHandle) {
@@ -571,17 +590,8 @@ fn mirror_profile(state: &SharedState) {
     let Some(config_path) = state.config_path() else {
         return;
     };
-    let (enabled, _) = profiles::profiles_enabled(Some(&config_path));
-    if !enabled {
-        return;
-    }
-    let active = profiles::read_active(&config_path).unwrap_or_else(|| "default".to_string());
-    let text = match std::fs::read_to_string(&config_path) {
-        Ok(text) => text,
-        Err(_) => return,
-    };
-    if let Err(e) = profiles::mirror(&config_path, &active, &text) {
-        tracing::warn!("Failed to mirror profile {active}: {e}");
+    if let Err(e) = profiles::mirror_active(&config_path) {
+        tracing::warn!("Failed to mirror active profile: {e}");
     }
 }
 
@@ -635,6 +645,12 @@ async fn emit_subtitle(app: &AppHandle, state: &SharedState) {
     emit_subtitle_with_config(app, state, &config).await;
 }
 
+/// 将重新格式化后的当前字幕快照同步给外部输出（SteamVR / OSC）
+async fn publish_subtitle_snapshot(state: &SharedState) {
+    let lines = state.subtitle_state.lock().await.display_lines();
+    state.outputs.publish(&lines);
+}
+
 /// 应用热更新字段（样式 / 输出 / 翻译开关 / 语言 / 窗口属性）
 async fn apply_hot_config(app: &AppHandle, state: &SharedState, old: &AppConfig, new: &AppConfig) {
     // 字幕状态
@@ -653,6 +669,7 @@ async fn apply_hot_config(app: &AppHandle, state: &SharedState, old: &AppConfig,
 
     // 输出
     state.outputs.apply_config(&new.output);
+    publish_subtitle_snapshot(state).await;
 
     // 翻译开关 / 语言
     let _ = state.translate_tx.send(new.translate.enabled);
@@ -764,11 +781,24 @@ async fn start_capture_locked(app: AppHandle, state: Arc<SharedState>) -> Result
 
     if contexts.is_empty() {
         emit_status(&app, false, "没有可用的输入源");
+        if let Some(warning) = state.take_startup_warning() {
+            let _ = app.emit_all(ERROR_EVENT, warning);
+        }
         emit_source_status(&app, &state).await;
         return Ok(());
     }
 
-    // 并发上限 / 重复设备 / Silero CPU 提示
+    state.outputs.set_capture_active(true);
+    let active_count = contexts.len();
+
+    let (event_tx, mut event_rx): (
+        mpsc::Sender<app::PipelineEvent>,
+        mpsc::Receiver<app::PipelineEvent>,
+    ) = mpsc::channel(128);
+    let (stop_tx, stop_rx) = watch::channel(false);
+
+    emit_status(&app, true, format!("{active_count} 源采集中"));
+    // 提示放在 emit_status 之后发送，避免刚发出的告警被状态文案立刻覆盖
     if !skipped.is_empty() {
         let message = skipped
             .iter()
@@ -786,17 +816,9 @@ async fn start_capture_locked(app: AppHandle, state: Arc<SharedState>) -> Result
             ),
         );
     }
-
-    state.outputs.set_capture_active(true);
-    let active_count = contexts.len();
-
-    let (event_tx, mut event_rx): (
-        mpsc::Sender<app::PipelineEvent>,
-        mpsc::Receiver<app::PipelineEvent>,
-    ) = mpsc::channel(128);
-    let (stop_tx, stop_rx) = watch::channel(false);
-
-    emit_status(&app, true, format!("{active_count} 源采集中"));
+    if let Some(warning) = state.take_startup_warning() {
+        let _ = app.emit_all(ERROR_EVENT, warning);
+    }
     emit_source_status(&app, &state).await;
 
     let mut pipeline = state.pipeline.lock().await;
@@ -1161,6 +1183,7 @@ async fn set_show_source(
         })
         .await?;
     persist_value(&app, &state, "subtitle", "show_source", enabled.into());
+    publish_subtitle_snapshot(&state).await;
     emit_config(&app, &config);
     emit_subtitle(&app, &state).await;
     Ok(())
@@ -1607,6 +1630,7 @@ async fn preview_settings(
     let saved = state.config();
     let mut preview = saved.clone();
     apply_settings_changes(&mut preview, &changes)?;
+    preview.validate()?;
     state.outputs.apply_config(&preview.output);
     {
         let mut subtitle_state = state.subtitle_state.lock().await;
@@ -1614,6 +1638,7 @@ async fn preview_settings(
         subtitle_state.set_show_source(preview.subtitle.show_source);
         subtitle_state.set_label_mode(preview.subtitle.label_sources);
     }
+    publish_subtitle_snapshot(&state).await;
     // 仅覆盖纯视觉预览字段，不伪造点击穿透、翻译开关、识别语言等运行态按钮状态
     let mut payload = OverlayConfigPayload::from_config(&saved);
     payload.font_size = preview.subtitle.font_size;
@@ -1646,6 +1671,7 @@ async fn cancel_preview_impl(app: AppHandle, state: Arc<SharedState>) -> Result<
         subtitle_state.set_show_source(config.subtitle.show_source);
         subtitle_state.set_label_mode(config.subtitle.label_sources);
     }
+    publish_subtitle_snapshot(&state).await;
     emit_config(&app, &config);
     emit_subtitle_with_config(&app, &state, &config).await;
     emit_output_status(&app, &state);
@@ -1758,9 +1784,14 @@ async fn open_config_folder(state: State<'_, Arc<SharedState>>) -> Result<(), St
 }
 
 #[tauri::command]
-async fn open_settings(app: AppHandle) -> Result<(), String> {
-    open_settings_window(&app);
+async fn open_settings(app: AppHandle, group: Option<String>) -> Result<(), String> {
+    open_settings_window(&app, group.as_deref());
     Ok(())
+}
+
+#[tauri::command]
+fn is_window_visible(window: Window) -> bool {
+    window.is_visible().unwrap_or(true)
 }
 
 // ---------------- 配置档命令 ----------------
@@ -1782,6 +1813,7 @@ async fn create_profile(
     name: String,
     copy_current: bool,
 ) -> Result<(), String> {
+    let _config_guard = state.config_update.lock().await;
     let path = require_profile_path(&state)?;
     let source = if copy_current {
         Some(path.as_path())
@@ -1797,6 +1829,7 @@ async fn duplicate_profile(
     from: String,
     to: String,
 ) -> Result<(), String> {
+    let _config_guard = state.config_update.lock().await;
     let path = require_profile_path(&state)?;
     profiles::duplicate(&path, &from, &to)
 }
@@ -1807,12 +1840,14 @@ async fn rename_profile(
     old: String,
     new: String,
 ) -> Result<(), String> {
+    let _config_guard = state.config_update.lock().await;
     let path = require_profile_path(&state)?;
     profiles::rename(&path, &old, &new)
 }
 
 #[tauri::command]
 async fn delete_profile(state: State<'_, Arc<SharedState>>, name: String) -> Result<(), String> {
+    let _config_guard = state.config_update.lock().await;
     let path = require_profile_path(&state)?;
     profiles::delete(&path, &name)
 }
@@ -2261,7 +2296,7 @@ fn run(args: Args) -> anyhow::Result<()> {
     // ONNX Runtime 动态库探测必须在创建任何线程/异步运行时之前完成
     audio::detector::prepare_ort_library();
 
-    let (config, config_path) = match AppConfig::resolve(args.config.clone()) {
+    let resolved = match AppConfig::resolve_detailed(args.config.clone()) {
         Ok(resolved) => resolved,
         Err(e) if args.config.is_some() => {
             tracing::error!("Failed to load config: {}", e);
@@ -2270,9 +2305,16 @@ fn run(args: Args) -> anyhow::Result<()> {
         Err(e) => {
             tracing::error!("Failed to load config: {}", e);
             tracing::warn!("Falling back to built-in default configuration");
-            (AppConfig::default(), None)
+            config::ResolvedConfig {
+                config: AppConfig::default(),
+                path: None,
+                warning: Some(format!("配置文件加载失败（{e}），已回退到默认配置")),
+            }
         }
     };
+    let config = resolved.config;
+    let config_path = resolved.path;
+    let startup_warning = resolved.warning;
 
     match &config_path {
         Some(path) => tracing::info!("Config file: {}", path.display()),
@@ -2315,7 +2357,11 @@ fn run(args: Args) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let shared = Arc::new(SharedState::new(config.clone(), config_path.clone()));
+    let shared = Arc::new(SharedState::new(
+        config.clone(),
+        config_path.clone(),
+        startup_warning,
+    ));
 
     let app = tauri::Builder::default()
         .system_tray(tray::create_system_tray())
@@ -2385,6 +2431,19 @@ fn run(args: Args) -> anyhow::Result<()> {
                 let _ = window.emit(OUTPUT_STATUS_EVENT, state.outputs.status());
             }
 
+            // 后台输出线程（SteamVR 连接重连 / OSC 发送与报错）状态变化时实时推送给前端
+            let app_for_output = app.handle();
+            let state_for_output = state.inner().clone();
+            tauri::async_runtime::spawn(async move {
+                loop {
+                    state_for_output.outputs.status_notified().await;
+                    if state_for_output.shutting_down.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    emit_output_status(&app_for_output, &state_for_output);
+                }
+            });
+
             let _ = window.show();
             let _ = window.set_focus();
             Ok(())
@@ -2412,6 +2471,7 @@ fn run(args: Args) -> anyhow::Result<()> {
             set_output_enabled,
             get_capabilities,
             open_settings,
+            is_window_visible,
             get_settings_schema,
             save_settings,
             preview_settings,
@@ -2582,5 +2642,16 @@ mod tests {
         registry.set_translate_all(false);
         assert!(registry.status_items()[0].translate);
         assert!(!registry.runtimes[0].translate_enabled());
+    }
+
+    #[test]
+    fn preview_validation_catches_invalid_values() {
+        let mut preview = AppConfig::default();
+        let changes = vec![SettingChange {
+            path: "subtitle.font_size".to_string(),
+            value: json!(999),
+        }];
+        apply_settings_changes(&mut preview, &changes).unwrap();
+        assert!(preview.validate().is_err());
     }
 }

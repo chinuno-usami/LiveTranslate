@@ -189,6 +189,19 @@ pub fn has_window_quota(sent_at: &VecDeque<std::time::Instant>, max_per_window: 
     sent_at.iter().filter(|t| **t >= cutoff).count() < max_per_window
 }
 
+/// 退出或禁用 OSC 时是否需要补发一次空消息清屏：
+/// 除 `pending_clear` 原子位与上次已发非空文本外，已被消费进 `pending_text == Some("")`
+/// 但尚在等待限流窗口的清屏请求也必须计入，否则停止采集后紧接禁用/退出会把旧字幕留在 Chatbox。
+pub fn should_flush_clear(
+    pending_clear_flag: bool,
+    last_sent_text: Option<&str>,
+    pending_text: Option<&str>,
+) -> bool {
+    let had_visible = last_sent_text.is_some_and(|text| !text.is_empty());
+    let pending_is_clear = pending_text == Some("");
+    pending_clear_flag || had_visible || pending_is_clear
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct OscStatus {
     pub enabled: bool,
@@ -238,6 +251,7 @@ mod imp {
         reset_dedup: AtomicBool,
         /// 请求发送一次空文本（Chatbox 是有状态的，停止后要主动清屏）
         pending_clear: AtomicBool,
+        notify: Arc<tokio::sync::Notify>,
     }
 
     impl Shared {
@@ -249,8 +263,15 @@ mod imp {
         }
 
         fn set_status_message(&self, message: String) {
-            let mut status = self.status.lock().unwrap_or_else(|e| e.into_inner());
-            status.message = message;
+            let changed = {
+                let mut status = self.status.lock().unwrap_or_else(|e| e.into_inner());
+                let changed = status.message != message;
+                status.message = message;
+                changed
+            };
+            if changed {
+                self.notify.notify_one();
+            }
         }
     }
 
@@ -260,7 +281,7 @@ mod imp {
     }
 
     impl OscSink {
-        pub fn new(config: &OscConfig) -> Self {
+        pub fn new(config: &OscConfig, notify: Arc<tokio::sync::Notify>) -> Self {
             let shared = Arc::new(Shared {
                 config: Mutex::new(config.clone()),
                 pending: Mutex::new(None),
@@ -278,6 +299,7 @@ mod imp {
                 activity_ms: AtomicU64::new(0),
                 reset_dedup: AtomicBool::new(false),
                 pending_clear: AtomicBool::new(false),
+                notify,
             });
 
             let thread_shared = shared.clone();
@@ -316,11 +338,16 @@ mod imp {
             if previous.enabled && !config.enabled {
                 self.shared.pending_clear.store(true, Ordering::SeqCst);
             }
-            let mut status = self.shared.status.lock().unwrap_or_else(|e| e.into_inner());
-            status.enabled = config.enabled;
-            if !config.enabled {
-                status.message = "未启用".to_string();
+            {
+                let mut status = self.shared.status.lock().unwrap_or_else(|e| e.into_inner());
+                status.enabled = config.enabled;
+                if !config.enabled {
+                    status.message = "未启用".to_string();
+                } else if !previous.enabled {
+                    status.message = "等待字幕".to_string();
+                }
             }
+            self.shared.notify.notify_one();
         }
 
         /// 传入完整字幕快照；内部覆盖旧快照，限流期间只保留最新结果
@@ -431,10 +458,11 @@ mod imp {
                     if typing {
                         let _ = send_typing(&socket, addr, false);
                     }
-                    let had_visible = last_sent_text
-                        .as_deref()
-                        .is_some_and(|text| !text.is_empty());
-                    if shared.pending_clear.swap(false, Ordering::SeqCst) || had_visible {
+                    if should_flush_clear(
+                        shared.pending_clear.swap(false, Ordering::SeqCst),
+                        last_sent_text.as_deref(),
+                        pending_text.as_deref(),
+                    ) {
                         let _ = send_chatbox(&socket, addr, "");
                     }
                 }
@@ -444,16 +472,20 @@ mod imp {
             let config = shared.config();
 
             if !config.enabled {
-                let need_clear = shared.pending_clear.swap(false, Ordering::SeqCst);
-                let had_visible = last_sent_text
-                    .as_deref()
-                    .is_some_and(|text| !text.is_empty());
+                let flush_clear = should_flush_clear(
+                    shared.pending_clear.swap(false, Ordering::SeqCst),
+                    last_sent_text.as_deref(),
+                    pending_text.as_deref(),
+                );
                 if shared.reset_dedup.swap(false, Ordering::SeqCst) {
                     last_sent_text = None;
                     pending_text = None;
                     history.clear();
+                } else if flush_clear {
+                    last_sent_text = None;
+                    pending_text = None;
                 }
-                if typing || need_clear || had_visible {
+                if typing || flush_clear {
                     let addr = target
                         .as_ref()
                         .map(|(_, addr)| *addr)
@@ -462,7 +494,7 @@ mod imp {
                         if typing {
                             let _ = send_typing(&socket, addr, false);
                         }
-                        if need_clear || had_visible {
+                        if flush_clear {
                             let _ = send_chatbox(&socket, addr, "");
                         }
                     }
@@ -474,7 +506,9 @@ mod imp {
 
             if shared.reset_dedup.swap(false, Ordering::SeqCst) {
                 last_sent_text = None;
-                pending_text = None;
+                if pending_text.as_deref() != Some("") {
+                    pending_text = None;
+                }
                 history.clear();
             }
 
@@ -577,8 +611,13 @@ mod imp {
                                 shared.status.lock().unwrap_or_else(|e| e.into_inner());
                             status.enabled = true;
                             status.last_sent_ms = now_ms();
-                            status.message = format!("已发送 {} 字符", text.chars().count());
+                            status.message = if text.is_empty() {
+                                "已清屏".to_string()
+                            } else {
+                                format!("已发送 {} 字符", text.chars().count())
+                            };
                         }
+                        shared.notify.notify_one();
                         let custom = config.custom_address.trim();
                         if !custom.is_empty() {
                             match cached_target(&mut custom_target, custom) {
@@ -668,15 +707,15 @@ mod imp {
 #[cfg(not(feature = "osc"))]
 mod imp {
     use super::*;
+    use std::sync::{Arc, Mutex};
 
     pub struct OscSink {
         status: Mutex<OscStatus>,
+        notify: Arc<tokio::sync::Notify>,
     }
 
-    use std::sync::Mutex;
-
     impl OscSink {
-        pub fn new(config: &OscConfig) -> Self {
+        pub fn new(config: &OscConfig, notify: Arc<tokio::sync::Notify>) -> Self {
             Self {
                 status: Mutex::new(OscStatus {
                     enabled: config.enabled,
@@ -684,12 +723,20 @@ mod imp {
                     last_sent_ms: 0,
                     message: "当前构建未包含 OSC 支持（请下载 Full 版）".to_string(),
                 }),
+                notify,
             }
         }
 
         pub fn apply_config(&self, config: &OscConfig) {
-            if let Ok(mut status) = self.status.lock() {
+            let changed = if let Ok(mut status) = self.status.lock() {
+                let changed = status.enabled != config.enabled;
                 status.enabled = config.enabled;
+                changed
+            } else {
+                false
+            };
+            if changed {
+                self.notify.notify_one();
             }
         }
 
@@ -830,5 +877,15 @@ mod tests {
         assert!(!has_window_quota(&sent, 2));
         sent.push_back(std::time::Instant::now() - Duration::from_secs(6));
         assert!(!has_window_quota(&sent, 2));
+    }
+
+    #[test]
+    fn flush_clear_detects_in_flight_empty_pending_text() {
+        assert!(!should_flush_clear(false, None, None));
+        assert!(!should_flush_clear(false, Some(""), None));
+        assert!(should_flush_clear(true, None, None));
+        assert!(should_flush_clear(false, Some("hello"), None));
+        // pending_clear 已被消费、last_sent_text 已被置空，但空消息仍在等待限流窗口
+        assert!(should_flush_clear(false, None, Some("")));
     }
 }

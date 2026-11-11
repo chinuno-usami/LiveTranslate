@@ -6,9 +6,9 @@ use crate::subtitle::DisplayLine;
 use cosmic_text::{Attrs, Buffer, Color, Family, FontSystem, Metrics, Shaping, SwashCache, Weight};
 
 pub const CANVAS_WIDTH: usize = 1024;
-/// OpenVR 对纹理尺寸有隐式上限，且整帧 CPU 光栅开销随高度线性增长。
-/// 超长字幕（ASR/翻译输出长度不可控）必须被夹住，否则会 OOM 或上传失败。
-const MAX_CANVAS_HEIGHT: usize = 2048;
+/// OpenVR `SetOverlayRaw` 通过共享内存 IPC 传输整幅 RGBA 缓冲区，超过 ~4 MiB 时容易返回
+/// `RequestFailed`；高度限制在 1024（1024×1024×4 = 4 MiB），超出时自动丢弃最旧行。
+const MAX_CANVAS_HEIGHT: usize = 1024;
 /// 单条字幕参与排版的字符上限（超出部分用 … 截断）
 const MAX_LINE_CHARS: usize = 400;
 const PADDING: f32 = 28.0;

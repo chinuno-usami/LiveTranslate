@@ -43,7 +43,7 @@ pub fn handle_system_tray_event(app: &AppHandle, event: SystemTrayEvent) {
                 crate::toggle_click_through(app);
             }
             "settings" => {
-                crate::open_settings_window(app);
+                crate::open_settings_window(app, None);
             }
             "config_dir" => {
                 if let Err(e) = crate::open_config_dir(app) {
@@ -118,7 +118,7 @@ pub fn register_global_shortcuts(app: &AppHandle) -> tauri::Result<()> {
     let app_handle = app.clone();
     register(
         "CmdOrCtrl+Alt+Comma",
-        Box::new(move || crate::open_settings_window(&app_handle)),
+        Box::new(move || crate::open_settings_window(&app_handle, None)),
     );
 
     let app_handle = app.clone();

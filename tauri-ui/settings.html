@@ -43,6 +43,30 @@
       <span id="config-path" class="hint"></span>
     </footer>
 
+    <div
+      id="dialog-modal"
+      class="dialog-backdrop hidden"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="dialog-title"
+    >
+      <div class="dialog-card">
+        <h3 id="dialog-title" class="dialog-title">提示</h3>
+        <p id="dialog-message" class="dialog-message"></p>
+        <input
+          id="dialog-input"
+          class="dialog-input hidden"
+          type="text"
+          autocomplete="off"
+          spellcheck="false"
+        />
+        <div class="dialog-actions">
+          <button id="dialog-cancel" type="button" class="btn">取消</button>
+          <button id="dialog-ok" type="button" class="btn primary">确定</button>
+        </div>
+      </div>
+    </div>
+
     <script src="./settings.js"></script>
   </body>
 </html>

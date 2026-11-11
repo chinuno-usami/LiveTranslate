@@ -57,6 +57,11 @@ body {
     border-width 180ms ease;
 }
 
+.toolbar:not(.collapsed) {
+  max-height: min(160px, calc(100vh - 20px));
+  overflow-y: auto;
+}
+
 .toolbar.collapsed {
   max-height: 0;
   opacity: 0;
@@ -171,6 +176,7 @@ body {
 }
 
 .subtitle-line {
+  width: 100%;
   color: var(--text-color);
   font-size: var(--font-size);
   line-height: 1.28;
@@ -295,6 +301,8 @@ body {
   display: flex;
   align-items: center;
   justify-content: center;
+  padding: 8px;
+  box-sizing: border-box;
   background: rgba(0, 0, 0, 0.45);
 }
 
@@ -303,7 +311,10 @@ body {
 }
 
 .modal-card {
-  width: min(520px, 92%);
+  box-sizing: border-box;
+  width: min(520px, 100%);
+  max-height: calc(100vh - 16px);
+  overflow-y: auto;
   padding: 16px 18px;
   border-radius: 14px;
   border: 1px solid rgba(255, 255, 255, 0.14);
@@ -438,10 +449,19 @@ kbd {
 /* ===== v0.2 多源与设置入口 ===== */
 
 .subtitle-entry {
+  width: 100%;
   display: flex;
   flex-direction: column;
-  align-items: flex-start;
+  align-items: center;
   gap: 2px;
+}
+
+.subtitle-entry.labeled {
+  align-items: flex-start;
+}
+
+.subtitle-entry.labeled .subtitle-line {
+  text-align: left;
 }
 
 .subtitle-line-sub {
@@ -465,12 +485,13 @@ kbd {
 }
 
 .sources-popover {
+  box-sizing: border-box;
   position: absolute;
-  top: 64px;
+  top: 56px;
   left: 12px;
   z-index: 40;
   width: min(620px, calc(100% - 24px));
-  max-height: calc(100% - 80px);
+  max-height: calc(100vh - 68px);
   overflow: auto;
   padding: 12px;
   border-radius: 12px;

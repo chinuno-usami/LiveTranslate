@@ -547,6 +547,14 @@ pub struct AppConfig {
     pub output: OutputConfig,
 }
 
+/// 配置解析结果（附带可恢复的告警信息，供 GUI 在启动后提示用户）
+#[derive(Debug, Clone)]
+pub struct ResolvedConfig {
+    pub config: AppConfig,
+    pub path: Option<PathBuf>,
+    pub warning: Option<String>,
+}
+
 impl AppConfig {
     /// 用户级配置目录（跨平台）
     ///
@@ -648,7 +656,14 @@ impl AppConfig {
     }
 
     /// 按优先级解析配置，返回 `(配置, 来源路径)`
+    #[cfg(test)]
     pub fn resolve(explicit: Option<PathBuf>) -> AppResult<(Self, Option<PathBuf>)> {
+        let resolved = Self::resolve_detailed(explicit)?;
+        Ok((resolved.config, resolved.path))
+    }
+
+    /// 按优先级解析配置，并在非显式配置文件损坏时保留原路径与告警信息
+    pub fn resolve_detailed(explicit: Option<PathBuf>) -> AppResult<ResolvedConfig> {
         if let Some(path) = explicit {
             if !path.exists() {
                 return Err(AppError::Config(format!(
@@ -658,25 +673,25 @@ impl AppConfig {
             }
             let cfg = Self::load_validated(&path)?;
             tracing::info!("Loaded config from: {}", path.display());
-            return Ok((cfg, Some(path)));
+            return Ok(ResolvedConfig {
+                config: cfg,
+                path: Some(path),
+                warning: None,
+            });
         }
 
         if let Ok(exe) = std::env::current_exe() {
             if let Some(dir) = exe.parent() {
                 let p = dir.join("config").join("default.toml");
                 if p.exists() {
-                    let cfg = Self::load_validated(&p)?;
-                    tracing::info!("Loaded config from: {}", p.display());
-                    return Ok((cfg, Some(p)));
+                    return Ok(Self::load_non_explicit_or_warn(p));
                 }
             }
         }
 
         let cwd_path = PathBuf::from("config/default.toml");
         if cwd_path.exists() {
-            let cfg = Self::load_validated(&cwd_path)?;
-            tracing::info!("Loaded config from: {}", cwd_path.display());
-            return Ok((cfg, Some(cwd_path)));
+            return Ok(Self::load_non_explicit_or_warn(cwd_path));
         }
 
         if let Ok(user_path) = Self::user_config_path() {
@@ -684,23 +699,36 @@ impl AppConfig {
                 match Self::load_validated(&user_path) {
                     Ok(cfg) => {
                         tracing::info!("Loaded config from: {}", user_path.display());
-                        return Ok((cfg, Some(user_path)));
+                        return Ok(ResolvedConfig {
+                            config: cfg,
+                            path: Some(user_path),
+                            warning: None,
+                        });
                     }
                     Err(e) => {
                         // 保留坏文件（用户可手动修复），并继续用配置路径运行，
                         // 否则配置档功能会静默消失、下次保存会覆盖原文件。
-                        tracing::error!("配置 {} 无法加载: {e}", user_path.display());
-                        if let Some(bad) = Self::quarantine(&user_path) {
-                            tracing::error!(
-                                "已将损坏的配置改名为 {}，本次使用内置默认配置",
+                        let warning = match Self::quarantine(&user_path) {
+                            Some(bad) => format!(
+                                "配置 {} 无法加载（{e}），已备份为 {} 并恢复默认配置",
+                                user_path.display(),
                                 bad.display()
-                            );
-                        }
+                            ),
+                            None => format!(
+                                "配置 {} 无法加载（{e}），本次使用内置默认配置",
+                                user_path.display()
+                            ),
+                        };
+                        tracing::error!("{warning}");
                         let cfg = match Self::write_default_if_absent(&user_path) {
                             Ok(true) => Self::load_validated(&user_path).unwrap_or_default(),
                             _ => AppConfig::default(),
                         };
-                        return Ok((cfg, Some(user_path)));
+                        return Ok(ResolvedConfig {
+                            config: cfg,
+                            path: Some(user_path),
+                            warning: Some(warning),
+                        });
                     }
                 }
             }
@@ -712,7 +740,11 @@ impl AppConfig {
                         user_path.display()
                     );
                     let cfg = Self::load_validated(&user_path).unwrap_or_default();
-                    return Ok((cfg, Some(user_path)));
+                    return Ok(ResolvedConfig {
+                        config: cfg,
+                        path: Some(user_path),
+                        warning: None,
+                    });
                 }
                 Ok(false) => {}
                 Err(e) => {
@@ -733,7 +765,37 @@ impl AppConfig {
              Create one at: {}",
             hint
         );
-        Ok((AppConfig::default(), None))
+        Ok(ResolvedConfig {
+            config: AppConfig::default(),
+            path: None,
+            warning: None,
+        })
+    }
+
+    /// 便携模式 / 工作目录配置损坏时保留原路径（避免运行期误写进系统用户配置目录）
+    fn load_non_explicit_or_warn(path: PathBuf) -> ResolvedConfig {
+        match Self::load_validated(&path) {
+            Ok(cfg) => {
+                tracing::info!("Loaded config from: {}", path.display());
+                ResolvedConfig {
+                    config: cfg,
+                    path: Some(path),
+                    warning: None,
+                }
+            }
+            Err(e) => {
+                let warning = format!(
+                    "配置文件 {} 加载失败（{e}），本次使用默认配置",
+                    path.display()
+                );
+                tracing::error!("{warning}");
+                ResolvedConfig {
+                    config: AppConfig::default(),
+                    path: Some(path),
+                    warning: Some(warning),
+                }
+            }
+        }
     }
 
     /// 返回一份抹掉密钥的副本，仅用于日志输出
@@ -898,8 +960,24 @@ impl AppConfig {
             if !self.asr.request_path.starts_with('/') {
                 errors.push("asr.request_path 必须以 / 开头".to_string());
             }
-        } else if self.asr.edge.language.trim().is_empty() {
-            errors.push("asr.edge.language 不能为空（edge 后端）".to_string());
+        } else {
+            let edge_lang = self.asr.edge.language.trim();
+            if edge_lang.is_empty() {
+                errors.push("asr.edge.language 不能为空（edge 后端）".to_string());
+            } else if edge_lang.eq_ignore_ascii_case("auto") {
+                errors.push(
+                    "asr.edge.language 在 edge 后端下不支持 auto，请指定具体语言（如 en-US）"
+                        .to_string(),
+                );
+            }
+            for (index, source) in sources.iter().enumerate() {
+                if source.language.trim().eq_ignore_ascii_case("auto") {
+                    errors.push(format!(
+                        "输入源 #{}: edge 后端不支持单源 language = \"auto\"，请指定具体语言或留空跟随全局",
+                        index + 1
+                    ));
+                }
+            }
         }
         if !(3..=120).contains(&self.asr.edge.timeout_secs) {
             errors.push("asr.edge.timeout_secs 必须在 3–120 之间".to_string());
@@ -1299,6 +1377,41 @@ mod tests {
 
         cfg.output.steamvr.world_rotation_deg[1] = 15.0;
         cfg.output.osc.custom_address = "127.0.0.1:9001".to_string();
+        cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn non_explicit_corrupt_config_preserves_path_and_warns() {
+        let path = temp_config_path("corrupt-portable");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, "not valid toml [[[").unwrap();
+
+        let resolved = AppConfig::load_non_explicit_or_warn(path.clone());
+        assert_eq!(resolved.path.as_deref(), Some(path.as_path()));
+        assert!(resolved.warning.is_some());
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "not valid toml [[[",
+            "便携/开发配置损坏时不应被覆盖或移动"
+        );
+
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn validation_rejects_edge_auto_language_on_global_and_source() {
+        let mut cfg = AppConfig::default();
+        cfg.asr.backend = "edge".to_string();
+        cfg.asr.edge.language = "auto".to_string();
+        assert!(cfg.validate().is_err());
+
+        cfg.asr.edge.language = "en-US".to_string();
+        let mut src = AudioSourceConfig::new("mic", "麦克风", "mic:0");
+        src.language = "auto".to_string();
+        cfg.audio.sources = vec![src];
+        assert!(cfg.validate().is_err());
+
+        cfg.audio.sources[0].language = "ja-JP".to_string();
         cfg.validate().unwrap();
     }
 }

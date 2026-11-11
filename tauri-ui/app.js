@@ -135,7 +135,8 @@ function renderLines(entries) {
       const body = lines
         .map((line, index) => `<div class="subtitle-line${index === 0 ? '' : ' subtitle-line-sub'}">${line}</div>`)
         .join('');
-      return `<div class="subtitle-entry">${chip}${body}</div>`;
+      const entryClass = label ? 'subtitle-entry labeled' : 'subtitle-entry';
+      return `<div class="${entryClass}">${chip}${body}</div>`;
     })
     .join('');
 }
@@ -567,6 +568,14 @@ async function loadLanguages() {
       return;
     }
 
+    if (payload.current && !options.some((item) => item.code === payload.current)) {
+      const customOpt = document.createElement('option');
+      customOpt.value = payload.current;
+      customOpt.textContent = payload.current;
+      customOpt.selected = true;
+      els.languageSelect.appendChild(customOpt);
+    }
+
     for (const item of options) {
       const opt = document.createElement('option');
       opt.value = item.code;
@@ -614,6 +623,16 @@ async function bindActions() {
   });
 
   els.sourcesBtn.addEventListener('click', async () => {
+    // 浮窗拉成扁长字幕条（高度不足以容纳弹层）时，直接打开独立设置窗口的「输入源」页
+    if (els.sourcesPopover.classList.contains('hidden') && window.innerHeight < 210) {
+      try {
+        await invoke('open_settings', { group: 'sources' });
+      } catch (error) {
+        console.error('打开设置失败', error);
+        showActionError(`打开设置失败: ${error}`);
+      }
+      return;
+    }
     const hidden = els.sourcesPopover.classList.toggle('hidden');
     els.sourcesBtn.setAttribute('aria-expanded', hidden ? 'false' : 'true');
     if (!hidden) {
@@ -628,7 +647,7 @@ async function bindActions() {
     els.sourcesPopover.classList.add('hidden');
     els.sourcesBtn.setAttribute('aria-expanded', 'false');
     try {
-      await invoke('open_settings');
+      await invoke('open_settings', { group: 'sources' });
     } catch (error) {
       console.error('打开设置失败', error);
       showActionError(`打开设置失败: ${error}`);

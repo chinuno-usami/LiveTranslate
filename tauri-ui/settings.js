@@ -22,6 +22,12 @@ const els = {
   content: document.getElementById('group-content'),
   status: document.getElementById('save-status'),
   configPath: document.getElementById('config-path'),
+  dialogModal: document.getElementById('dialog-modal'),
+  dialogTitle: document.getElementById('dialog-title'),
+  dialogMessage: document.getElementById('dialog-message'),
+  dialogInput: document.getElementById('dialog-input'),
+  dialogCancel: document.getElementById('dialog-cancel'),
+  dialogOk: document.getElementById('dialog-ok'),
 };
 
 const state = {
@@ -39,7 +45,118 @@ const state = {
   invalidInputs: new Map(),
   originalSourcesJson: '[]',
   previewTimer: null,
+  hasLoaded: false,
 };
+
+// ---------------- 页内模态对话框 ----------------
+
+let activeDialogCancel = null;
+
+function closeActiveDialog() {
+  if (activeDialogCancel) {
+    const cancelFn = activeDialogCancel;
+    activeDialogCancel = null;
+    cancelFn();
+  }
+}
+
+function openDialog({
+  mode,
+  title = '提示',
+  message = '',
+  defaultValue = '',
+  placeholder = '',
+  okText = '确定',
+  cancelText = '取消',
+  danger = false,
+}) {
+  closeActiveDialog();
+
+  return new Promise((resolve) => {
+    const previousFocus = document.activeElement;
+    const isPrompt = mode === 'prompt';
+
+    els.dialogTitle.textContent = title;
+    els.dialogMessage.textContent = message;
+    els.dialogOk.textContent = okText;
+    els.dialogCancel.textContent = cancelText;
+    els.dialogOk.classList.toggle('primary', !danger);
+    els.dialogOk.classList.toggle('danger-fill', Boolean(danger));
+
+    if (isPrompt) {
+      els.dialogInput.value = defaultValue == null ? '' : String(defaultValue);
+      els.dialogInput.placeholder = placeholder;
+      els.dialogInput.classList.remove('hidden');
+    } else {
+      els.dialogInput.value = '';
+      els.dialogInput.classList.add('hidden');
+    }
+
+    els.dialogModal.classList.remove('hidden');
+
+    let settled = false;
+    const finish = (result) => {
+      if (settled) return;
+      settled = true;
+      activeDialogCancel = null;
+      els.dialogModal.classList.add('hidden');
+      els.dialogOk.removeEventListener('click', onOk);
+      els.dialogCancel.removeEventListener('click', onCancel);
+      els.dialogModal.removeEventListener('click', onBackdrop);
+      window.removeEventListener('keydown', onKeyDown, true);
+      if (previousFocus && typeof previousFocus.focus === 'function') {
+        previousFocus.focus();
+      }
+      resolve(result);
+    };
+
+    const onOk = () => {
+      finish(isPrompt ? els.dialogInput.value.trim() : true);
+    };
+    const onCancel = () => {
+      finish(isPrompt ? null : false);
+    };
+    const onBackdrop = (event) => {
+      if (event.target === els.dialogModal) {
+        onCancel();
+      }
+    };
+    const onKeyDown = (event) => {
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        event.stopPropagation();
+        onCancel();
+      } else if (event.key === 'Enter' && document.activeElement !== els.dialogCancel) {
+        event.preventDefault();
+        event.stopPropagation();
+        onOk();
+      }
+    };
+
+    activeDialogCancel = onCancel;
+    els.dialogOk.addEventListener('click', onOk);
+    els.dialogCancel.addEventListener('click', onCancel);
+    els.dialogModal.addEventListener('click', onBackdrop);
+    window.addEventListener('keydown', onKeyDown, true);
+
+    requestAnimationFrame(() => {
+      if (isPrompt) {
+        els.dialogInput.focus();
+        els.dialogInput.select();
+      } else {
+        els.dialogOk.focus();
+      }
+    });
+  });
+}
+
+function uiConfirm(message, opts = {}) {
+  return openDialog({ mode: 'confirm', message, ...opts });
+}
+
+function uiPrompt(message, defaultValue = '', opts = {}) {
+  return openDialog({ mode: 'prompt', message, defaultValue, ...opts });
+}
 
 function clearPreviewTimer() {
   if (state.previewTimer) {
@@ -241,12 +358,20 @@ async function switchProfile(name) {
   if (!name || name === state.profiles?.active) return;
   const count = dirtyCount();
   if (count > 0) {
-    const ok = window.confirm(`当前有 ${count} 项未保存的修改，切换配置档将丢弃它们。继续？`);
+    const ok = await uiConfirm(`当前有 ${count} 项未保存的修改，切换配置档将丢弃它们。继续？`, {
+      title: '切换配置档',
+      okText: '丢弃并切换',
+      danger: true,
+    });
     if (!ok) {
       return;
     }
   }
-  if (!window.confirm(`切换到配置档「${name}」将替换当前配置（采集运行中会自动重启），继续？`)) {
+  const confirmed = await uiConfirm(
+    `切换到配置档「${name}」将替换当前配置（采集运行中会自动重启），继续？`,
+    { title: '切换配置档', okText: '切换' },
+  );
+  if (!confirmed) {
     return;
   }
   clearPreviewTimer();
@@ -267,9 +392,20 @@ async function switchProfile(name) {
 }
 
 async function createProfile() {
-  const name = window.prompt('新配置档名（1–40 字符，字母/数字/中文/_/-）');
+  const name = await uiPrompt('新配置档名（1–40 字符，字母/数字/中文/_/-）', '', {
+    title: '新建配置档',
+    placeholder: '例如：vrchat',
+    okText: '下一步',
+  });
   if (!name) return;
-  const copyCurrent = window.confirm('确定 = 从当前配置复制；取消 = 创建默认配置');
+  const copyCurrent = await uiConfirm(
+    '是否复制当前配置作为新配置档的初始内容？\n（选择「创建默认」则使用内置默认配置）',
+    {
+      title: '初始配置来源',
+      okText: '复制当前配置',
+      cancelText: '创建默认',
+    },
+  );
   try {
     await invoke('create_profile', { name, copyCurrent });
     const [profiles, raw] = await Promise.all([invoke('get_profiles'), invoke('get_config_raw')]);
@@ -286,7 +422,10 @@ async function createProfile() {
 async function duplicateProfile() {
   const from = selectedProfile();
   if (!from) return;
-  const to = window.prompt(`复制「${from}」到新配置档名`);
+  const to = await uiPrompt(`复制「${from}」到新配置档名`, `${from}-copy`, {
+    title: '复制配置档',
+    okText: '复制',
+  });
   if (!to) return;
   try {
     await invoke('duplicate_profile', { from, to });
@@ -301,7 +440,10 @@ async function duplicateProfile() {
 async function renameProfile() {
   const old = selectedProfile();
   if (!old || old === 'default') return;
-  const next = window.prompt(`把「${old}」重命名为`, old);
+  const next = await uiPrompt(`把「${old}」重命名为`, old, {
+    title: '重命名配置档',
+    okText: '重命名',
+  });
   if (!next || next === old) return;
   try {
     await invoke('rename_profile', { old, new: next });
@@ -323,11 +465,11 @@ async function deleteProfile() {
         ? 'default'
         : (state.profiles?.profiles || []).find((p) => p.name !== name)?.name || 'default';
     const dirtyHint = dirtyCount() > 0 ? '，并丢弃当前未保存的修改' : '';
-    if (
-      !window.confirm(
-        `配置档「${name}」正在使用，删除前将自动切换回「${fallback}」${dirtyHint}。此操作不可恢复，确定删除？`,
-      )
-    ) {
+    const confirmed = await uiConfirm(
+      `配置档「${name}」正在使用，删除前将自动切换回「${fallback}」${dirtyHint}。此操作不可恢复，确定删除？`,
+      { title: '删除当前配置档', okText: '切换并删除', danger: true },
+    );
+    if (!confirmed) {
       return;
     }
     clearPreviewTimer();
@@ -346,7 +488,12 @@ async function deleteProfile() {
     return;
   }
 
-  if (!window.confirm(`删除配置档「${name}」？此操作不可恢复。`)) return;
+  const confirmed = await uiConfirm(`删除配置档「${name}」？此操作不可恢复。`, {
+    title: '删除配置档',
+    okText: '删除',
+    danger: true,
+  });
+  if (!confirmed) return;
   try {
     await invoke('delete_profile', { name });
     state.profiles = await invoke('get_profiles');
@@ -359,6 +506,17 @@ async function deleteProfile() {
 
 // ---------------- 导航 / 搜索 ----------------
 
+function switchToGroup(groupId) {
+  const groups = state.schema?.groups || [];
+  if (!groups.some((group) => group.id === groupId)) return;
+  state.currentGroup = groupId;
+  state.invalidInputs.clear();
+  els.search.value = '';
+  renderNav();
+  renderContent();
+  updateDirtyIndicator();
+}
+
 function renderNav() {
   const groups = state.schema?.groups || [];
   els.nav.innerHTML = groups
@@ -370,12 +528,7 @@ function renderNav() {
     .join('');
   els.nav.querySelectorAll('.nav-item').forEach((button) => {
     button.addEventListener('click', () => {
-      state.currentGroup = button.dataset.group;
-      state.invalidInputs.clear();
-      els.search.value = '';
-      renderNav();
-      renderContent();
-      updateDirtyIndicator();
+      switchToGroup(button.dataset.group);
     });
   });
 }
@@ -646,12 +799,31 @@ function tomlInline(value) {
 
 // ---------------- 输入源表格 ----------------
 
+function effectiveAsrBackend() {
+  if (state.dirty.has('asr.backend')) {
+    return String(state.dirty.get('asr.backend') || '');
+  }
+  const backendField = findField('asr.backend');
+  return String(backendField?.value || 'openai_compatible');
+}
+
+function effectiveSourceLanguageOptions() {
+  const backend = effectiveAsrBackend();
+  const fieldPath = backend === 'edge' ? 'asr.edge.language' : 'asr.language';
+  const field = findField(fieldPath);
+  if (Array.isArray(field?.options) && field.options.length > 0) {
+    return field.options.map((option) => ({ code: option.value, label: option.label }));
+  }
+  return state.languages;
+}
+
 function renderSourcesBlock(disabled) {
   const block = document.getElementById('sources-block');
   if (!block) return;
+  const candidateLanguages = effectiveSourceLanguageOptions();
   const rows = state.sources
     .map((source, index) => {
-      const languageOptions = state.languages.map(
+      const languageOptions = candidateLanguages.map(
         (language) =>
           `<option value="${escapeHtml(language.code)}"${
             language.code === source.language ? ' selected' : ''
@@ -659,7 +831,7 @@ function renderSourcesBlock(disabled) {
       );
       if (
         source.language &&
-        !state.languages.some((language) => language.code === source.language)
+        !candidateLanguages.some((language) => language.code === source.language)
       ) {
         languageOptions.unshift(
           `<option value="${escapeHtml(source.language)}" selected>${escapeHtml(
@@ -816,6 +988,12 @@ function collectSourceErrors(sources) {
       if (devices.has(device)) errors.push(`${row}: 设备「${device}」被多个启用中的输入源占用`);
       devices.add(device);
     }
+    if (
+      effectiveAsrBackend() === 'edge' &&
+      String(source.language || '').trim().toLowerCase() === 'auto'
+    ) {
+      errors.push(`${row}: Edge 语音识别不支持将语言覆盖设为 auto，请选择具体语言或跟随全局`);
+    }
   });
   return errors;
 }
@@ -847,11 +1025,14 @@ function renderRawGroup() {
 }
 
 async function saveRawConfig() {
-  if (
-    state.dirty.size > 0 &&
-    !window.confirm('保存原始 TOML 将覆盖其它分组尚未保存的表单修改，继续？')
-  ) {
-    return;
+  if (state.dirty.size > 0) {
+    const confirmed = await uiConfirm(
+      '保存原始 TOML 将覆盖其它分组尚未保存的表单修改，继续？',
+      { title: '覆盖未保存修改', okText: '继续保存', danger: true },
+    );
+    if (!confirmed) {
+      return;
+    }
   }
   clearPreviewTimer();
   const saveRawBtn = document.getElementById('save-raw-btn');
@@ -926,10 +1107,11 @@ function bindFieldEvents() {
         state.invalidInputs.delete(path);
         const values = inputs.map((input) => input.value);
         if (values.some((raw) => raw === '')) {
+          state.invalidInputs.set(path, findField(path)?.label || path);
           if (state.dirty.delete(path)) {
-            updateDirtyIndicator();
             schedulePreview(path);
           }
+          updateDirtyIndicator();
           return;
         }
         value = values.map(Number);
@@ -941,16 +1123,16 @@ function bindFieldEvents() {
           updateDirtyIndicator();
           return;
         }
-        state.invalidInputs.delete(path);
-        // 清空输入框时不要当成 0（position_x 之类会被真的写成 0），
-        // 视为「这项先不改」，等用户输入真正的值。
+        // 清空数字输入框时不能静默忽略，否则用户点保存会误以为改动已生效
         if (element.value === '') {
+          state.invalidInputs.set(path, findField(path)?.label || path);
           if (state.dirty.delete(path)) {
-            updateDirtyIndicator();
             schedulePreview(path);
           }
+          updateDirtyIndicator();
           return;
         }
+        state.invalidInputs.delete(path);
         value = Number(element.value);
       } else {
         value =
@@ -1078,7 +1260,7 @@ function findField(path) {
  * 一条非法值会让后端整批保存失败，用户还得逐项排查。
  */
 function validateNumbers(changes) {
-  const errors = [...state.invalidInputs.values()].map((label) => `${label} 输入不是有效数字`);
+  const errors = [...state.invalidInputs.values()].map((label) => `${label} 请输入有效数字`);
   for (const change of changes) {
     const field = findField(change.path);
     if (!field || !['int', 'float', 'number'].includes(field.kind)) continue;
@@ -1198,8 +1380,14 @@ async function cancel() {
 
 async function reload() {
   const count = dirtyCount();
-  if (count > 0 && !window.confirm(`当前有 ${count} 项未保存的修改，重新加载将丢弃它们。继续？`)) {
-    return;
+  if (count > 0) {
+    const confirmed = await uiConfirm(
+      `当前有 ${count} 项未保存的修改，重新加载将丢弃它们。继续？`,
+      { title: '重新加载配置', okText: '丢弃并重载', danger: true },
+    );
+    if (!confirmed) {
+      return;
+    }
   }
   clearPreviewTimer();
   state.dirty.clear();
@@ -1251,17 +1439,28 @@ function bindTopbar() {
 async function reloadOnShow() {
   clearPreviewTimer();
   const count = dirtyCount();
+  let keptDirty = false;
   if (count > 0) {
-    const keep = window.confirm(
-      `有 ${count} 项未保存的修改。确定 = 保留并继续编辑；取消 = 丢弃并重新加载。`,
-    );
+    const keep = await uiConfirm(`当前有 ${count} 项未保存的修改，是否保留并继续编辑？`, {
+      title: '未保存的修改',
+      okText: '保留修改',
+      cancelText: '丢弃并重新加载',
+    });
     if (!keep) {
       state.dirty.clear();
       state.invalidInputs.clear();
       state.rawDirty = false;
+    } else {
+      keptDirty = true;
     }
   }
   await loadAll();
+  if (keptDirty) {
+    const previewable = [...state.dirty.keys()].find(isPreviewablePath);
+    if (previewable) {
+      schedulePreview(previewable);
+    }
+  }
 }
 
 window.addEventListener('DOMContentLoaded', async () => {
@@ -1271,26 +1470,41 @@ window.addEventListener('DOMContentLoaded', async () => {
     return;
   }
   bindTopbar();
-  // 设置窗口在 app 启动时就创建（hidden），但用户可能整场都不打开它。
-  // 不可见时不做加载，等第一次 settings://shown 再拉取。
-  const current = window.__TAURI__?.window?.getCurrent?.();
-  const visible = current?.isVisible ? await current.isVisible().catch(() => true) : true;
+  // 设置窗口在 app 启动时就创建（hidden），通过后端命令判断可见性（不依赖 window allowlist），
+  // 不可见时不做初始化查询，等第一次 settings://shown 再加载。
+  const visible = await invoke('is_window_visible').catch(() => true);
   if (visible) {
+    state.hasLoaded = true;
     await loadAll();
   } else {
     setStatus('就绪');
   }
   // 设置窗口关闭只是 hide()，前端状态会一直活着；
-  // 不重新拉取的话，用户会拿启动时的快照去覆盖浮窗里的改动。
+  // 再次显示时重新拉取快照，同时支持直接跳到指定分组（如紧凑浮窗点击「源」直达输入源页）。
   if (window.__TAURI__?.event?.listen) {
-    await window.__TAURI__.event.listen('settings://shown', () => {
-      reloadOnShow().catch((error) => {
+    await window.__TAURI__.event.listen('settings://shown', (event) => {
+      const targetGroup = event?.payload?.group || null;
+      const wasVisible = Boolean(event?.payload?.was_visible);
+      const task = async () => {
+        if (!state.hasLoaded) {
+          if (targetGroup) state.currentGroup = targetGroup;
+          state.hasLoaded = true;
+          await loadAll();
+        } else if (!wasVisible) {
+          if (targetGroup) state.currentGroup = targetGroup;
+          await reloadOnShow();
+        } else if (targetGroup && targetGroup !== state.currentGroup) {
+          switchToGroup(targetGroup);
+        }
+      };
+      task().catch((error) => {
         console.error(error);
         showError(`重新加载失败: ${error}`);
       });
     });
     await window.__TAURI__.event.listen('settings://hidden', () => {
       clearPreviewTimer();
+      closeActiveDialog();
     });
   }
 });

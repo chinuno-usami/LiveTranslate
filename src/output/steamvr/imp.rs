@@ -31,6 +31,7 @@ struct Shared {
     last_activity: Mutex<Instant>,
     /// 同一时刻最多允许一个线程持有 OpenVR Context（openvr 全局 INITIALIZED 重入会 panic）
     worker_alive: AtomicBool,
+    notify: Arc<tokio::sync::Notify>,
 }
 
 struct Worker {
@@ -44,7 +45,7 @@ pub struct SteamVrSink {
 }
 
 impl SteamVrSink {
-    pub fn new(config: &SteamVrConfig) -> Self {
+    pub fn new(config: &SteamVrConfig, notify: Arc<tokio::sync::Notify>) -> Self {
         let shared = Arc::new(Shared {
             lines: Mutex::new(Vec::new()),
             config: Mutex::new(config.clone()),
@@ -61,6 +62,7 @@ impl SteamVrSink {
             revision: AtomicU64::new(1),
             last_activity: Mutex::new(Instant::now()),
             worker_alive: AtomicBool::new(false),
+            notify,
         });
 
         let mut sink = Self {
@@ -118,7 +120,12 @@ impl SteamVrSink {
                 status.message = "未启用".to_string();
             }
         }
+        if config.enabled {
+            // 调整设置或实时预览时刷新活动时间，让已因静音淡出的面板重新显现
+            *lock(&self.shared.last_activity) = Instant::now();
+        }
         self.shared.revision.fetch_add(1, Ordering::SeqCst);
+        self.shared.notify.notify_one();
 
         if config.enabled {
             self.start();
@@ -160,9 +167,17 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 }
 
 fn set_status(shared: &Shared, connected: bool, message: impl Into<String>) {
-    let mut status = lock(&shared.status);
-    status.connected = connected;
-    status.message = message.into();
+    let changed = {
+        let mut status = lock(&shared.status);
+        let message = message.into();
+        let changed = status.connected != connected || status.message != message;
+        status.connected = connected;
+        status.message = message;
+        changed
+    };
+    if changed {
+        shared.notify.notify_one();
+    }
 }
 
 struct WorkerGuard<'a>(&'a AtomicBool);
@@ -191,6 +206,8 @@ fn run(shared: Arc<Shared>, stop: Arc<AtomicBool>) {
         std::thread::sleep(Duration::from_millis(50));
     }
     let _guard = WorkerGuard(&shared.worker_alive);
+    // 字体数据库在线程生命周期内只加载一次，避免重连时重复全盘扫描系统字体
+    let mut renderer = render::Renderer::new();
 
     loop {
         if stop.load(Ordering::SeqCst) {
@@ -198,7 +215,7 @@ fn run(shared: Arc<Shared>, stop: Arc<AtomicBool>) {
         }
         let interval = lock(&shared.config).reconnect_interval_secs.max(1);
 
-        let result = catch_unwind(AssertUnwindSafe(|| session(&shared, &stop)));
+        let result = catch_unwind(AssertUnwindSafe(|| session(&shared, &stop, &mut renderer)));
         if stop.load(Ordering::SeqCst) {
             // 主动停止：不要再写“已断开”，否则会覆盖刚设置的“未启用”
             break;
@@ -237,15 +254,18 @@ fn init_context() -> Result<openvr::Context, SessionError> {
 }
 
 fn is_fatal_overlay_error(err: VROverlayError) -> bool {
+    // RequestFailed 常见于单帧纹理尺寸或瞬时 IPC 繁忙，不应销毁整个 OpenVR 会话触发 5s 重连
     matches!(
         err,
-        VROverlayError::UnknownOverlay
-            | VROverlayError::InvalidHandle
-            | VROverlayError::RequestFailed
+        VROverlayError::UnknownOverlay | VROverlayError::InvalidHandle
     )
 }
 
-fn session(shared: &Arc<Shared>, stop: &AtomicBool) -> Result<(), SessionError> {
+fn session(
+    shared: &Arc<Shared>,
+    stop: &AtomicBool,
+    renderer: &mut render::Renderer,
+) -> Result<(), SessionError> {
     let context = init_context()?;
     let system = context
         .system()
@@ -256,10 +276,11 @@ fn session(shared: &Arc<Shared>, stop: &AtomicBool) -> Result<(), SessionError> 
     let handle: OverlayHandle = overlay
         .create_overlay(OVERLAY_KEY, OVERLAY_NAME)
         .map_err(|e| SessionError::Message(format!("创建 Overlay 失败: {e:?}")))?;
+    // OpenVR 新建 Overlay 默认不透明度为 1.0，先置 0 再走淡入动画，避免首帧闪烁
+    let _ = overlay.set_opacity(handle, 0.0);
     set_status(shared, true, "已连接 SteamVR");
 
     let mut last_revision = u64::MAX;
-    let mut renderer = render::Renderer::new();
     let mut current_opacity = 0.0f32;
     let mut target_opacity = 0.0f32;
     let mut last_animate = Instant::now();
@@ -354,7 +375,13 @@ fn session(shared: &Arc<Shared>, stop: &AtomicBool) -> Result<(), SessionError> 
         if (target_opacity - current_opacity).abs() > 0.005 {
             let step = (dt / 0.12).clamp(0.0, 1.0);
             current_opacity += (target_opacity - current_opacity) * step;
-            if let Err(e) = overlay.set_opacity(handle, current_opacity.clamp(0.0, 1.0)) {
+            let safe_opacity = if current_opacity.is_finite() {
+                current_opacity.clamp(0.0, 1.0)
+            } else {
+                current_opacity = 0.0;
+                0.0
+            };
+            if let Err(e) = overlay.set_opacity(handle, safe_opacity) {
                 if is_fatal_overlay_error(e) {
                     return Err(SessionError::Message(format!("Overlay 会话失效: {e:?}")));
                 }

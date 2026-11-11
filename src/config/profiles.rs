@@ -95,6 +95,11 @@ fn seed_text() -> String {
 
 /// 首次启用时做非破坏性迁移：创建 profiles/ 与 default 快照
 pub fn ensure_initialized(config_path: &Path) -> Result<(), String> {
+    let _guard = writer::lock_writes();
+    ensure_initialized_unlocked(config_path)
+}
+
+fn ensure_initialized_unlocked(config_path: &Path) -> Result<(), String> {
     let dir = profiles_dir(config_path);
     fs::create_dir_all(&dir).map_err(|e| format!("创建配置档目录失败: {e}"))?;
 
@@ -106,13 +111,13 @@ pub fn ensure_initialized(config_path: &Path) -> Result<(), String> {
             // 权限 / 编码错误不要退化成“文件不存在”，否则会静默生成无注释默认档
             Err(e) => return Err(format!("读取当前配置失败: {e}")),
         };
-        writer::write_atomic(&default_path, &text)?;
+        writer::write_atomic_unlocked(&default_path, &text)?;
     }
 
     let meta = meta_path(config_path);
     if !meta.exists() {
         let active = read_active(config_path).unwrap_or_else(|| DEFAULT_PROFILE.to_string());
-        write_active(config_path, &active)?;
+        write_active_unlocked(config_path, &active)?;
     }
     Ok(())
 }
@@ -126,12 +131,18 @@ pub fn read_active(config_path: &Path) -> Option<String> {
     read_meta(config_path).and_then(|m| m.active)
 }
 
+#[cfg(test)]
 pub fn write_active(config_path: &Path, name: &str) -> Result<(), String> {
+    let _guard = writer::lock_writes();
+    write_active_unlocked(config_path, name)
+}
+
+fn write_active_unlocked(config_path: &Path, name: &str) -> Result<(), String> {
     let meta = ProfilesMeta {
         active: Some(name.to_string()),
     };
     let text = toml::to_string(&meta).map_err(|e| format!("序列化 profiles.toml 失败: {e}"))?;
-    writer::write_atomic(&meta_path(config_path), &text)
+    writer::write_atomic_unlocked(&meta_path(config_path), &text)
 }
 
 /// 校验配置档名（跨平台安全）
@@ -254,10 +265,14 @@ fn validated_text(text: &str) -> Result<AppConfig, String> {
     Ok(cfg)
 }
 
-/// 新建配置档；`copy_current = true` 时从当前 config.toml 复制
+/// 新建配置档；`copy_from` 有值时从给定文件复制
 pub fn create(config_path: &Path, name: &str, copy_from: Option<&Path>) -> Result<(), String> {
     validate_name(name)?;
-    ensure_initialized(config_path)?;
+    if name.eq_ignore_ascii_case(DEFAULT_PROFILE) && name != DEFAULT_PROFILE {
+        return Err("配置档「default」已存在".to_string());
+    }
+    let _guard = writer::lock_writes();
+    ensure_initialized_unlocked(config_path)?;
     let target = profile_path(config_path, name);
     if target.exists() {
         return Err(format!("配置档「{name}」已存在"));
@@ -267,35 +282,70 @@ pub fn create(config_path: &Path, name: &str, copy_from: Option<&Path>) -> Resul
         None => seed_text(),
     };
     validated_text(&text)?;
-    writer::write_atomic(&target, &text)
+    writer::write_atomic_unlocked(&target, &text)
 }
 
 pub fn duplicate(config_path: &Path, from: &str, to: &str) -> Result<(), String> {
     validate_name(from)?;
     validate_name(to)?;
-    ensure_initialized(config_path)?;
+    if to.eq_ignore_ascii_case(DEFAULT_PROFILE) && to != DEFAULT_PROFILE {
+        return Err("配置档「default」已存在".to_string());
+    }
+    let _guard = writer::lock_writes();
+    ensure_initialized_unlocked(config_path)?;
     let source = profile_path(config_path, from);
     if !source.exists() {
         return Err(format!("配置档「{from}」不存在"));
     }
-    create(config_path, to, Some(&source))
+    let target = profile_path(config_path, to);
+    if target.exists() {
+        return Err(format!("配置档「{to}」已存在"));
+    }
+    let text = fs::read_to_string(&source).map_err(|e| format!("读取源配置失败: {e}"))?;
+    validated_text(&text)?;
+    writer::write_atomic_unlocked(&target, &text)
 }
 
 pub fn rename(config_path: &Path, old: &str, new: &str) -> Result<(), String> {
     validate_name(old)?;
     validate_name(new)?;
-    ensure_initialized(config_path)?;
+    if old.eq_ignore_ascii_case(DEFAULT_PROFILE) {
+        return Err("不能重命名 default 配置档".to_string());
+    }
+    if old == new {
+        return Ok(());
+    }
+    if new.eq_ignore_ascii_case(DEFAULT_PROFILE) {
+        return Err("配置档「default」已存在".to_string());
+    }
+    let _guard = writer::lock_writes();
+    ensure_initialized_unlocked(config_path)?;
     let source = profile_path(config_path, old);
     let target = profile_path(config_path, new);
     if !source.exists() {
         return Err(format!("配置档「{old}」不存在"));
     }
-    if target.exists() {
+    let case_only = target.exists() && same_path(&source, &target);
+    if target.exists() && !case_only {
         return Err(format!("配置档「{new}」已存在"));
     }
-    fs::rename(&source, &target).map_err(|e| format!("重命名失败: {e}"))?;
-    if read_active(config_path).as_deref() == Some(old) {
-        if let Err(e) = write_active(config_path, new) {
+    if case_only {
+        // 大小写不敏感文件系统（NTFS / 默认 APFS / FAT）经临时名两步改名，确保目录项大小写刷新
+        let tmp =
+            profiles_dir(config_path).join(format!(".rename-{}-{}.tmp", std::process::id(), old));
+        fs::rename(&source, &tmp).map_err(|e| format!("重命名失败: {e}"))?;
+        if let Err(e) = fs::rename(&tmp, &target) {
+            let _ = fs::rename(&tmp, &source);
+            return Err(format!("重命名失败: {e}"));
+        }
+    } else {
+        fs::rename(&source, &target).map_err(|e| format!("重命名失败: {e}"))?;
+    }
+    let was_active = read_active(config_path)
+        .as_deref()
+        .is_some_and(|active| active == old || (case_only && active.eq_ignore_ascii_case(old)));
+    if was_active {
+        if let Err(e) = write_active_unlocked(config_path, new) {
             // 回滚重命名，避免 active 指向不存在的配置档
             let _ = fs::rename(&target, &source);
             return Err(e);
@@ -306,10 +356,11 @@ pub fn rename(config_path: &Path, old: &str, new: &str) -> Result<(), String> {
 
 pub fn delete(config_path: &Path, name: &str) -> Result<(), String> {
     validate_name(name)?;
-    ensure_initialized(config_path)?;
-    if name == DEFAULT_PROFILE {
+    if name.eq_ignore_ascii_case(DEFAULT_PROFILE) {
         return Err("不能删除 default 配置档".to_string());
     }
+    let _guard = writer::lock_writes();
+    ensure_initialized_unlocked(config_path)?;
     let active = read_active(config_path);
     if active.as_deref() == Some(name) {
         return Err("不能删除当前激活的配置档，请先切换到其它配置档".to_string());
@@ -339,16 +390,25 @@ pub fn switch(config_path: &Path, name: &str) -> Result<String, String> {
 /// 顺序是刻意的：`write_active` 失败时文件完全没动；
 /// `config.toml` 写入失败时回滚 active。这样两者不会长期不一致。
 pub fn switch_to(config_path: &Path, name: &str) -> Result<String, String> {
-    let text = switch(config_path, name)?;
+    validate_name(name)?;
+    let _guard = writer::lock_writes();
+    ensure_initialized_unlocked(config_path)?;
+    let path = profile_path(config_path, name);
+    if !path.exists() {
+        return Err(format!("配置档「{name}」不存在"));
+    }
+    let text = fs::read_to_string(&path).map_err(|e| format!("读取配置档失败: {e}"))?;
+    validated_text(&text)?;
+
     let previous = read_active(config_path);
     // 先备份：备份失败时 profiles.toml 还没动。
     // 若先写 active 再备份，中途失败会留下「active 指向新档、config 还是旧内容」，
     // 下一次 mirror 就会把旧内容写进新档，把用户刚切的配置毁掉。
     writer::backup(config_path)?;
-    write_active(config_path, name)?;
-    if let Err(e) = writer::write_atomic(config_path, &text) {
+    write_active_unlocked(config_path, name)?;
+    if let Err(e) = writer::write_atomic_unlocked(config_path, &text) {
         if let Some(previous) = previous {
-            if let Err(revert) = write_active(config_path, &previous) {
+            if let Err(revert) = write_active_unlocked(config_path, &previous) {
                 tracing::warn!("回滚 profiles.toml 失败: {revert}");
             }
         }
@@ -357,12 +417,27 @@ pub fn switch_to(config_path: &Path, name: &str) -> Result<String, String> {
     Ok(text)
 }
 
-/// 把当前配置镜像到激活的配置档（保存设置后调用）
-pub fn mirror(config_path: &Path, active: &str, text: &str) -> Result<(), String> {
-    ensure_initialized(config_path)?;
-    validate_name(active)?;
-    let path = profile_path(config_path, active);
-    writer::write_atomic(&path, text)
+/// 在同一把写锁内读取当前激活配置档与 `config.toml` 并完成镜像，避免与重命名并发竞态
+pub fn mirror_active(config_path: &Path) -> Result<(), String> {
+    let (enabled, _) = profiles_enabled(Some(config_path));
+    if !enabled {
+        return Ok(());
+    }
+    mirror_current(config_path)
+}
+
+pub(crate) fn mirror_current(config_path: &Path) -> Result<(), String> {
+    let _guard = writer::lock_writes();
+    ensure_initialized_unlocked(config_path)?;
+    let active = read_active(config_path).unwrap_or_else(|| DEFAULT_PROFILE.to_string());
+    validate_name(&active)?;
+    let text = match fs::read_to_string(config_path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(format!("读取当前配置失败: {e}")),
+    };
+    let path = profile_path(config_path, &active);
+    writer::write_atomic_unlocked(&path, &text)
 }
 
 #[cfg(test)]
@@ -475,5 +550,45 @@ mod tests {
         assert!(!enabled);
         assert!(reason.is_some());
         assert!(!profiles_enabled(None).0);
+    }
+
+    #[test]
+    fn rename_rejects_default_and_allows_case_only_rename() {
+        let config = setup("rename-edge");
+        fs::write(&config, AppConfig::default().to_toml_string().unwrap()).unwrap();
+        ensure_initialized(&config).unwrap();
+
+        assert!(
+            rename(&config, "default", "other").is_err(),
+            "default 配置档不应允许重命名"
+        );
+
+        create(&config, "vr", None).unwrap();
+        switch_to(&config, "vr").unwrap();
+        rename(&config, "vr", "VR").unwrap();
+        assert_eq!(read_active(&config).as_deref(), Some("VR"));
+        assert!(profile_path(&config, "VR").exists());
+
+        // 修改 config.toml 后调用 mirror_current，应镜像到重命名后的 VR.toml
+        let mut updated = AppConfig::default();
+        updated.subtitle.font_size = 42;
+        let updated_text = updated.to_toml_string().unwrap();
+        fs::write(&config, &updated_text).unwrap();
+        mirror_current(&config).unwrap();
+        assert_eq!(
+            fs::read_to_string(profile_path(&config, "VR")).unwrap(),
+            updated_text
+        );
+
+        let entries: Vec<String> = fs::read_dir(profiles_dir(&config))
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        assert!(
+            entries.iter().any(|n| n == "VR.toml"),
+            "目录项大小写应更新为 VR.toml，实际: {entries:?}"
+        );
+        let _ = fs::remove_dir_all(config.parent().unwrap());
     }
 }

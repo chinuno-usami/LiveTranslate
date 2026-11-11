@@ -12,57 +12,61 @@
 
 ```
 livetranslate/
-├── Cargo.toml                      # Rust 项目配置
+├── Cargo.toml                      # Rust 项目配置与 feature 定义（silero-vad / steamvr / osc / extras）
 ├── Cargo.lock                      # 依赖版本锁定
-├── README.md                       # 英文 README
 ├── README.md                       # 用户指南
-├── PLAN.md                         # 完整的技术方案文档
+├── PLAN.md                         # 技术方案文档
 │
 ├── config/
-│   └── default.toml               # 配置文件示例
+│   ├── default.toml               # 开发默认配置
+│   └── config.example.toml        # 随包示例配置
+│
+├── tauri-ui/                      # 静态前端（无前端打包链）
+│   ├── index.html / styles.css / app.js          # 桌面透明字幕浮窗
+│   └── settings.html / settings.css / settings.js # 独立设置窗口
 │
 ├── src/
-│   ├── main.rs                    # 程序入口 / Tauri 命令 / 共享状态
-│   ├── app.rs                     # 单源流水线 run_source / 事件
+│   ├── main.rs                    # 程序入口 / Tauri 命令 / SharedState / SourceRegistry
+│   ├── app.rs                     # 单源流水线 run_source / 控制台与设备枚举辅助
+│   ├── tray.rs                    # 系统托盘菜单与全局快捷键
 │   ├── config/                    # 配置管理（结构体 / 写入 / schema / 配置档）
 │   │   ├── mod.rs
 │   │   ├── writer.rs              # toml_edit 定点写入 + 先校验后落盘 + 写入串行化
 │   │   ├── schema.rs              # 设置页字段描述
 │   │   └── profiles.rs            # 多配置档
 │   ├── output/                    # 统一输出层
-│   │   ├── mod.rs                 # OutputManager
+│   │   ├── mod.rs                 # OutputManager + 状态通知
 │   │   ├── osc.rs                 # VRChat Chatbox（组包/限流/typing）
 │   │   └── steamvr/               # Overlay 线程 + cosmic-text 渲染 + stub
 │   ├── error.rs                   # 错误类型定义
 │   │
-│   ├── audio/                     # 音频采集模块
+│   ├── audio/                     # 音频采集与分段模块
 │   │   ├── mod.rs
-│   │   ├── capture.rs             # 音频采集（cpal）
-│   │   ├── chunker.rs             # 音频分片和去重
+│   │   ├── capture.rs             # 音频采集（cpal / WASAPI Loopback）
+│   │   ├── resample.rs            # 单声道下混与线性重采样
+│   │   ├── vad.rs                 # 自适应噪声底能量 VAD
+│   │   ├── silero.rs              # Silero VAD v6.2（ONNX Runtime 动态加载）
+│   │   ├── detector.rs            # VAD 后端抽象与自动降级
+│   │   ├── chunker.rs             # 固定时长分片回退路径
 │   │   └── wav.rs                 # WAV 编码
 │   │
 │   ├── asr/                       # 语音识别模块
-│   │   └── mod.rs                 # Whisper 客户端
+│   │   ├── mod.rs                 # OpenAI/Whisper 兼容客户端与幻听过滤
+│   │   ├── edge.rs                # Edge 在线语音识别客户端
+│   │   └── languages.rs           # 识别语言候选与后端归一化
 │   │
 │   ├── translate/                 # 翻译模块
-│   │   └── mod.rs                 # OpenAI 兼容客户端
+│   │   └── mod.rs                 # OpenAI 兼容客户端与思考块剥离
 │   │
 │   ├── subtitle/                  # 字幕管理
-│   │   └── mod.rs                 # 字幕状态管理
+│   │   └── mod.rs                 # 多源字幕历史、重叠合并与来源标签格式化
 │   │
-│   └── ui/                        # UI 模块（未来实现）
-│       ├── mod.rs
-│       └── overlay.rs             # 透明浮窗（计划中）
+│   └── ui/                        # 前后端事件名与 IPC 载荷结构定义
+│       └── mod.rs
 │
-├── docs/
-│   └── ARCHITECTURE.md            # 详细的架构文档
-│
-├── run.sh                         # Linux/macOS 启动脚本
-├── run.bat                        # Windows 启动脚本
-│
-└── target/
-    └── release/
-        └── livetranslate           # 编译后的二进制文件
+└── docs/
+    ├── ARCHITECTURE.md            # 架构说明
+    └── BUILD_FLAVORS.md           # 标准版 / Full 版构建说明
 ```
 
 ## 🏗️ 模块设计
@@ -178,25 +182,28 @@ pub struct SubtitleState {
 - `get_text()` - 获取当前显示文本
 - `clear()` - 清空历史
 
-### 7. config.rs - 配置管理
+### 7. config/ - 配置管理与多配置档
 
-**职责**：加载、验证和保存配置
+**职责**：加载、校验、保留注释定点写回及多配置档切换
 
 **结构体**：
 ```rust
 pub struct AppConfig {
-    pub audio: AudioConfig,        // 音频设置
-    pub asr: AsrConfig,           // ASR 设置
-    pub translate: TranslateConfig, // 翻译设置
-    pub subtitle: SubtitleConfig,  // 字幕设置
+    pub audio: AudioConfig,         // 音频与多输入源设置
+    pub vad: VadConfig,             // Energy / Silero VAD 分段设置
+    pub asr: AsrConfig,             // OpenAI 兼容 / Edge 识别设置
+    pub translate: TranslateConfig, // 翻译与思考控制设置
+    pub subtitle: SubtitleConfig,   // 桌面浮窗与字幕排版设置
+    pub output: OutputConfig,       // SteamVR / OSC 外部输出设置
 }
 ```
 
 **配置加载顺序**：
-1. 优先使用命令行指定的路径
-2. 否则查找项目目录的 `config/default.toml`
-3. 否则查找执行目录的 `config/default.toml`
-4. 默认返回程序内置默认值
+1. 命令行 `--config <path>` 显式指定的路径（失败即直接报错退出）
+2. 可执行文件同级的 `config/default.toml`（便携模式）
+3. 当前工作目录的 `./config/default.toml`（源码开发模式）
+4. 系统用户配置目录的 `config.toml`（不存在则自动生成默认配置；损坏则隔离备份并恢复）
+5. 程序内置默认值（`AppConfig::default()`）
 
 ### 8. app.rs - 应用核心
 
@@ -372,24 +379,20 @@ tracing        - 日志系统
 windows        - Win32 API（可选）
 ```
 
-## 🔮 未来改进方向
+## 🔮 已完成里程碑与未来改进方向
 
-### Phase 5: 浮窗实现
-- [ ] egui/egui-winit 集成
-- [ ] 透明窗口和置顶
-- [ ] 拖动和配置保存
+### v0.1 – v0.2 已完成 ✅
+- [x] Tauri 透明无边框桌面字幕浮窗、点击穿透、位置尺寸持久化
+- [x] 独立设置窗口（Schema 驱动表单 + 实时预览 + 原始 TOML + 多配置档）
+- [x] 多输入源并行采集、Silero / Energy 双 VAD 后端、Edge / Whisper 双 ASR 后端
+- [x] SteamVR Overlay 与 VRChat OSC Chatbox 输出通道（按 feature gate 拆包）
+- [x] 系统托盘菜单与全局快捷键
 
-### Phase 6: 高级特性
+### 后续演进方向
 - [ ] 字幕导出（SRT/VTT）
-- [ ] 实时统计和分析
-- [ ] 语言自动检测
-- [ ] 多窗口支持
-- [ ] 键盘快捷键
-
-### Performance
-- [ ] 内存池优化
-- [ ] SIMD 加速（可选）
-- [ ] GPU 推理支持（ONNX Runtime）
+- [ ] 实时统计和延迟分析
+- [ ] 内存池复用与音频重采样进一步优化
+- [ ] GPU 推理支持（ONNX Runtime EP 可配置）
 
 ## 📖 参考文档
 

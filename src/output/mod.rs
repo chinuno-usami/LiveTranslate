@@ -34,15 +34,27 @@ pub struct OutputManager {
     osc: osc::OscSink,
     /// 采集是否在运行；停止后 OSC typing 会关闭
     capture_active: AtomicBool,
+    /// 后台输出线程状态变化通知（无锁唤醒前端事件推送）
+    status_notify: Arc<tokio::sync::Notify>,
 }
 
 impl OutputManager {
     pub fn new(config: &OutputConfig) -> Arc<Self> {
+        let status_notify = Arc::new(tokio::sync::Notify::new());
         Arc::new(Self {
-            steamvr: steamvr::SteamVrSink::new(&config.steamvr),
-            osc: osc::OscSink::new(&config.osc),
+            steamvr: steamvr::SteamVrSink::new(&config.steamvr, status_notify.clone()),
+            osc: osc::OscSink::new(&config.osc, status_notify.clone()),
             capture_active: AtomicBool::new(false),
+            status_notify,
         })
+    }
+
+    pub async fn status_notified(&self) {
+        self.status_notify.notified().await;
+    }
+
+    pub fn notify_status(&self) {
+        self.status_notify.notify_one();
     }
 
     /// 发布一份完整字幕快照（按时间从旧到新）
@@ -59,6 +71,7 @@ impl OutputManager {
     pub fn apply_config(&self, config: &OutputConfig) {
         self.steamvr.apply_config(&config.steamvr);
         self.osc.apply_config(&config.osc);
+        self.status_notify.notify_one();
     }
 
     pub fn set_capture_active(&self, active: bool) {
