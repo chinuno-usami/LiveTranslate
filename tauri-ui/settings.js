@@ -36,6 +36,7 @@ const state = {
   profiles: null,
   rawPath: null,
   rawText: '',
+  originalRawText: '',
   rawDirty: false,
   devices: [],
   languages: [],
@@ -263,6 +264,7 @@ async function loadAll() {
     state.rawPath = raw.path;
     if (!state.rawDirty) {
       state.rawText = raw.text || '';
+      state.originalRawText = raw.text || '';
     }
     // 输入源表：本地有未保存的改动时以本地为准，否则会被这份快照覆盖
     const keepLocalSources = state.dirty.has('audio.sources');
@@ -334,13 +336,19 @@ async function refreshSchemaOnly(preferredProfile) {
   els.configPath.textContent = raw.path || '（内置默认配置，首次保存时创建）';
   if (schema?.warning) {
     showError(schema.warning);
+  } else {
+    showError('');
   }
   state.sources = deepClone(sources.sources || []);
   state.originalSourcesJson = JSON.stringify(state.sources);
   state.devices = devices.devices || [];
   state.languages = languages.options || [];
+  if (!state.rawDirty) {
+    state.originalRawText = raw.text || '';
+  }
   state.invalidInputs.clear();
   state.rawInputs.clear();
+  pruneDirty();
   renderContent();
 }
 
@@ -706,7 +714,9 @@ function renderControl(field, value) {
           Array.isArray(rawValues) && index < rawValues.length ? rawValues[index] : item;
         const invalidClass =
           state.invalidInputs.has(field.path) && displayItem === '' ? ' invalid' : '';
-        return `<input type="number" class="array-input${invalidClass}" data-path="${path}" data-array-index="${index}" step="0.01" value="${escapeHtml(
+        return `<input type="number" class="array-input${invalidClass}" data-path="${path}" data-array-index="${index}" step="0.01" ${
+          field.min != null ? `min="${field.min}"` : ''
+        } ${field.max != null ? `max="${field.max}"` : ''} value="${escapeHtml(
           displayItem,
         )}" />`;
       })
@@ -732,14 +742,23 @@ function renderControl(field, value) {
       // 默认遮蔽：密钥不该在不经意间被旁人/录屏看到
       return `<input type="password" data-path="${path}" value="${escapeHtml(value)}" spellcheck="false" autocomplete="off" />
         <button class="btn small" data-secret-toggle="${path}">显示</button>`;
-    case 'enum':
-      return `<select data-path="${path}">${(field.options || [])
+    case 'enum': {
+      const options = field.options || [];
+      const matched = options.some((option) => String(option.value) === String(value));
+      const invalidOption =
+        !matched && value != null && String(value) !== ''
+          ? `<option value="${escapeHtml(value)}" selected>${escapeHtml(value)}（无效）</option>`
+          : '';
+      return `<select data-path="${path}" class="${matched ? '' : 'invalid'}">${invalidOption}${(options
         .map(
           (option) =>
-            `<option value="${escapeHtml(option.value)}"${String(option.value) === String(value) ? ' selected' : ''}>` +
+            `<option value="${escapeHtml(option.value)}"${
+              matched && String(option.value) === String(value) ? ' selected' : ''
+            }>` +
             `${escapeHtml(option.label)}</option>`,
         )
-        .join('')}</select>`;
+        .join(''))}</select>`;
+    }
     case 'multiline':
       return `<textarea data-path="${path}" rows="3">${escapeHtml(value)}</textarea>`;
     case 'toml':
@@ -775,8 +794,32 @@ function renderControl(field, value) {
 function cssColor(value) {
   const text = String(value || '').trim();
   if (/^#[0-9a-fA-F]{3,8}$/.test(text)) return text;
-  if (/^rgba?\([\d.,%\s/]+\)$/.test(text)) return text.replace(/[\s;]/g, '');
+  // 允许 CSS Color 4 空格分隔写法，只去掉分号以防注入多声明
+  if (/^rgba?\([\d.,%\s/]+\)$/.test(text)) return text.replace(/;/g, '');
   return 'transparent';
+}
+
+function valuesEqual(a, b) {
+  return JSON.stringify(a) === JSON.stringify(b);
+}
+
+function baselineForPath(path) {
+  if (path === 'audio.sources') {
+    try {
+      return JSON.parse(state.originalSourcesJson);
+    } catch (_error) {
+      return [];
+    }
+  }
+  return findField(path)?.value;
+}
+
+function setFieldDirty(path, value) {
+  if (valuesEqual(value, baselineForPath(path))) {
+    state.dirty.delete(path);
+  } else {
+    state.dirty.set(path, value);
+  }
 }
 
 function renderDeviceOptions(current) {
@@ -1003,7 +1046,7 @@ function renderSourcesBlock(disabled) {
 }
 
 function markSourcesDirty() {
-  state.dirty.set('audio.sources', deepClone(state.sources));
+  setFieldDirty('audio.sources', deepClone(state.sources));
   updateDirtyIndicator();
   validateSources();
 }
@@ -1113,7 +1156,7 @@ function bindRawGroup() {
   if (editor) {
     editor.addEventListener('input', () => {
       state.rawText = editor.value;
-      state.rawDirty = true;
+      state.rawDirty = editor.value !== state.originalRawText;
       updateDirtyIndicator();
     });
   }
@@ -1191,7 +1234,7 @@ function bindFieldEvents() {
           path === 'output.osc.separator' ? unescapeControlChars(element.value) : element.value;
       }
 
-      state.dirty.set(path, value);
+      setFieldDirty(path, value);
       updateDirtyIndicator();
 
       if (element.type === 'text' && path && isColorPath(path)) {
@@ -1222,7 +1265,7 @@ function bindFieldEvents() {
       if (text) {
         text.value = nextColor;
       }
-      state.dirty.set(path, nextColor);
+      setFieldDirty(path, nextColor);
       updateColorPreview(path, nextColor);
       updateDirtyIndicator();
       schedulePreview(path);
@@ -1371,6 +1414,26 @@ async function save() {
       await saveRawConfig();
       return;
     }
+    // 降级保护态下磁盘已是合法恢复配置，但仍需一次空保存来 clear_config_degraded
+    if (state.schema?.warning) {
+      clearPreviewTimer();
+      els.save.disabled = true;
+      try {
+        const result = await invoke('save_settings', { changes: [] });
+        clearLocalEdits();
+        setStatus(result.message || '已确认恢复配置并退出保护态', 'ok');
+        showError('');
+        await refreshSchemaOnly();
+        updateDirtyIndicator();
+      } catch (error) {
+        console.error(error);
+        showError(`保存失败: ${error}`);
+        setStatus('保存失败', 'err');
+      } finally {
+        els.save.disabled = false;
+      }
+      return;
+    }
     setStatus('没有需要保存的修改');
     return;
   }
@@ -1452,14 +1515,16 @@ async function reload() {
     }
   }
   clearPreviewTimer();
-  clearLocalEdits();
   await invoke('cancel_preview').catch(() => {});
   try {
     const result = await invoke('reload_config');
+    // 仅在后端重载成功后再清脏标记，失败时保留表单与「保存（N 项）」状态
+    clearLocalEdits();
     await loadAll();
     setStatus(result.message || '已重新加载', 'ok');
   } catch (error) {
     showError(`重新加载失败: ${error}`);
+    updateDirtyIndicator();
   }
 }
 
@@ -1542,7 +1607,10 @@ window.addEventListener('DOMContentLoaded', async () => {
           state.hasLoaded = true;
           await loadAll();
         } else if (!wasVisible) {
-          if (targetGroup) state.currentGroup = targetGroup;
+          if (targetGroup) {
+            state.currentGroup = targetGroup;
+            els.search.value = '';
+          }
           await reloadOnShow();
         } else if (targetGroup && targetGroup !== state.currentGroup) {
           switchToGroup(targetGroup);
@@ -1561,12 +1629,14 @@ window.addEventListener('DOMContentLoaded', async () => {
       if (!state.hasLoaded || state.dirty.has('audio.sources')) return;
       try {
         const sources = await invoke('get_sources_config');
+        // await 期间用户可能已开始编辑输入源，需二次检查避免覆盖未保存改动
+        if (state.dirty.has('audio.sources')) return;
         const fresh = deepClone(sources.sources || []);
         const nextJson = JSON.stringify(fresh);
         if (nextJson !== state.originalSourcesJson) {
           state.sources = fresh;
           state.originalSourcesJson = nextJson;
-          if (state.currentGroup === 'sources') {
+          if (state.currentGroup === 'sources' && !els.search.value) {
             renderContent();
           }
         }

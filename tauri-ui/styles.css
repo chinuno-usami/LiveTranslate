@@ -36,6 +36,8 @@ body {
 
 .toolbar {
   box-sizing: border-box;
+  position: relative;
+  z-index: 6;
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -158,8 +160,10 @@ body {
   flex: 1;
   min-height: 0;
   display: flex;
-  align-items: center;
+  flex-direction: column;
+  /* 内容不足时垂直居中；溢出时靠 flex-end 保住底部最新字幕 */
   justify-content: center;
+  align-items: stretch;
   border-radius: 18px;
   background: var(--panel-bg);
   border: 1px solid var(--panel-border);
@@ -196,9 +200,13 @@ body {
 
 .subtitle-lines {
   width: 100%;
+  max-height: 100%;
   display: none;
   flex-direction: column;
+  justify-content: flex-end;
   gap: 10px;
+  overflow: hidden;
+  margin-block: auto;
 }
 
 .subtitle-line {
@@ -492,6 +500,8 @@ kbd {
 
 .subtitle-line-sub {
   opacity: 0.82;
+  font-size: calc(var(--font-size) * 0.82);
+  font-weight: 500;
 }
 
 .source-chip {
@@ -513,6 +523,7 @@ kbd {
 .sources-popover {
   box-sizing: border-box;
   position: absolute;
+  /* top 由 JS 按工具栏实际高度写入，避免换行后盖住第二行控件 */
   top: 56px;
   left: 12px;
   z-index: 40;

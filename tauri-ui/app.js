@@ -132,8 +132,12 @@ function renderLines(entries) {
     .map((entry) => {
       const label = entry.label ? String(entry.label) : '';
       const prefix = label ? `[${label}] ` : '';
-      const lines = (entry.lines || []).map((line) => {
-        const text = prefix && line.startsWith(prefix) ? line.slice(prefix.length) : line;
+      const lines = (entry.lines || []).map((line, lineIndex) => {
+        // 后端只在首行加 [label] 前缀；后续行若原文恰好以同前缀开头不能误删
+        const text =
+          lineIndex === 0 && prefix && line.startsWith(prefix)
+            ? line.slice(prefix.length)
+            : line;
         return formatSubtitleHtml(text);
       });
       const chip = label
@@ -209,6 +213,18 @@ function isHelpOpen() {
   return els.helpModal && !els.helpModal.classList.contains('hidden');
 }
 
+function isSourcesOpen() {
+  return els.sourcesPopover && !els.sourcesPopover.classList.contains('hidden');
+}
+
+function positionSourcesPopover() {
+  if (!els.sourcesPopover || !els.toolbar) {
+    return;
+  }
+  const top = Math.round(els.toolbar.getBoundingClientRect().bottom + 4);
+  els.sourcesPopover.style.top = `${Math.max(40, top)}px`;
+}
+
 function closePopovers() {
   if (els.sourcesPopover) {
     els.sourcesPopover.classList.add('hidden');
@@ -240,6 +256,10 @@ function bindToolbarAutoHide() {
     pointerInside = false;
     if (clickThrough || isHelpOpen()) {
       return;
+    }
+    // 工具栏收起时同步关掉输入源弹层，避免弹层悬空盖住字幕
+    if (isSourcesOpen()) {
+      closePopovers();
     }
     setToolbarVisible(false);
   };
@@ -575,6 +595,7 @@ function renderSources(payload, devices) {
         await invoke('set_source_enabled', { id, enabled: event.target.checked });
       } catch (error) {
         console.error('切换启用失败', error);
+        event.target.checked = !event.target.checked;
         showActionError(`切换启用失败: ${error}`);
       }
       refreshSources();
@@ -666,6 +687,7 @@ async function bindActions() {
     const hidden = els.sourcesPopover.classList.toggle('hidden');
     els.sourcesBtn.setAttribute('aria-expanded', hidden ? 'false' : 'true');
     if (!hidden) {
+      positionSourcesPopover();
       await refreshSources();
     }
   });
