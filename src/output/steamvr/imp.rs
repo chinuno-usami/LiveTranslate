@@ -118,6 +118,8 @@ impl SteamVrSink {
             if !config.enabled {
                 status.connected = false;
                 status.message = "未启用".to_string();
+            } else if !status.connected && status.message == "未启用" {
+                status.message = "正在连接 SteamVR".to_string();
             }
         }
         if config.enabled {
@@ -285,6 +287,7 @@ fn session(
     let mut target_opacity = 0.0f32;
     let mut last_animate = Instant::now();
     let mut had_upload_error = false;
+    let mut last_upload_retry: Option<Instant> = None;
 
     loop {
         if stop.load(Ordering::SeqCst) {
@@ -302,9 +305,19 @@ fn session(
         let config = lock(&shared.config).clone();
         let revision = shared.revision.load(Ordering::SeqCst);
 
-        if revision != last_revision {
-            last_revision = revision;
-            apply_transform(&mut overlay, handle, &config).map_err(SessionError::Message)?;
+        let retry_due = revision != last_revision
+            && last_upload_retry
+                .map(|t| t.elapsed() >= Duration::from_millis(500))
+                .unwrap_or(true);
+        if retry_due {
+            if let Err(e) = apply_transform(&mut overlay, handle, &config) {
+                if is_fatal_overlay_error(e) {
+                    return Err(SessionError::Message(format!(
+                        "设置 Overlay 坐标失败: {e:?}"
+                    )));
+                }
+                tracing::warn!("设置 Overlay 坐标失败: {e:?}");
+            }
             if let Err(e) = overlay.set_width(handle, config.width_m.clamp(0.3, 5.0)) {
                 if is_fatal_overlay_error(e) {
                     return Err(SessionError::Message(format!("Overlay 会话失效: {e:?}")));
@@ -319,6 +332,8 @@ fn session(
             let lines = lock(&shared.lines).clone();
 
             if lines.is_empty() {
+                last_revision = revision;
+                last_upload_retry = None;
                 // 淡出后隐藏（由下面的动画循环在 opacity 接近 0 时隐藏）
                 target_opacity = 0.0;
             } else {
@@ -334,6 +349,8 @@ fn session(
                     4,
                 ) {
                     Ok(()) => {
+                        last_revision = revision;
+                        last_upload_retry = None;
                         if had_upload_error {
                             had_upload_error = false;
                             set_status(shared, true, "已连接 SteamVR");
@@ -352,7 +369,8 @@ fn session(
                         return Err(SessionError::Message(format!("上传纹理失败: {e:?}")));
                     }
                     Err(e) => {
-                        // 单帧上传失败（尺寸超限 / SteamVR 瞬时忙）跳过本帧、保留上一帧纹理
+                        // 单帧上传失败（SteamVR 瞬时忙）保留未提交的 revision，500ms 后自动重试
+                        last_upload_retry = Some(Instant::now());
                         tracing::warn!(
                             "上传纹理失败（{}x{}）: {e:?}",
                             rendered.width,
@@ -410,17 +428,13 @@ fn apply_transform(
     overlay: &mut openvr::Overlay,
     handle: OverlayHandle,
     config: &SteamVrConfig,
-) -> Result<(), String> {
+) -> Result<(), VROverlayError> {
     if config.anchor == "world" {
         let matrix = world_matrix(config);
-        overlay
-            .set_transform_absolute(handle, TrackingUniverseOrigin::Standing, &matrix)
-            .map_err(|e| format!("设置世界坐标失败: {e:?}"))
+        overlay.set_transform_absolute(handle, TrackingUniverseOrigin::Standing, &matrix)
     } else {
         let matrix = hmd_matrix(config);
-        overlay
-            .set_transform_tracked_device_relative(handle, tracked_device_index::HMD, &matrix)
-            .map_err(|e| format!("设置头部相对坐标失败: {e:?}"))
+        overlay.set_transform_tracked_device_relative(handle, tracked_device_index::HMD, &matrix)
     }
 }
 

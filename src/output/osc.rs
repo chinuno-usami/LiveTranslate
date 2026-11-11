@@ -243,6 +243,8 @@ mod imp {
         config: Mutex<OscConfig>,
         /// 最新一份完整字幕快照（覆盖旧值，不做队列）
         pending: Mutex<Option<Vec<DisplayLine>>>,
+        /// 最近一次非空字幕末尾条目签名，避免空快照或样式预览重推误触发 typing
+        last_tail: Mutex<Option<(String, String, String)>>,
         status: Mutex<OscStatus>,
         stop: AtomicBool,
         /// 最近一次字幕活动时间（epoch ms），用于 typing 指示
@@ -285,6 +287,7 @@ mod imp {
             let shared = Arc::new(Shared {
                 config: Mutex::new(config.clone()),
                 pending: Mutex::new(None),
+                last_tail: Mutex::new(None),
                 status: Mutex::new(OscStatus {
                     enabled: config.enabled,
                     available: true,
@@ -328,6 +331,7 @@ mod imp {
                 *current = config.clone();
             }
             if previous.target != config.target
+                || previous.custom_address != config.custom_address
                 || previous.content != config.content
                 || previous.separator != config.separator
                 || previous.mode != config.mode
@@ -354,18 +358,32 @@ mod imp {
 
         /// 传入完整字幕快照；内部覆盖旧快照，限流期间只保留最新结果
         pub fn publish(&self, snapshot: &[DisplayLine]) {
-            let mut pending = self
-                .shared
-                .pending
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            *pending = Some(snapshot.to_vec());
-            if !snapshot.is_empty() {
-                // 新一轮非空字幕到达后取消残留清屏标记，防止快速停启时新字幕被空串覆盖
-                self.shared.pending_clear.store(false, Ordering::SeqCst);
+            let tail = snapshot
+                .last()
+                .map(|l| (l.source_id.clone(), l.source.clone(), l.translated.clone()));
+            let is_new_activity = {
+                let mut pending = self
+                    .shared
+                    .pending
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                *pending = Some(snapshot.to_vec());
+                if !snapshot.is_empty() {
+                    // 新一轮非空字幕到达后取消残留清屏标记，防止快速停启时新字幕被空串覆盖
+                    self.shared.pending_clear.store(false, Ordering::SeqCst);
+                }
+                let mut last_tail = self
+                    .shared
+                    .last_tail
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                let changed = tail.is_some() && *last_tail != tail;
+                *last_tail = tail;
+                changed
+            };
+            if is_new_activity {
+                self.shared.activity_ms.store(now_ms(), Ordering::SeqCst);
             }
-            drop(pending);
-            self.shared.activity_ms.store(now_ms(), Ordering::SeqCst);
         }
 
         pub fn set_active(&self, active: bool) {
@@ -378,6 +396,11 @@ mod imp {
                     .lock()
                     .unwrap_or_else(|e| e.into_inner());
                 *pending = Some(Vec::new());
+                *self
+                    .shared
+                    .last_tail
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()) = None;
                 // 空快照组包后是 None（什么都不发），Chatbox 会把最后一句留在画面里，
                 // 所以额外标记一次「发空串」。与 pending 放在同一把锁内保证顺序一致。
                 self.shared.pending_clear.store(true, Ordering::SeqCst);
@@ -394,9 +417,19 @@ mod imp {
 
         pub fn shutdown(&self) {
             self.shared.stop.store(true, Ordering::SeqCst);
-            if let Ok(mut handle) = self.handle.lock() {
-                if let Some(handle) = handle.take() {
-                    let _ = handle.join();
+            if let Ok(mut guard) = self.handle.lock() {
+                if let Some(handle) = guard.take() {
+                    // 若后台线程正阻塞在慢速 DNS 解析中，限时等待后分离，避免卡死应用退出
+                    let (done_tx, done_rx) = std::sync::mpsc::channel();
+                    let _ = std::thread::Builder::new()
+                        .name("osc-join".to_string())
+                        .spawn(move || {
+                            let _ = handle.join();
+                            let _ = done_tx.send(());
+                        });
+                    if done_rx.recv_timeout(Duration::from_millis(1500)).is_err() {
+                        tracing::warn!("OSC 线程未能在 1.5s 内退出，已分离后台清理");
+                    }
                 }
             }
         }
@@ -450,19 +483,39 @@ mod imp {
             .ok_or_else(|| format!("解析 {trimmed} 得不到地址"))
     }
 
-    /// 取缓存的目标地址；配置里的字符串变了才重解析
-    fn cached_target(
-        cache: &mut Option<(String, SocketAddr)>,
-        configured: &str,
-    ) -> Result<SocketAddr, String> {
-        if let Some((source, addr)) = cache.as_ref() {
+    type TargetCache = Option<(String, Result<SocketAddr, (String, Instant)>)>;
+
+    /// 取缓存的目标地址；成功结果常驻缓存，解析失败负缓存 5 秒避免高频阻塞 DNS
+    fn cached_target(cache: &mut TargetCache, configured: &str) -> Result<SocketAddr, String> {
+        if let Some((source, cached)) = cache.as_ref() {
             if source == configured {
-                return Ok(*addr);
+                match cached {
+                    Ok(addr) => return Ok(*addr),
+                    Err((err, failed_at)) if failed_at.elapsed() < Duration::from_secs(5) => {
+                        return Err(err.clone());
+                    }
+                    Err(_) => {}
+                }
             }
         }
-        let addr = resolve_target(configured)?;
-        *cache = Some((configured.to_string(), addr));
-        Ok(addr)
+        match resolve_target(configured) {
+            Ok(addr) => {
+                *cache = Some((configured.to_string(), Ok(addr)));
+                Ok(addr)
+            }
+            Err(err) => {
+                *cache = Some((configured.to_string(), Err((err.clone(), Instant::now()))));
+                Err(err)
+            }
+        }
+    }
+
+    fn cached_or_literal_addr(cache: &TargetCache, configured: &str) -> Option<SocketAddr> {
+        cache
+            .as_ref()
+            .and_then(|(src, res)| (src == configured).then(|| res.as_ref().ok().copied()))
+            .flatten()
+            .or_else(|| configured.trim().parse::<SocketAddr>().ok())
     }
 
     fn run(shared: Arc<Shared>) {
@@ -484,19 +537,20 @@ mod imp {
         let mut last_typing_sent: Option<Instant> = None;
         // 解析好的目标地址：只在「配置里的字符串变了」时重解析，避免每包 DNS。
         // 只判断 `is_none()` 会让 output.osc.target 的改动永远不生效。
-        let mut target: Option<(String, SocketAddr)> = None;
-        let mut custom_target: Option<(String, SocketAddr)> = None;
+        let mut target: TargetCache = None;
+        let mut custom_target: TargetCache = None;
 
         loop {
             if shared.stop.load(Ordering::SeqCst) {
                 let config = shared.config();
-                let addr = target.map(|(_, addr)| addr).or_else(|| {
-                    if config.enabled {
-                        resolve_target(&config.target).ok()
-                    } else {
-                        None
-                    }
-                });
+                // 停机路径不再发起可能阻塞的 DNS 查询，仅使用已缓存地址或纯字面量 IP
+                let addr = if config.enabled {
+                    cached_or_literal_addr(&target, &config.target)
+                } else {
+                    target
+                        .as_ref()
+                        .and_then(|(_, res)| res.as_ref().ok().copied())
+                };
                 if let Some(addr) = addr {
                     if typing {
                         let _ = send_typing(&sockets, addr, false);
@@ -529,11 +583,7 @@ mod imp {
                     pending_text = None;
                 }
                 if typing || flush_clear {
-                    let addr = target
-                        .as_ref()
-                        .map(|(_, addr)| *addr)
-                        .or_else(|| resolve_target(&config.target).ok());
-                    if let Some(addr) = addr {
+                    if let Some(addr) = cached_or_literal_addr(&target, &config.target) {
                         if typing {
                             let _ = send_typing(&sockets, addr, false);
                         }
@@ -587,7 +637,12 @@ mod imp {
                     Some(text) if Some(&text) != last_sent_text.as_ref() => {
                         pending_text = Some(text);
                     }
-                    _ => pending_text = None,
+                    _ => {
+                        // 限流退避期间若已有待发清屏空串，后续空快照重推不得将其覆盖掉
+                        if pending_text.as_deref() != Some("") {
+                            pending_text = None;
+                        }
+                    }
                 }
             }
 
@@ -965,6 +1020,56 @@ mod tests {
                 assert_eq!(
                     msg.args.first(),
                     Some(&rosc::OscType::String("你好".to_string()))
+                );
+            }
+            other => panic!("意外的 OSC 包: {other:?}"),
+        }
+        sink.shutdown();
+    }
+
+    #[cfg(feature = "osc")]
+    #[test]
+    fn osc_sink_preserves_pending_clear_across_empty_publish_while_rate_limited() {
+        use std::net::UdpSocket;
+        use std::sync::Arc;
+
+        let Ok(receiver) = UdpSocket::bind("127.0.0.1:0") else {
+            return;
+        };
+        receiver
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let addr = receiver.local_addr().unwrap();
+
+        let cfg = OscConfig {
+            enabled: true,
+            target: addr.to_string(),
+            send_typing: false,
+            min_interval_ms: 450,
+            ..OscConfig::default()
+        };
+        let sink = OscSink::new(&cfg, Arc::new(tokio::sync::Notify::new()));
+        sink.publish(&[line(None, "hi", "第一句")]);
+
+        let mut buf = [0u8; 512];
+        let (len, _) = receiver.recv_from(&mut buf).expect("应收到第一句");
+        let (_, packet) = rosc::decoder::decode_udp(&buf[..len]).unwrap();
+        assert!(matches!(packet, rosc::OscPacket::Message(_)));
+
+        // 在 450ms 限流退避窗口内停止采集（触发清屏），随后又收到空快照重推（如样式刷新）
+        sink.set_active(false);
+        std::thread::sleep(Duration::from_millis(150));
+        sink.publish(&[]);
+
+        // 退避结束后，空清屏包仍必须送达，不能被 publish(&[]) 抹掉
+        let (len, _) = receiver.recv_from(&mut buf).expect("应收到清屏空包");
+        let (_, packet) = rosc::decoder::decode_udp(&buf[..len]).unwrap();
+        match packet {
+            rosc::OscPacket::Message(msg) => {
+                assert_eq!(msg.addr, "/chatbox/input");
+                assert_eq!(
+                    msg.args.first(),
+                    Some(&rosc::OscType::String(String::new()))
                 );
             }
             other => panic!("意外的 OSC 包: {other:?}"),
