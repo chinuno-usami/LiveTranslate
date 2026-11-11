@@ -3,7 +3,9 @@
 
 use crate::config::SteamVrConfig;
 use crate::subtitle::DisplayLine;
-use cosmic_text::{Attrs, Buffer, Color, Family, FontSystem, Metrics, Shaping, SwashCache, Weight};
+use cosmic_text::{
+    Attrs, Buffer, Color, Family, FontSystem, Metrics, Shaping, SwashCache, SwashContent, Weight,
+};
 
 pub const CANVAS_WIDTH: usize = 1024;
 /// OpenVR `SetOverlayRaw` 通过共享内存 IPC 传输整幅 RGBA 缓冲区，超过 ~4 MiB 时容易返回
@@ -363,33 +365,94 @@ fn draw_buffer(
         for glyph in run.glyphs {
             let physical_glyph = glyph.physical((0.0, run.line_y), 1.0);
             let glyph_color = glyph.color_opt.unwrap_or(default_color);
-            let span_alpha = glyph_color.as_rgba()[3] as f32 / 255.0;
+            let base_rgba = glyph_color.as_rgba();
+            let span_alpha = base_rgba[3] as f32 / 255.0;
             if span_alpha <= 0.0 {
                 continue;
             }
-            cache.with_pixels(
-                font_system,
-                physical_glyph.cache_key,
-                glyph_color,
-                |gx, gy, pixel_color| {
-                    // cosmic-text 的 with_pixels 用字形覆盖度替换了 base.a()，
-                    // 这里把 span 自身的透明度（颜色 alpha × line_alphas）乘回来。
-                    let mut rgba = pixel_color.as_rgba();
-                    rgba[3] = (rgba[3] as f32 * span_alpha).round() as u8;
-                    blend_rect(
-                        canvas,
-                        width,
-                        height,
-                        x + physical_glyph.x + gx,
-                        y + physical_glyph.y + gy,
-                        1,
-                        1,
-                        rgba,
-                    );
-                },
-            );
+            let Some(image) = cache.get_image(font_system, physical_glyph.cache_key) else {
+                continue;
+            };
+            let gx0 = image.placement.left;
+            let gy0 = -image.placement.top;
+            let gw = image.placement.width as i32;
+            let gh = image.placement.height as i32;
+            match image.content {
+                SwashContent::Mask => {
+                    let mut idx = 0;
+                    for off_y in 0..gh {
+                        for off_x in 0..gw {
+                            let cov = image.data[idx];
+                            idx += 1;
+                            if cov == 0 {
+                                continue;
+                            }
+                            let alpha = (cov as f32 * span_alpha).round() as u8;
+                            blend_rect(
+                                canvas,
+                                width,
+                                height,
+                                x + physical_glyph.x + gx0 + off_x,
+                                y + physical_glyph.y + gy0 + off_y,
+                                1,
+                                1,
+                                [base_rgba[0], base_rgba[1], base_rgba[2], alpha],
+                            );
+                        }
+                    }
+                }
+                SwashContent::Color => {
+                    // Windows COLR 矢量彩色字形（Source::ColorOutline）由 swash::blit 产出预乘 RGBA，
+                    // 而位图彩色字形（SBIX/CBDT）为直通 RGBA；blend_pixel 期望直通 RGBA，需先还原避免暗边。
+                    let premultiplied = format!("{:?}", image.source).starts_with("ColorOutline");
+                    let mut idx = 0;
+                    for off_y in 0..gh {
+                        for off_x in 0..gw {
+                            let mut rgba = [
+                                image.data[idx],
+                                image.data[idx + 1],
+                                image.data[idx + 2],
+                                image.data[idx + 3],
+                            ];
+                            idx += 4;
+                            if rgba[3] == 0 {
+                                continue;
+                            }
+                            if premultiplied && rgba[3] < 255 {
+                                rgba = unpremultiply_rgba(rgba);
+                            }
+                            rgba[3] = (rgba[3] as f32 * span_alpha).round() as u8;
+                            blend_rect(
+                                canvas,
+                                width,
+                                height,
+                                x + physical_glyph.x + gx0 + off_x,
+                                y + physical_glyph.y + gy0 + off_y,
+                                1,
+                                1,
+                                rgba,
+                            );
+                        }
+                    }
+                }
+                SwashContent::SubpixelMask => {}
+            }
         }
     }
+}
+
+fn unpremultiply_rgba(rgba: [u8; 4]) -> [u8; 4] {
+    let a = rgba[3];
+    if a == 0 || a == 255 {
+        return rgba;
+    }
+    let scale = 255.0 / a as f32;
+    [
+        (rgba[0] as f32 * scale).round().clamp(0.0, 255.0) as u8,
+        (rgba[1] as f32 * scale).round().clamp(0.0, 255.0) as u8,
+        (rgba[2] as f32 * scale).round().clamp(0.0, 255.0) as u8,
+        a,
+    ]
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -638,5 +701,15 @@ mod tests {
             (40..=140).contains(&max_alpha),
             "文字透明度未生效，max_alpha={max_alpha}"
         );
+    }
+
+    #[test]
+    fn unpremultiply_restores_straight_rgb_without_darkening_edges() {
+        // 半透明纯白（alpha=128，预乘后 RGB=128）还原后应回到 ~255，再经 blend_pixel 混合不发灰
+        let straight = unpremultiply_rgba([128, 128, 128, 128]);
+        assert_eq!(straight, [255, 255, 255, 128]);
+        let mut dst = [0u8, 0, 0, 0];
+        blend_pixel(&mut dst, straight);
+        assert_eq!(dst, [255, 255, 255, 128]);
     }
 }

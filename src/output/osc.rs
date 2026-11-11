@@ -331,6 +331,8 @@ mod imp {
                 || previous.content != config.content
                 || previous.separator != config.separator
                 || previous.mode != config.mode
+                || previous.max_lines != config.max_lines
+                || previous.max_chars != config.max_chars
                 || previous.enabled != config.enabled
             {
                 self.shared.reset_dedup.store(true, Ordering::SeqCst);
@@ -358,6 +360,10 @@ mod imp {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
             *pending = Some(snapshot.to_vec());
+            if !snapshot.is_empty() {
+                // 新一轮非空字幕到达后取消残留清屏标记，防止快速停启时新字幕被空串覆盖
+                self.shared.pending_clear.store(false, Ordering::SeqCst);
+            }
             drop(pending);
             self.shared.activity_ms.store(now_ms(), Ordering::SeqCst);
         }
@@ -366,11 +372,14 @@ mod imp {
             if !active {
                 self.shared.activity_ms.store(0, Ordering::SeqCst);
                 self.shared.reset_dedup.store(true, Ordering::SeqCst);
-                if let Ok(mut pending) = self.shared.pending.lock() {
-                    *pending = Some(Vec::new());
-                }
+                let mut pending = self
+                    .shared
+                    .pending
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                *pending = Some(Vec::new());
                 // 空快照组包后是 None（什么都不发），Chatbox 会把最后一句留在画面里，
-                // 所以额外标记一次「发空串」。
+                // 所以额外标记一次「发空串」。与 pending 放在同一把锁内保证顺序一致。
                 self.shared.pending_clear.store(true, Ordering::SeqCst);
             }
         }
@@ -393,17 +402,51 @@ mod imp {
         }
     }
 
-    /// 把 `host:port` 解析一次缓存起来，避免每个 UDP 包都做一次 DNS 查询
-    fn resolve_target(target: &str) -> Result<SocketAddr, String> {
+    struct OscSockets {
+        v4: UdpSocket,
+        v6: Option<UdpSocket>,
+    }
+
+    impl OscSockets {
+        fn bind() -> Result<Self, std::io::Error> {
+            let v4 = UdpSocket::bind("0.0.0.0:0")?;
+            let v6 = UdpSocket::bind("[::]:0").ok();
+            Ok(Self { v4, v6 })
+        }
+
+        fn send_to(&self, bytes: &[u8], target: SocketAddr) -> Result<(), String> {
+            let socket = match target {
+                SocketAddr::V4(_) => &self.v4,
+                SocketAddr::V6(_) => self
+                    .v6
+                    .as_ref()
+                    .ok_or_else(|| "当前系统不支持 IPv6 UDP 发送".to_string())?,
+            };
+            socket
+                .send_to(bytes, target)
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+        }
+    }
+
+    /// 把 `host:port` 解析一次缓存起来，避免每个 UDP 包都做一次 DNS 查询。
+    /// 双栈主机名（如 `localhost:9000`）优先选择 IPv4，兼容仅监听 `127.0.0.1` 的客户端（如 VRChat），
+    /// 同时允许显式 IPv6（如 `[::1]:9000`）正常解析。
+    pub(super) fn resolve_target(target: &str) -> Result<SocketAddr, String> {
         use std::net::ToSocketAddrs;
         let trimmed = target.trim();
         if trimmed.is_empty() {
             return Err("目标地址为空".to_string());
         }
-        trimmed
+        let addrs: Vec<SocketAddr> = trimmed
             .to_socket_addrs()
             .map_err(|e| format!("解析 {trimmed} 失败: {e}"))?
-            .next()
+            .collect();
+        addrs
+            .iter()
+            .copied()
+            .find(SocketAddr::is_ipv4)
+            .or_else(|| addrs.into_iter().next())
             .ok_or_else(|| format!("解析 {trimmed} 得不到地址"))
     }
 
@@ -423,8 +466,8 @@ mod imp {
     }
 
     fn run(shared: Arc<Shared>) {
-        let socket = match UdpSocket::bind("0.0.0.0:0") {
-            Ok(socket) => socket,
+        let sockets = match OscSockets::bind() {
+            Ok(sockets) => sockets,
             Err(e) => {
                 shared.set_status_message(format!("无法创建 UDP socket: {e}"));
                 return;
@@ -456,14 +499,14 @@ mod imp {
                 });
                 if let Some(addr) = addr {
                     if typing {
-                        let _ = send_typing(&socket, addr, false);
+                        let _ = send_typing(&sockets, addr, false);
                     }
                     if should_flush_clear(
                         shared.pending_clear.swap(false, Ordering::SeqCst),
                         last_sent_text.as_deref(),
                         pending_text.as_deref(),
                     ) {
-                        let _ = send_chatbox(&socket, addr, "");
+                        let _ = send_chatbox(&sockets, addr, "");
                     }
                 }
                 break;
@@ -492,10 +535,10 @@ mod imp {
                         .or_else(|| resolve_target(&config.target).ok());
                     if let Some(addr) = addr {
                         if typing {
-                            let _ = send_typing(&socket, addr, false);
+                            let _ = send_typing(&sockets, addr, false);
                         }
                         if flush_clear {
-                            let _ = send_chatbox(&socket, addr, "");
+                            let _ = send_chatbox(&sockets, addr, "");
                         }
                     }
                     typing = false;
@@ -514,44 +557,42 @@ mod imp {
 
             let opts = PackOptions::from_config(&config);
 
-            // 锁只覆盖 take()：后面的格式化/组包不持有锁
-            let snapshot = shared
-                .pending
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .take();
+            // 锁内同时取走 pending 与 pending_clear，避免与 stop->restart->publish 乱序
+            let (snapshot, clear_requested) = {
+                let mut guard = shared.pending.lock().unwrap_or_else(|e| e.into_inner());
+                let clear = shared.pending_clear.swap(false, Ordering::SeqCst);
+                (guard.take(), clear)
+            };
             if let Some(snapshot) = snapshot {
-                {
-                    // 重新构建历史（快照已经按浮窗 max_lines 裁剪）
-                    history.clear();
-                    for line in &snapshot {
-                        let entry = format_entry(line, opts.content);
-                        if entry.is_empty() {
-                            continue;
-                        }
-                        history.push_back(entry);
+                // 重新构建历史（快照已经按浮窗 max_lines 裁剪）
+                history.clear();
+                for line in &snapshot {
+                    let entry = format_entry(line, opts.content);
+                    if entry.is_empty() {
+                        continue;
                     }
-                    while history.len() > opts.max_lines {
-                        history.pop_front();
-                    }
-                    if let Some(last) = snapshot.last() {
-                        latest_meta = Some((
-                            last.source_id.clone(),
-                            last.label.clone().unwrap_or_default(),
-                        ));
-                    }
+                    history.push_back(entry);
+                }
+                while history.len() > opts.max_lines {
+                    history.pop_front();
+                }
+                if let Some(last) = snapshot.last() {
+                    latest_meta = Some((
+                        last.source_id.clone(),
+                        last.label.clone().unwrap_or_default(),
+                    ));
+                }
 
-                    match pack(&history, &opts) {
-                        Some(text) if Some(&text) != last_sent_text.as_ref() => {
-                            pending_text = Some(text);
-                        }
-                        _ => pending_text = None,
+                match pack(&history, &opts) {
+                    Some(text) if Some(&text) != last_sent_text.as_ref() => {
+                        pending_text = Some(text);
                     }
+                    _ => pending_text = None,
                 }
             }
 
-            // 停止采集后主动清屏：pack() 对空历史返回 None，只能显式发一个空串
-            if shared.pending_clear.swap(false, Ordering::SeqCst) {
+            // 停止采集后主动清屏：仅在当前无新非空字幕待发时置空串
+            if clear_requested && pending_text.as_deref().is_none_or(str::is_empty) {
                 last_sent_text = None;
                 pending_text = Some(String::new());
             }
@@ -567,12 +608,15 @@ mod imp {
                 if throttle_ok {
                     match cached_target(&mut target, &config.target) {
                         Ok(addr) => {
-                            if send_typing(&socket, addr, want_typing).is_ok() {
+                            if send_typing(&sockets, addr, want_typing).is_ok() {
                                 typing = want_typing;
                                 last_typing_sent = Some(Instant::now());
                             }
                         }
-                        Err(e) => shared.set_status_message(format!("OSC 目标无效: {e}")),
+                        Err(e) => {
+                            last_typing_sent = Some(Instant::now());
+                            shared.set_status_message(format!("OSC 目标无效: {e}"));
+                        }
                     }
                 }
             }
@@ -586,17 +630,8 @@ mod imp {
             let window_ok = has_window_quota(&sent_at, config.max_per_window.max(1));
 
             if let (Some(text), true, true) = (pending_text.clone(), interval_ok, window_ok) {
-                let addr = match cached_target(&mut target, &config.target) {
-                    Ok(addr) => Some(addr),
-                    Err(e) => {
-                        shared.set_status_message(format!("OSC 目标无效: {e}"));
-                        None
-                    }
-                };
-                let send_result = match addr {
-                    Some(addr) => send_chatbox(&socket, addr, &text),
-                    None => Err("目标地址无效".to_string()),
-                };
+                let send_result = cached_target(&mut target, &config.target)
+                    .and_then(|addr| send_chatbox(&sockets, addr, &text));
                 match send_result {
                     Ok(()) => {
                         last_sent_text = Some(text.clone());
@@ -624,7 +659,7 @@ mod imp {
                                 Ok(addr) => {
                                     if let Some((source_id, label)) = &latest_meta {
                                         if let Err(e) =
-                                            send_custom(&socket, addr, &text, source_id, label)
+                                            send_custom(&sockets, addr, &text, source_id, label)
                                         {
                                             shared.set_status_message(format!(
                                                 "自定义地址发送失败: {e}"
@@ -653,7 +688,7 @@ mod imp {
         rosc::encoder::encode(&packet).map_err(|e| format!("OSC 编码失败: {e}"))
     }
 
-    fn send_chatbox(socket: &UdpSocket, target: SocketAddr, text: &str) -> Result<(), String> {
+    fn send_chatbox(sockets: &OscSockets, target: SocketAddr, text: &str) -> Result<(), String> {
         let packet = OscPacket::Message(OscMessage {
             addr: "/chatbox/input".to_string(),
             args: vec![
@@ -663,26 +698,20 @@ mod imp {
             ],
         });
         let bytes = packet_bytes(packet)?;
-        socket
-            .send_to(&bytes, target)
-            .map(|_| ())
-            .map_err(|e| e.to_string())
+        sockets.send_to(&bytes, target)
     }
 
-    fn send_typing(socket: &UdpSocket, target: SocketAddr, typing: bool) -> Result<(), String> {
+    fn send_typing(sockets: &OscSockets, target: SocketAddr, typing: bool) -> Result<(), String> {
         let packet = OscPacket::Message(OscMessage {
             addr: "/chatbox/typing".to_string(),
             args: vec![OscType::Bool(typing)],
         });
         let bytes = packet_bytes(packet)?;
-        socket
-            .send_to(&bytes, target)
-            .map(|_| ())
-            .map_err(|e| e.to_string())
+        sockets.send_to(&bytes, target)
     }
 
     fn send_custom(
-        socket: &UdpSocket,
+        sockets: &OscSockets,
         target: SocketAddr,
         text: &str,
         source_id: &str,
@@ -697,10 +726,7 @@ mod imp {
             ],
         });
         let bytes = packet_bytes(packet)?;
-        socket
-            .send_to(&bytes, target)
-            .map(|_| ())
-            .map_err(|e| e.to_string())
+        sockets.send_to(&bytes, target)
     }
 }
 
@@ -887,5 +913,62 @@ mod tests {
         assert!(should_flush_clear(false, Some("hello"), None));
         // pending_clear 已被消费、last_sent_text 已被置空，但空消息仍在等待限流窗口
         assert!(should_flush_clear(false, None, Some("")));
+    }
+
+    #[cfg(feature = "osc")]
+    #[test]
+    fn resolve_target_prefers_ipv4_for_localhost_and_accepts_ipv6_literal() {
+        let localhost = imp::resolve_target("localhost:9000").unwrap();
+        assert!(
+            localhost.is_ipv4(),
+            "localhost 应优先解析为 IPv4 以兼容 VRChat: {localhost}"
+        );
+        let v6 = imp::resolve_target("[::1]:9000").unwrap();
+        assert!(v6.is_ipv6());
+    }
+
+    #[cfg(feature = "osc")]
+    #[test]
+    fn osc_sink_sends_ipv6_and_cancels_stale_clear_on_new_publish() {
+        use std::net::UdpSocket;
+        use std::sync::Arc;
+
+        let Ok(receiver) = UdpSocket::bind("[::1]:0") else {
+            return;
+        };
+        receiver
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let addr = receiver.local_addr().unwrap();
+
+        let cfg = OscConfig {
+            enabled: true,
+            target: addr.to_string(),
+            send_typing: false,
+            min_interval_ms: 200,
+            ..OscConfig::default()
+        };
+        let sink = OscSink::new(&cfg, Arc::new(tokio::sync::Notify::new()));
+        // 模拟快速 stop -> publish 新字幕：残留的 pending_clear 不应覆盖刚发布的字幕
+        sink.set_active(false);
+        sink.set_active(true);
+        sink.publish(&[line(None, "hi", "你好")]);
+
+        let mut buf = [0u8; 512];
+        let (len, _) = receiver
+            .recv_from(&mut buf)
+            .expect("应收到 IPv6 OSC 数据包");
+        let (_, packet) = rosc::decoder::decode_udp(&buf[..len]).unwrap();
+        match packet {
+            rosc::OscPacket::Message(msg) => {
+                assert_eq!(msg.addr, "/chatbox/input");
+                assert_eq!(
+                    msg.args.first(),
+                    Some(&rosc::OscType::String("你好".to_string()))
+                );
+            }
+            other => panic!("意外的 OSC 包: {other:?}"),
+        }
+        sink.shutdown();
     }
 }

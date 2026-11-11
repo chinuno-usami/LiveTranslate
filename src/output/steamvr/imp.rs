@@ -284,6 +284,7 @@ fn session(
     let mut current_opacity = 0.0f32;
     let mut target_opacity = 0.0f32;
     let mut last_animate = Instant::now();
+    let mut had_upload_error = false;
 
     loop {
         if stop.load(Ordering::SeqCst) {
@@ -333,6 +334,10 @@ fn session(
                     4,
                 ) {
                     Ok(()) => {
+                        if had_upload_error {
+                            had_upload_error = false;
+                            set_status(shared, true, "已连接 SteamVR");
+                        }
                         if let Err(e) = overlay.set_visibility(handle, true) {
                             if is_fatal_overlay_error(e) {
                                 return Err(SessionError::Message(format!(
@@ -353,6 +358,7 @@ fn session(
                             rendered.width,
                             rendered.height
                         );
+                        had_upload_error = true;
                         set_status(shared, true, format!("上传纹理失败: {e:?}"));
                     }
                 }
