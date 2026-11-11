@@ -313,6 +313,9 @@ mod imp {
             {
                 self.shared.reset_dedup.store(true, Ordering::SeqCst);
             }
+            if previous.enabled && !config.enabled {
+                self.shared.pending_clear.store(true, Ordering::SeqCst);
+            }
             let mut status = self.shared.status.lock().unwrap_or_else(|e| e.into_inner());
             status.enabled = config.enabled;
             if !config.enabled {
@@ -322,9 +325,13 @@ mod imp {
 
         /// 传入完整字幕快照；内部覆盖旧快照，限流期间只保留最新结果
         pub fn publish(&self, snapshot: &[DisplayLine]) {
-            if let Ok(mut pending) = self.shared.pending.try_lock() {
-                *pending = Some(snapshot.to_vec());
-            }
+            let mut pending = self
+                .shared
+                .pending
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            *pending = Some(snapshot.to_vec());
+            drop(pending);
             self.shared.activity_ms.store(now_ms(), Ordering::SeqCst);
         }
 
@@ -412,9 +419,23 @@ mod imp {
 
         loop {
             if shared.stop.load(Ordering::SeqCst) {
-                if typing {
-                    if let Some((_, addr)) = target {
+                let config = shared.config();
+                let addr = target.map(|(_, addr)| addr).or_else(|| {
+                    if config.enabled {
+                        resolve_target(&config.target).ok()
+                    } else {
+                        None
+                    }
+                });
+                if let Some(addr) = addr {
+                    if typing {
                         let _ = send_typing(&socket, addr, false);
+                    }
+                    let had_visible = last_sent_text
+                        .as_deref()
+                        .is_some_and(|text| !text.is_empty());
+                    if shared.pending_clear.swap(false, Ordering::SeqCst) || had_visible {
+                        let _ = send_chatbox(&socket, addr, "");
                     }
                 }
                 break;
@@ -422,21 +443,39 @@ mod imp {
 
             let config = shared.config();
 
-            if shared.reset_dedup.swap(false, Ordering::SeqCst) {
-                last_sent_text = None;
-                pending_text = None;
-                history.clear();
-            }
-
             if !config.enabled {
-                if typing {
-                    if let Some((_, addr)) = target {
-                        let _ = send_typing(&socket, addr, false);
+                let need_clear = shared.pending_clear.swap(false, Ordering::SeqCst);
+                let had_visible = last_sent_text
+                    .as_deref()
+                    .is_some_and(|text| !text.is_empty());
+                if shared.reset_dedup.swap(false, Ordering::SeqCst) {
+                    last_sent_text = None;
+                    pending_text = None;
+                    history.clear();
+                }
+                if typing || need_clear || had_visible {
+                    let addr = target
+                        .as_ref()
+                        .map(|(_, addr)| *addr)
+                        .or_else(|| resolve_target(&config.target).ok());
+                    if let Some(addr) = addr {
+                        if typing {
+                            let _ = send_typing(&socket, addr, false);
+                        }
+                        if need_clear || had_visible {
+                            let _ = send_chatbox(&socket, addr, "");
+                        }
                     }
                     typing = false;
                 }
                 std::thread::sleep(Duration::from_millis(100));
                 continue;
+            }
+
+            if shared.reset_dedup.swap(false, Ordering::SeqCst) {
+                last_sent_text = None;
+                pending_text = None;
+                history.clear();
             }
 
             let opts = PackOptions::from_config(&config);

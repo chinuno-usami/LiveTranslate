@@ -62,9 +62,6 @@ struct Block {
     translated: Option<Buffer>,
     source_height: f32,
     translated_height: f32,
-    /// 逐行不透明度（line_alphas）。cosmic-text 的 mask 像素会把 alpha
-    /// 换成字形覆盖度，所以只能在混合时乘，不能靠 attrs 传下去。
-    alpha: f32,
 }
 
 /// 画布装不下时，需要从最旧的多少行开始丢弃（至少保留一行）
@@ -215,7 +212,6 @@ impl Renderer {
                 translated: Some(buffer),
                 source_height,
                 translated_height,
-                alpha,
             });
         }
 
@@ -266,7 +262,6 @@ impl Renderer {
                     height,
                     x,
                     y as i32,
-                    block.alpha,
                 );
                 y += block.source_height.max(0.0) + SOURCE_ROW_GAP;
             }
@@ -280,7 +275,6 @@ impl Renderer {
                     height,
                     PADDING as i32,
                     y as i32,
-                    block.alpha,
                 );
                 y += block.translated_height;
             }
@@ -362,21 +356,40 @@ fn draw_buffer(
     height: usize,
     x: i32,
     y: i32,
-    alpha: f32,
 ) {
-    let alpha = alpha.clamp(0.0, 1.0);
-    buffer.draw(
-        font_system,
-        cache,
-        Color::rgba(255, 255, 255, 255),
-        |gx, gy, gw, gh, color| {
-            // 这里的 alpha 是字形覆盖度；attrs 里的逐行透明度在上面被
-            // cosmic-text 丢掉了，只能在这里乘回来。
-            let mut rgba = color.as_rgba();
-            rgba[3] = (rgba[3] as f32 * alpha).round() as u8;
-            blend_rect(canvas, width, height, x + gx, y + gy, gw, gh, rgba);
-        },
-    );
+    buffer.shape_until_scroll(font_system, false);
+    let default_color = Color::rgba(255, 255, 255, 255);
+    for run in buffer.layout_runs() {
+        for glyph in run.glyphs {
+            let physical_glyph = glyph.physical((0.0, run.line_y), 1.0);
+            let glyph_color = glyph.color_opt.unwrap_or(default_color);
+            let span_alpha = glyph_color.as_rgba()[3] as f32 / 255.0;
+            if span_alpha <= 0.0 {
+                continue;
+            }
+            cache.with_pixels(
+                font_system,
+                physical_glyph.cache_key,
+                glyph_color,
+                |gx, gy, pixel_color| {
+                    // cosmic-text 的 with_pixels 用字形覆盖度替换了 base.a()，
+                    // 这里把 span 自身的透明度（颜色 alpha × line_alphas）乘回来。
+                    let mut rgba = pixel_color.as_rgba();
+                    rgba[3] = (rgba[3] as f32 * span_alpha).round() as u8;
+                    blend_rect(
+                        canvas,
+                        width,
+                        height,
+                        x + physical_glyph.x + gx,
+                        y + physical_glyph.y + gy,
+                        1,
+                        1,
+                        rgba,
+                    );
+                },
+            );
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -608,5 +621,22 @@ mod tests {
         let swapped_pixel = swapped.rgba.chunks_exact(4).find(|p| p[3] == 255).unwrap();
         assert_eq!(normal_pixel[0], 255);
         assert_eq!(swapped_pixel[2], 255);
+    }
+
+    #[test]
+    fn text_color_alpha_is_respected() {
+        let config = SteamVrConfig {
+            background: "#00000000".to_string(),
+            text_color: "#FFFFFF80".to_string(),
+            show_source: false,
+            ..SteamVrConfig::default()
+        };
+        let frame = render(&[line(None, "", "半透明测试")], &config);
+        // 去除 1px 描边（alpha <= 20），字形峰值 alpha 应受 #FFFFFF80 约束（约 128）
+        let max_alpha = frame.rgba.chunks_exact(4).map(|p| p[3]).max().unwrap_or(0);
+        assert!(
+            (40..=140).contains(&max_alpha),
+            "文字透明度未生效，max_alpha={max_alpha}"
+        );
     }
 }

@@ -136,7 +136,7 @@ pub async fn list_devices() -> AppResult<()> {
 /// 控制台模式：同时跑所有启用中的源
 pub async fn start_console(config: AppConfig) -> AppResult<()> {
     let (tx, mut rx) = mpsc::channel(128);
-    let (_stop_tx, stop_rx) = watch::channel(false);
+    let (stop_tx, stop_rx) = watch::channel(false);
 
     let configured_language = if languages::is_edge_backend(&config.asr.backend) {
         config.asr.edge.language.clone()
@@ -202,38 +202,69 @@ pub async fn start_console(config: AppConfig) -> AppResult<()> {
     drop(tx);
 
     tracing::info!("Console pipeline running. Press Ctrl+C to stop.");
-    while let Some(event) = rx.recv().await {
-        match event {
-            PipelineEvent::Subtitle(line) if line.translated.is_empty() => {
-                subtitle_state.push(line.clone());
-                outputs.publish(&subtitle_state.display_lines());
-                tracing::info!("[{}] {}", line.label, line.source)
+    loop {
+        tokio::select! {
+            maybe_event = rx.recv() => {
+                match maybe_event {
+                    Some(event) => handle_console_event(&mut subtitle_state, &outputs, event),
+                    None => break,
+                }
             }
-            PipelineEvent::Subtitle(line) => {
-                subtitle_state.push(line.clone());
-                outputs.publish(&subtitle_state.display_lines());
-                tracing::info!("[{}] {} => {}", line.label, line.source, line.translated)
-            }
-            PipelineEvent::Notice { source_id, message } => {
-                tracing::warn!("Notice ({}): {}", source_id.unwrap_or_default(), message)
-            }
-            PipelineEvent::SourceState {
-                source_id,
-                running,
-                message,
-            } => {
-                tracing::info!(
-                    "Source {} {}: {}",
-                    source_id,
-                    if running { "started" } else { "stopped" },
-                    message
-                )
+            res = tokio::signal::ctrl_c() => {
+                if let Err(e) = res {
+                    tracing::warn!("Failed to listen for Ctrl+C: {e}");
+                } else {
+                    tracing::info!("Received Ctrl+C, stopping console pipeline...");
+                }
+                let _ = stop_tx.send(true);
+                let drain = async {
+                    while let Some(event) = rx.recv().await {
+                        handle_console_event(&mut subtitle_state, &outputs, event);
+                    }
+                };
+                let _ = tokio::time::timeout(std::time::Duration::from_secs(3), drain).await;
+                break;
             }
         }
     }
 
+    outputs.set_capture_active(false);
     outputs.shutdown();
     Ok(())
+}
+
+fn handle_console_event(
+    subtitle_state: &mut SubtitleState,
+    outputs: &OutputManager,
+    event: PipelineEvent,
+) {
+    match event {
+        PipelineEvent::Subtitle(line) if line.translated.is_empty() => {
+            subtitle_state.push(line.clone());
+            outputs.publish(&subtitle_state.display_lines());
+            tracing::info!("[{}] {}", line.label, line.source);
+        }
+        PipelineEvent::Subtitle(line) => {
+            subtitle_state.push(line.clone());
+            outputs.publish(&subtitle_state.display_lines());
+            tracing::info!("[{}] {} => {}", line.label, line.source, line.translated);
+        }
+        PipelineEvent::Notice { source_id, message } => {
+            tracing::warn!("Notice ({}): {}", source_id.unwrap_or_default(), message);
+        }
+        PipelineEvent::SourceState {
+            source_id,
+            running,
+            message,
+        } => {
+            tracing::info!(
+                "Source {} {}: {}",
+                source_id,
+                if running { "started" } else { "stopped" },
+                message
+            );
+        }
+    }
 }
 
 /// 去重地发送 Notice，避免同一个错误每几秒刷屏

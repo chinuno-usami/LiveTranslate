@@ -58,22 +58,23 @@ mod imp;
 mod imp;
 
 pub struct SteamVrSink {
+    lifecycle: Mutex<()>,
     inner: Mutex<imp::SteamVrSink>,
 }
 
 impl SteamVrSink {
     pub fn new(config: &SteamVrConfig) -> Self {
         Self {
+            lifecycle: Mutex::new(()),
             inner: Mutex::new(imp::SteamVrSink::new(config)),
         }
     }
 
     pub fn apply_config(&self, config: &SteamVrConfig) {
-        // 先取走线程句柄再释放外层锁，否则 join 期间 publish/shutdown 都会阻塞
+        let _lifecycle = self.lifecycle.lock().unwrap_or_else(|e| e.into_inner());
+        // 先取走线程句柄再释放 inner 锁，否则 join 期间 publish/status 都会阻塞
         let handle = {
-            let Ok(mut inner) = self.inner.lock() else {
-                return;
-            };
+            let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
             inner.apply_config(config)
         };
         if let Some(handle) = handle {
@@ -83,23 +84,21 @@ impl SteamVrSink {
 
     /// 传入完整字幕快照；内部只保留最新一帧
     pub fn publish(&self, lines: &[DisplayLine]) {
-        if let Ok(inner) = self.inner.lock() {
-            inner.publish(lines);
-        }
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        inner.publish(lines);
     }
 
     pub fn status(&self) -> SteamVrStatus {
         self.inner
             .lock()
-            .map(|inner| inner.status())
-            .unwrap_or_default()
+            .unwrap_or_else(|e| e.into_inner())
+            .status()
     }
 
     pub fn shutdown(&self) {
+        let _lifecycle = self.lifecycle.lock().unwrap_or_else(|e| e.into_inner());
         let handle = {
-            let Ok(mut inner) = self.inner.lock() else {
-                return;
-            };
+            let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
             inner.shutdown()
         };
         if let Some(handle) = handle {

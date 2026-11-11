@@ -119,7 +119,20 @@ impl SubtitleState {
         match self.label_mode {
             LabelMode::Always => true,
             LabelMode::Never => false,
-            LabelMode::Auto => self.active_labels.len() >= 2,
+            LabelMode::Auto => {
+                if self.active_labels.len() >= 2 {
+                    return true;
+                }
+                let mut first_source: Option<&str> = None;
+                for item in &self.history {
+                    match first_source {
+                        None => first_source = Some(item.source_id.as_str()),
+                        Some(first) if first != item.source_id => return true,
+                        _ => {}
+                    }
+                }
+                false
+            }
         }
     }
 
@@ -201,6 +214,12 @@ mod tests {
 
         state.set_active_labels(vec!["麦克风".into(), "游戏".into()]);
         assert_eq!(state.display_lines()[0].lines[0], "[麦克风] 你好");
+
+        // 其中一路刚停止时，只要屏幕历史里仍混合多源字幕，就继续保留来源标识
+        state.push(line("game", "游戏", "hi", "嗨"));
+        state.set_active_labels(vec!["麦克风".into()]);
+        assert_eq!(state.display_lines()[0].lines[0], "[麦克风] 你好");
+        assert_eq!(state.display_lines()[1].lines[0], "[游戏] 嗨");
     }
 
     #[test]
