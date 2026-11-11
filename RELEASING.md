@@ -94,13 +94,14 @@ open dist/LiveTranslate.app
 | 平台 | 产物 |
 |------|------|
 | Linux x86_64 | `livetranslate-x86_64-unknown-linux-gnu.tar.gz` |
-| Windows x86_64 | `livetranslate-x86_64-pc-windows-msvc.zip` |
+| Windows x86_64（标准版） | `livetranslate-x86_64-pc-windows-msvc.zip` |
+| Windows x86_64（Full 版） | `livetranslate-x86_64-pc-windows-msvc-full.zip` |
 | macOS (Universal) | `LiveTranslate-universal-apple-darwin.zip`（内含 `LiveTranslate.app`） |
 
 内容：
 
-- **Linux / Windows**：可执行文件 + ONNX Runtime 动态库 + `config/default.toml` + 文档
-- **macOS**：`LiveTranslate.app` bundle（应用图标 + `Info.plist` + 二进制 + `Contents/Frameworks/` 下的 ONNX Runtime）
+- **Linux / Windows**：可执行文件 + ONNX Runtime 动态库 + `config/config.example.toml` + 文档（含 `BUILD_FLAVORS.md`）
+- **macOS**：`LiveTranslate.app` bundle（应用图标 + `Info.plist` + 二进制 + `Contents/Frameworks/` 下的 ONNX Runtime + `Contents/Resources/BUILD_FLAVORS.md`）
 
 ### 关于随包附带的 ONNX Runtime
 
@@ -129,14 +130,14 @@ open dist/LiveTranslate.app
 tar -xzf livetranslate-x86_64-unknown-linux-gnu.tar.gz
 cd livetranslate-x86_64-unknown-linux-gnu
 
-# 编辑配置（填入翻译 API Key 等）
-vim config/default.toml
-
-# 运行
+# 直接运行（默认使用用户配置目录，可在图形设置页填写 API Key 并管理多配置档）
 ./livetranslate --log-level info
+
+# 若需单目录便携模式（不使用用户配置目录与多配置档），将样例重命名为 default.toml：
+# cp config/config.example.toml config/default.toml
 ```
 
-> Windows 解压后双击 `livetranslate.exe`。
+> Windows 解压后双击 `livetranslate.exe`，通过浮窗 **⚙ 设置** 或托盘 **设置…** 完成配置。
 
 ### macOS
 
@@ -169,12 +170,11 @@ open /Applications/LiveTranslate.app
 
 ## CI（持续集成）
 
-`.github/workflows/ci.yml` 会在 push / PR 时对三平台执行：
+`.github/workflows/ci.yml` 会在 push / PR 时执行（全部为阻塞门禁）：
 
-- `cargo check`
-- `cargo test`
-- `cargo clippy`（不阻塞）
-- `cargo fmt --check`（不阻塞）
+- `cargo fmt --all -- --check`
+- `cargo clippy --all-targets -- -D warnings`（Windows 额外检查 `--features custom-protocol,extras`）
+- 三平台 `cargo check` 与 `cargo test`（Windows 含标准版与 Full 版 `extras`）
 
 用于在打 tag 前尽早发现跨平台编译问题。
 

@@ -164,7 +164,7 @@ background = "rgba(8, 10, 14, 0.28)"
 toolbar_background = "rgba(10, 12, 18, 0.42)"
 # 是否显示源文本
 show_source = false
-# 窗口尺寸和位置（手动拖拽边缘缩放后会自动写回）
+# 窗口尺寸和位置（手动拖动窗口或拖拽边缘缩放后会自动写回）
 window_width = 1200
 window_height = 220
 position_x = 200
@@ -245,7 +245,7 @@ send_typing = true
 
 > 按住浮窗任意空白处可拖动窗口。
 > 字号与原文开关的修改会**就地写入配置文件并保留原有注释**；
-> 窗口位置目前仅本次运行有效，重启后仍以配置中的 `position_x/position_y` 为准。
+> 拖动浮窗或拖拽边缘缩放后，窗口位置（`position_x/position_y`）与尺寸也会自动防抖写回配置。
 
 ### 多输入源
 
@@ -557,11 +557,11 @@ DEBUG livetranslate::app: VAD 噪声底 ≈ -52.3 dBFS (speech 阈值 ≈ -44.3 
 
 | 优先级 | 位置 | 适用场景 |
 |--------|------|----------|
-| 1 | `--config <路径>` | 显式指定（找不到会直接报错） |
-| 2 | `<可执行文件目录>/config/default.toml` | Windows 便携包（解压即用） |
+| 1 | `--config <路径>` | 显式指定（找不到或格式错误会直接报错） |
+| 2 | `<可执行文件目录>/config/default.toml` | 便携模式（将随包 `config/config.example.toml` 重命名为 `default.toml` 启用） |
 | 3 | `./config/default.toml` | 源码 / 开发模式下运行 |
-| 4 | 用户配置目录 | 打包后的 `.app` / 安装版 |
-| 5 | 内置默认值 | 都没有时（`api_key` 为占位符） |
+| 4 | 用户配置目录 | Release 压缩包 / `.app` 默认使用（支持多配置档与标准版/Full 版互通） |
+| 5 | 内置默认值 | 都没有时（`api_key` 为占位符，首次保存自动写入用户配置目录） |
 
 **用户配置目录**由 `directories` 推导，首次运行会自动生成一份默认配置：
 

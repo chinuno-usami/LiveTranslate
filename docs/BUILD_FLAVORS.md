@@ -38,14 +38,14 @@ LiveTranslate 从 v0.2 开始提供两种构建风味。两者**版本号一致�
 | SteamVR Overlay 字幕 | — | ✅（仅 Windows） |
 | 原有托盘 / 快捷键 / 点击穿透 | ✅ | ✅ |
 
-标准版的设置页里，SteamVR 与 OSC 分组会置灰并提示「当前构建未包含，请下载 Full 版」；手动在 `config.toml` 里写 `enabled = true` 也不会生效（代码未编译），保存时会被拒绝。
+标准版的设置页里，SteamVR 与 OSC 分组会置灰并提示「当前构建未包含，请下载 Full 版」；手动在 `config.toml` 里把未启用的输出改成 `enabled = true` 也不会生效（代码未编译），保存时会被拒绝；若原本已在 Full 版启用，标准版允许正常修改其它配置并保留该开关。
 
 ## 配置与数据兼容
 
 - 两个包使用**同一份**用户配置（`config.toml`）与**同一套**配置档目录（`profiles/`）。
 - 标准版会**保留但忽略** `[output.steamvr]` / `[output.osc]` 段，不会删除；换回 Full 版后原设置继续生效。
 - 配置档（profiles）、日志、ONNX Runtime 两个包一致。
-- 从标准版换到 Full 版：解压新包即可，无需迁移配置；配置文件位置不变。
+- 从标准版换到 Full 版：解压新包即可，无需迁移配置；发布包内仅附带 `config/config.example.toml` 参考模板，默认读写用户配置目录（若手工重命名为 `config/default.toml` 则切换为单目录便携模式，此时不共用配置且禁用多配置档）。
 
 ## 从源码构建
 

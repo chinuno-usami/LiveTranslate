@@ -118,7 +118,11 @@ jobs:
 
           cp "target/${TARGET}/release/${BIN_NAME}" "$STAGE/"
           chmod +x "$STAGE/${BIN_NAME}"
-          [ -d config ] && cp -r config "$STAGE/"
+          # 附带 config.example.toml 而非 default.toml：避免默认落入便携模式导致多配置档不可用
+          if [ -f config/default.toml ]; then
+            mkdir -p "$STAGE/config"
+            cp config/default.toml "$STAGE/config/config.example.toml"
+          fi
           for f in README.md QUICKSTART.md; do
             [ -f "$f" ] && cp "$f" "$STAGE/"
           done
@@ -156,7 +160,11 @@ jobs:
           $stage = "dist/$name"
           New-Item -ItemType Directory -Force -Path $stage | Out-Null
           Copy-Item "target/$target/release/$env:BIN_NAME.exe" $stage
-          if (Test-Path config) { Copy-Item -Recurse config $stage }
+          # 附带 config.example.toml 而非 default.toml：默认走用户配置目录，保证标准版/Full 版配置互通与多配置档可用
+          if (Test-Path config/default.toml) {
+            New-Item -ItemType Directory -Force -Path "$stage/config" | Out-Null
+            Copy-Item config/default.toml "$stage/config/config.example.toml"
+          }
           foreach ($f in @('README.md','QUICKSTART.md','docs/BUILD_FLAVORS.md')) {
             if (Test-Path $f) { Copy-Item $f $stage }
           }

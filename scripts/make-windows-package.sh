@@ -39,8 +39,11 @@ mkdir -p "$STAGE"
 
 cp "target/${TARGET}/release/${BIN_NAME}.exe" "$STAGE/"
 
-# 附带的配置样例（用户可直接编辑）
-[ -d config ] && cp -r config "$STAGE/"
+# 附带配置样例（默认使用用户配置目录以支持多配置档；重命名为 default.toml 可启用便携模式）
+if [ -f config/default.toml ]; then
+  mkdir -p "$STAGE/config"
+  cp config/default.toml "$STAGE/config/config.example.toml"
+fi
 for f in README.md QUICKSTART.md docs/BUILD_FLAVORS.md; do
   [ -f "$f" ] && cp "$f" "$STAGE/"
 done
@@ -55,6 +58,7 @@ cp "$ORT_TMP/ort/onnxruntime.dll" "$STAGE/"
 echo "    + onnxruntime.dll ($(du -h "$STAGE/onnxruntime.dll" | cut -f1))"
 
 echo "==> 打包"
+rm -f "${OUT_DIR}/${BIN_NAME}-${TARGET}.zip"
 ( cd "$OUT_DIR" && zip -q -r "${BIN_NAME}-${TARGET}.zip" "$(basename "$STAGE")" )
 
 echo

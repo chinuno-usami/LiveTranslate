@@ -101,11 +101,10 @@ cat > "$APP_DIR/Contents/Info.plist" <<PLIST
 </plist>
 PLIST
 
-# ad-hoc 签名（有 codesign 时执行；未签名时 macOS 首次运行需放行）
+# ad-hoc 签名（Apple Silicon / Universal 运行必需；签名失败时立即报错终止）
 if command -v codesign >/dev/null 2>&1; then
-  codesign --force --deep --sign - "$APP_DIR" >/dev/null 2>&1 \
-    && echo "ad-hoc signed: $APP_DIR" \
-    || echo "warning: ad-hoc codesign failed (ignored)"
+  codesign --force --deep --sign - "$APP_DIR"
+  echo "ad-hoc signed: $APP_DIR"
 fi
 
 # 打包为 zip
