@@ -40,6 +40,10 @@ pub enum AppError {
 
     #[error("CPAL play stream error: {0}")]
     CpalPlayStream(String),
+
+    /// 采集流在收到停止信号之前就断了（USB 拔出 / 设备被抢占）
+    #[error("音频输入已中断（设备断开？）")]
+    AudioStreamEnded,
 }
 
 impl From<cpal::Error> for AppError {

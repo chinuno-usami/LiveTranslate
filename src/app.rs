@@ -5,7 +5,7 @@ use crate::audio::resample::LinearResampler;
 use crate::audio::segmenter::SpeechSegmenter;
 use crate::audio::AudioCapture;
 use crate::config::AppConfig;
-use crate::error::AppResult;
+use crate::error::{AppError, AppResult};
 use crate::output::OutputManager;
 use crate::subtitle::{SubtitleLine, SubtitleProcessor, SubtitleState};
 use crate::translate::OpenAiClient;
@@ -343,7 +343,9 @@ async fn process_segment(
 
             tracing::debug!("[{}] Recognized text: {}", label, text);
 
-            // 先按原文去重/去重叠，再翻译：固定分片有 overlap 时若先翻译会得到重复译文碎片
+            // 先按原文去重/去重叠，再翻译：固定分片有 overlap 时若先翻译会得到重复译文碎片。
+            // 注意：这里只比对原文（传空译文），译文重复不再吞字幕——
+            // 不同原文译出同一句（如都是「是的」）是正常现象，不应被当成重复丢掉。
             if processor.is_duplicate(&text, "") {
                 tracing::debug!("Duplicate subtitle detected, skipping");
                 return Ok(true);
@@ -369,22 +371,20 @@ async fn process_segment(
                 String::new()
             };
 
-            {
-                processor.record(&clean_text, &translated);
+            processor.record(&clean_text, &translated);
 
-                if tx
-                    .send(PipelineEvent::Subtitle(SubtitleLine::new(
-                        source_id,
-                        label,
-                        clean_text,
-                        translated,
-                    )))
-                    .await
-                    .is_err()
-                {
-                    tracing::warn!("Subtitle receiver dropped, stopping pipeline");
-                    return Ok(false);
-                }
+            if tx
+                .send(PipelineEvent::Subtitle(SubtitleLine::new(
+                    source_id,
+                    label,
+                    clean_text,
+                    translated,
+                )))
+                .await
+                .is_err()
+            {
+                tracing::warn!("Subtitle receiver dropped, stopping pipeline");
+                return Ok(false);
             }
         }
         Ok(_) => {
@@ -594,6 +594,9 @@ async fn run_source_inner(
 
     let mut pushed_chunks: u64 = 0;
     let mut dropped_segments: u64 = 0;
+    // 非停止信号导致的流中断要带出去：只有当它变成 Err 时，
+    // SourceState 与采集状态才会显示「已停止: 音频输入已中断（设备断开？）」而不是裸的「已停止」
+    let mut stream_ended: Option<AppError> = None;
 
     'capture: loop {
         tokio::select! {
@@ -605,7 +608,13 @@ async fn run_source_inner(
             }
             samples = audio_capture.next_chunk() => {
                 let Some(samples) = samples else {
-                    tracing::warn!("[{}] Audio stream ended", source.label);
+                    // 通道只会在 cpal 回调报错时提前关闭；若是我们自己置位的停止信号
+                    // 与回调竞争到了这一轮，按正常停止处理，不误报成设备断开。
+                    if *stop_rx.borrow() {
+                        tracing::info!("[{}] Audio stream closed during stop", source.label);
+                        break;
+                    }
+                    tracing::warn!("[{}] Audio stream ended unexpectedly", source.label);
                     send_notice(
                         &tx,
                         &mut last_notice,
@@ -613,6 +622,7 @@ async fn run_source_inner(
                         "音频输入已中断（设备断开？），该源已停止".to_string(),
                     )
                     .await;
+                    stream_ended = Some(AppError::AudioStreamEnded);
                     break 'capture;
                 };
 
@@ -707,5 +717,8 @@ async fn run_source_inner(
     }
 
     tracing::info!("[{}] Audio pipeline stopped", source.label);
-    Ok(())
+    match stream_ended {
+        Some(err) => Err(err),
+        None => Ok(()),
+    }
 }

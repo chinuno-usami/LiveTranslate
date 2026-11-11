@@ -134,6 +134,15 @@ struct SourceRegistry {
     runtimes: Vec<SourceRuntime>,
 }
 
+/// 这些状态本身就是「该源为什么没在跑」的解释，停止时不能被覆盖成「已停止」
+///
+/// 生产者只有三处：设备重复「…跳过」（start_capture）、
+/// 「超出并发上限…」（start_capture）、以及启动后异常退出产生的「已停止: {原因}」
+/// （`app::run_source`，含设备断开）。
+fn keeps_stop_reason(message: &str) -> bool {
+    message.contains("跳过") || message.starts_with("超出") || message.starts_with("已停止:")
+}
+
 impl SourceRegistry {
     fn from_config(config: &AppConfig) -> Self {
         let global_language = global_language(config);
@@ -241,16 +250,11 @@ impl SourceRegistry {
             if !runtime.enabled {
                 continue;
             }
-            // 保留跳过/失败等具体原因，避免被统一改成「已停止」后无法排查
-            let keep = runtime.message.contains("跳过")
-                || runtime.message.starts_with("已停止:")
-                || runtime.message.starts_with("超出")
-                || runtime.message.contains("失败")
-                || runtime.message.contains("中断")
-                || runtime.message.contains("错误");
-            if !keep {
-                runtime.message = "已停止".to_string();
+            // 保留「为什么这个源没在跑」的解释，否则被统一改成「已停止」后无法排查
+            if keeps_stop_reason(&runtime.message) {
+                continue;
             }
+            runtime.message = "已停止".to_string();
         }
     }
 
@@ -534,7 +538,11 @@ pub(crate) fn toggle_click_through(app: &AppHandle) {
                 apply_click_through(&app, config.subtitle.click_through);
                 emit_config(&app, &config);
             }
-            Err(e) => tracing::warn!("切换点击穿透失败: {e}"),
+            Err(e) => {
+                tracing::warn!("切换点击穿透失败: {e}");
+                // 快捷键/托盘场景没有返回值，必须显式告知，否则看起来像按键失灵
+                let _ = app.emit_all(ERROR_EVENT, format!("切换点击穿透失败: {e}"));
+            }
         }
     });
 }
@@ -1331,24 +1339,27 @@ async fn set_translate_enabled(
     state: State<'_, Arc<SharedState>>,
     enabled: bool,
 ) -> Result<(), String> {
+    // 与 set_source_translate / mutate_sources 一致：降级态下改运行态会让内存与磁盘分叉
+    reject_if_config_degraded(&state)?;
     // 持有 config_update 直至运行态 watch/registry 同步完成，避免与 save_settings 交错覆盖
-    let _guard = state.config_update.lock().await;
-    let mut config = state.config();
-    config.translate.enabled = enabled;
-    config.validate()?;
-    state.set_config(config.clone());
-    persist_or_report(
-        &app,
-        state.inner(),
-        &[("translate.enabled", enabled.into())],
-    );
-    let _ = state.translate_tx.send(enabled);
     {
-        let mut registry = state.sources.lock().await;
-        registry.set_translate_all(enabled);
+        let _guard = state.config_update.lock().await;
+        let mut config = state.config();
+        config.translate.enabled = enabled;
+        config.validate()?;
+        state.set_config(config.clone());
+        persist_or_report(
+            &app,
+            state.inner(),
+            &[("translate.enabled", enabled.into())],
+        );
+        let _ = state.translate_tx.send(enabled);
+        {
+            let mut registry = state.sources.lock().await;
+            registry.set_translate_all(enabled);
+        }
+        emit_config(&app, &config);
     }
-    emit_config(&app, &config);
-    drop(_guard);
     emit_source_status(&app, &state).await;
     tracing::info!(
         "Mode set to: {}",
@@ -2947,5 +2958,18 @@ mod tests {
     fn minimized_offscreen_coordinates_are_rejected() {
         assert!(!is_valid_window_pos(-32_000, -32_000));
         assert!(is_valid_window_pos(100, 200));
+    }
+
+    #[test]
+    fn stop_reasons_survive_mark_all_stopped() {
+        // 设备断开 / 启动失败等具体原因不能被统一的「已停止」盖掉
+        assert!(keeps_stop_reason("已停止: 音频输入已中断（设备断开？）"));
+        assert!(keeps_stop_reason("已停止: 设备不存在"));
+        assert!(keeps_stop_reason("设备重复，已跳过"));
+        assert!(keeps_stop_reason("超出并发上限（4），未启动"));
+        // 普通运行态应被重写成「已停止」
+        assert!(!keeps_stop_reason("启动中"));
+        assert!(!keeps_stop_reason("已停止"));
+        assert!(!keeps_stop_reason("未启动"));
     }
 }
