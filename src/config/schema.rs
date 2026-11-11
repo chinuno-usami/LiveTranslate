@@ -245,6 +245,7 @@ pub fn build(config: &AppConfig) -> SettingsSchema {
                     "asr.language",
                     "识别语言",
                     "auto 为自动检测；也可在浮窗下拉框切换（立即生效）。",
+                    "whisper",
                 ),
                 int(config, "asr.timeout_secs", "超时（秒）", "", 5.0, 300.0),
                 string(
@@ -276,6 +277,7 @@ pub fn build(config: &AppConfig) -> SettingsSchema {
                     "asr.edge.language",
                     "Edge 语言",
                     "BCP-47，如 en-US / zh-CN（不能用 auto）。",
+                    "edge",
                 ),
                 int(
                     config,
@@ -674,7 +676,7 @@ pub fn build(config: &AppConfig) -> SettingsSchema {
                     config,
                     "output.osc.separator",
                     "行分隔符",
-                    "换行被过滤时可改为 \" | \"。",
+                    "默认 \\n（换行）；换行被过滤时可改为 \" | \"。",
                 ),
                 int(
                     config,
@@ -701,8 +703,8 @@ pub fn build(config: &AppConfig) -> SettingsSchema {
                 string_adv(
                     config,
                     "output.osc.custom_address",
-                    "额外 OSC 地址",
-                    "可选；发送 (text, source_id, label)。",
+                    "额外接收端（host:port）",
+                    "可选；向额外 UDP 目标同步发送 (text, source_id, label)。",
                 ),
                 bool_adv(config, "output.osc.debug_log", "记录组包日志", "调试用。"),
             ],
@@ -724,7 +726,7 @@ pub fn is_restart_required(path: &str) -> bool {
     if path.starts_with("output.") || path.starts_with("subtitle.") {
         return false;
     }
-    if path == "translate.enabled" || path == "asr.language" {
+    if path == "translate.enabled" || path == "asr.language" || path == "asr.edge.language" {
         return false;
     }
     if path.starts_with("audio.") || path.starts_with("vad.") || path.starts_with("translate.") {
@@ -991,9 +993,22 @@ fn device(config: &AppConfig, path: &str, label: &str, help: &str) -> SettingsFi
         ..base(config, path, label, FieldKind::Device)
     }
 }
-fn language(config: &AppConfig, path: &str, label: &str, help: &str) -> SettingsField {
+fn language(
+    config: &AppConfig,
+    path: &str,
+    label: &str,
+    help: &str,
+    backend: &str,
+) -> SettingsField {
     SettingsField {
         help: help.into(),
+        options: crate::asr::languages::options_for_backend(backend)
+            .into_iter()
+            .map(|item| FieldOption {
+                value: item.code,
+                label: item.label,
+            })
+            .collect(),
         ..base(config, path, label, FieldKind::Language)
     }
 }
@@ -1137,5 +1152,27 @@ mod tests {
         ] {
             assert!(ids.contains(&expected), "缺少分组 {expected}");
         }
+    }
+
+    #[test]
+    fn language_fields_carry_backend_specific_options_and_hot_reload() {
+        let schema = build(&AppConfig::default());
+        let asr_group = schema.groups.iter().find(|g| g.id == "asr").unwrap();
+        let whisper_lang = asr_group
+            .fields
+            .iter()
+            .find(|f| f.path == "asr.language")
+            .unwrap();
+        let edge_lang = asr_group
+            .fields
+            .iter()
+            .find(|f| f.path == "asr.edge.language")
+            .unwrap();
+
+        assert!(whisper_lang.options.iter().any(|o| o.value == "auto"));
+        assert!(!edge_lang.options.iter().any(|o| o.value == "auto"));
+        assert!(edge_lang.options.iter().any(|o| o.value == "en-US"));
+        assert!(!whisper_lang.restart_required);
+        assert!(!edge_lang.restart_required);
     }
 }

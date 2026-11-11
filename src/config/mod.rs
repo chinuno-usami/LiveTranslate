@@ -639,6 +639,14 @@ impl AppConfig {
         }
     }
 
+    /// 从指定文件读取并校验配置
+    pub fn load_validated(path: &Path) -> AppResult<Self> {
+        let cfg = Self::from_file(path)?;
+        cfg.validate()
+            .map_err(|e| AppError::Config(format!("校验 {} 失败: {e}", path.display())))?;
+        Ok(cfg)
+    }
+
     /// 按优先级解析配置，返回 `(配置, 来源路径)`
     pub fn resolve(explicit: Option<PathBuf>) -> AppResult<(Self, Option<PathBuf>)> {
         if let Some(path) = explicit {
@@ -648,7 +656,7 @@ impl AppConfig {
                     path.display()
                 )));
             }
-            let cfg = Self::from_file(&path)?;
+            let cfg = Self::load_validated(&path)?;
             tracing::info!("Loaded config from: {}", path.display());
             return Ok((cfg, Some(path)));
         }
@@ -657,7 +665,7 @@ impl AppConfig {
             if let Some(dir) = exe.parent() {
                 let p = dir.join("config").join("default.toml");
                 if p.exists() {
-                    let cfg = Self::from_file(&p)?;
+                    let cfg = Self::load_validated(&p)?;
                     tracing::info!("Loaded config from: {}", p.display());
                     return Ok((cfg, Some(p)));
                 }
@@ -666,14 +674,14 @@ impl AppConfig {
 
         let cwd_path = PathBuf::from("config/default.toml");
         if cwd_path.exists() {
-            let cfg = Self::from_file(&cwd_path)?;
+            let cfg = Self::load_validated(&cwd_path)?;
             tracing::info!("Loaded config from: {}", cwd_path.display());
             return Ok((cfg, Some(cwd_path)));
         }
 
         if let Ok(user_path) = Self::user_config_path() {
             if user_path.exists() {
-                match Self::from_file(&user_path) {
+                match Self::load_validated(&user_path) {
                     Ok(cfg) => {
                         tracing::info!("Loaded config from: {}", user_path.display());
                         return Ok((cfg, Some(user_path)));
@@ -689,7 +697,7 @@ impl AppConfig {
                             );
                         }
                         let cfg = match Self::write_default_if_absent(&user_path) {
-                            Ok(true) => Self::from_file(&user_path).unwrap_or_default(),
+                            Ok(true) => Self::load_validated(&user_path).unwrap_or_default(),
                             _ => AppConfig::default(),
                         };
                         return Ok((cfg, Some(user_path)));
@@ -703,7 +711,7 @@ impl AppConfig {
                         "Created default config at: {} (请填入翻译 API Key)",
                         user_path.display()
                     );
-                    let cfg = Self::from_file(&user_path).unwrap_or_default();
+                    let cfg = Self::load_validated(&user_path).unwrap_or_default();
                     return Ok((cfg, Some(user_path)));
                 }
                 Ok(false) => {}
@@ -960,6 +968,13 @@ impl AppConfig {
                 ));
             }
         }
+        for (index, value) in vr.world_rotation_deg.iter().enumerate() {
+            if !value.is_finite() {
+                errors.push(format!(
+                    "output.steamvr.world_rotation_deg[{index}] 必须是有限值"
+                ));
+            }
+        }
         for (key, color) in [
             ("background", &vr.background),
             ("text_color", &vr.text_color),
@@ -998,6 +1013,9 @@ impl AppConfig {
         }
         if parse_target(&osc.target).is_none() {
             errors.push("output.osc.target 必须是合法的 host:port".to_string());
+        }
+        if !osc.custom_address.trim().is_empty() && parse_target(&osc.custom_address).is_none() {
+            errors.push("output.osc.custom_address 留空或填合法的 host:port".to_string());
         }
 
         if errors.is_empty() {
@@ -1268,5 +1286,19 @@ mod tests {
         );
         assert!(parse_target("127.0.0.1").is_none());
         assert!(parse_target("host:notaport").is_none());
+    }
+
+    #[test]
+    fn validation_rejects_nan_rotation_and_bad_custom_address() {
+        let mut cfg = AppConfig::default();
+        cfg.output.steamvr.world_rotation_deg[1] = f32::NAN;
+        cfg.output.osc.custom_address = "/chatbox/custom".to_string();
+        let err = cfg.validate().unwrap_err();
+        assert!(err.contains("world_rotation_deg[1]"), "{err}");
+        assert!(err.contains("custom_address"), "{err}");
+
+        cfg.output.steamvr.world_rotation_deg[1] = 15.0;
+        cfg.output.osc.custom_address = "127.0.0.1:9001".to_string();
+        cfg.validate().unwrap();
     }
 }

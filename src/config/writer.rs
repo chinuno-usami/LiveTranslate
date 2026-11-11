@@ -157,8 +157,12 @@ pub fn apply_changes(path: &Path, changes: &[(String, JsonValue)]) -> Result<App
                     let parsed: toml::Value = if text.trim().is_empty() {
                         toml::Value::Table(Default::default())
                     } else {
-                        toml::from_str(text)
-                            .map_err(|e| format!("extra_body TOML 解析失败: {e}"))?
+                        toml::from_str(text).map_err(|e| {
+                            format!(
+                                "extra_body TOML 解析失败: {}",
+                                crate::config::toml_error_text(&e)
+                            )
+                        })?
                     };
                     serde_json::to_value(parsed).map_err(|e| format!("extra_body 转换失败: {e}"))?
                 }
@@ -328,6 +332,7 @@ fn set_sources(doc: &mut DocumentMut, sources: &[AudioSourceConfig]) {
         .or_insert_with(|| Item::Table(Table::new()))
         .as_table_mut();
     if let Some(audio) = audio {
+        audio.set_dotted(false);
         // 若之前被写成普通数组，直接替换为 array of tables
         audio.insert("sources", Item::ArrayOfTables(tables));
     } else {
@@ -382,6 +387,7 @@ fn set_path(doc: &mut DocumentMut, dotted: &str, mut item: Item) -> Result<(), S
             }
             (Item::Table(old), Item::Value(Value::InlineTable(new_table))) => {
                 // 已有 `[section]` 表时改为原地更新，保留表头注释与位置
+                old.set_dotted(false);
                 let entries: Vec<(String, Value)> = new_table
                     .iter()
                     .map(|(k, v)| (k.to_string(), v.clone()))
