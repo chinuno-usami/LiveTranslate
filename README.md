@@ -86,7 +86,8 @@ cargo build --release
 # 设备选择（用 --list-devices 查看可用值）
 #   "default" / "microphone" / "loopback" / "mic:0" / "loopback:0" / "0" / 设备名模糊匹配
 # 回环采集仅 Windows 支持，用于捕获系统声音
-# 多源配置请使用 [[audio.sources]]；浮窗「源」面板可直接切换各源设备
+# 注意：只要配置文件里有 [[audio.sources]]，device_name 就会被忽略（保留仅为兼容旧版本）。
+# 选择设备请改 [[audio.sources]].device，或直接用浮窗「源」面板 / 设置页的输入源表格。
 device_name = "default"
 # 音频分片时长（秒）
 chunk_seconds = 2.0

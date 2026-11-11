@@ -38,6 +38,7 @@ enabled = true
 translate = true
 language = ""
 
+# 回环采集仅 Windows 支持；其它平台这一项无法启用
 [[audio.sources]]
 id = "game"
 label = "游戏声音"

@@ -61,6 +61,8 @@ timeout_secs = 20
 
 ```toml
 [audio]
+# 设备选择：只要存在 [[audio.sources]]，device_name 就会被忽略（仅为兼容旧版本）。
+# 请改 [[audio.sources]].device，或用浮窗「源」面板切换。
 device_name = "default"        # "default" / "microphone" / "loopback"
 chunk_seconds = 2.0            # 分片时长
 sample_rate = 16000            # 采样率
@@ -151,8 +153,8 @@ bash run.sh
 # 列出设备
 ./target/release/livetranslate --list-devices
 
-# 编辑 config/default.toml
-device_name = "microphone"  # 或 "loopback"
+# 编辑 config/default.toml 里的 [[audio.sources]].device（不是 device_name）
+device = "microphone"  # 或 "loopback"
 ```
 
 ### 问题 2: "ASR request failed with status 503"
