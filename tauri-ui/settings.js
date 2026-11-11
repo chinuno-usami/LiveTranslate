@@ -92,11 +92,17 @@ async function loadAll() {
     state.profiles = profiles;
     state.rawPath = raw.path;
     state.rawText = raw.text || '';
-    state.sources = deepClone(sources.sources || []);
-    state.originalSourcesJson = JSON.stringify(state.sources);
+    // 输入源表：本地有未保存的改动时以本地为准，否则会被这份快照覆盖
+    const keepLocalSources = state.dirty.has('audio.sources');
+    const freshSources = deepClone(sources.sources || []);
+    if (!keepLocalSources) state.sources = freshSources;
+    state.originalSourcesJson = JSON.stringify(freshSources);
     state.devices = devices.devices || [];
     state.languages = languages.options || [];
-    state.dirty.clear();
+    // 注意：这里**不能** state.dirty.clear()。
+    // 设置窗口在 await 期间仍然可交互，清空会把用户刚输入的内容吞掉；
+    // 丢弃修改只应该在 reloadOnShow 的确认框里显式发生。
+    pruneDirty();
 
     els.configPath.textContent = raw.path || '（内置默认配置，首次保存时创建）';
     renderProfileBar();
@@ -109,6 +115,20 @@ async function loadAll() {
     console.error(error);
     showError(`加载设置失败: ${error}`);
     setStatus('加载失败', 'err');
+  }
+}
+
+/**
+ * 丢掉已经不存在于 schema 的脏数据（配置项改名/删除后残留）。
+ * 保留仍有效的，包括加载期间刚输入的那些。
+ */
+function pruneDirty() {
+  const known = new Set(['audio.sources']);
+  for (const group of state.schema?.groups || []) {
+    for (const field of group.fields || []) known.add(field.path);
+  }
+  for (const path of [...state.dirty.keys()]) {
+    if (!known.has(path)) state.dirty.delete(path);
   }
 }
 
@@ -442,7 +462,7 @@ function renderControl(field, value) {
     case 'color': {
       const text = String(value || '');
       const picker = /^#[0-9a-fA-F]{6}/.test(text) ? text.slice(0, 7) : '#ffffff';
-      return `<span class="value-preview" data-color-preview="${path}" style="background:${escapeHtml(
+      return `<span class="value-preview" data-color-preview="${path}" style="background:${cssColor(
         text,
       )}"></span>
         <input type="text" data-path="${path}" value="${escapeHtml(text)}" placeholder="#RRGGBBAA" />
@@ -455,6 +475,18 @@ function renderControl(field, value) {
     default:
       return `<input type="text" data-path="${path}" value="${escapeHtml(value)}" />`;
   }
+}
+
+/**
+ * 只允许纯色语法进入 inline style。
+ * HTML 转义挡不住 `red; position:fixed; inset:0` 这种值（可能来自共享/导入的 TOML），
+ * 那样会盖住整个设置页。
+ */
+function cssColor(value) {
+  const text = String(value || '').trim();
+  if (/^#[0-9a-fA-F]{3,8}$/.test(text)) return text;
+  if (/^rgba?\([\d.,%\s/]+\)$/.test(text)) return text.replace(/[\s;]/g, '');
+  return 'transparent';
 }
 
 function renderDeviceOptions(current) {
@@ -635,11 +667,15 @@ function renderSourcesBlock(disabled) {
       n += 1;
       id = `source${n}`;
     }
+    // 默认挑一个没被其它源占用的设备：复用 devices[0] 会立刻触发
+    // “设备被多个启用中的输入源占用”，导致整页任何字段都存不进去。
+    const used = new Set(state.sources.map((source) => String(source.device || '')));
+    const freeDevice = (state.devices || []).find((device) => !used.has(device.spec));
     state.sources.push({
       id,
       label: `输入源 ${n}`,
-      device: state.devices[0]?.spec || 'default',
-      enabled: true,
+      device: freeDevice?.spec || '',
+      enabled: Boolean(freeDevice),
       translate: true,
       language: '',
     });
@@ -754,7 +790,14 @@ function bindFieldEvents() {
       if (element.type === 'checkbox') {
         value = element.checked;
       } else if (element.type === 'number') {
-        value = element.value === '' ? 0 : Number(element.value);
+        // 清空输入框时不要当成 0（position_x 之类会被真的写成 0），
+        // 视为「这项先不改」，等用户输入真正的值。
+        if (element.value === '') {
+          state.dirty.delete(path);
+          updateDirtyIndicator();
+          return;
+        }
+        value = Number(element.value);
       } else {
         value = element.value;
       }
@@ -763,7 +806,13 @@ function bindFieldEvents() {
         const inputs = els.content.querySelectorAll(
           `[data-path="${CSS.escape(path)}"][data-array-index]`,
         );
-        value = Array.from(inputs).map((input) => Number(input.value));
+        const values = Array.from(inputs).map((input) => input.value);
+        if (values.some((raw) => raw === '')) {
+          state.dirty.delete(path);
+          updateDirtyIndicator();
+          return;
+        }
+        value = values.map(Number);
       }
 
       state.dirty.set(path, value);
@@ -884,6 +933,21 @@ function validateNumbers(changes) {
     const field = findField(change.path);
     if (!field || !['int', 'float', 'number'].includes(field.kind)) continue;
     const value = change.value;
+    // world_position[] / line_alphas[] 这类字段的 dirty 值是整个数组，
+    // 之前这里按标量判断，导致数组字段一改就「必须是数字」，整批保存被挡。
+    if (Array.isArray(value)) {
+      if (value.some((item) => typeof item !== 'number' || !Number.isFinite(item))) {
+        errors.push(`${field.label} 必须是数字`);
+        continue;
+      }
+      if (field.min != null && value.some((item) => item < field.min)) {
+        errors.push(`${field.label} 不能小于 ${field.min}`);
+      }
+      if (field.max != null && value.some((item) => item > field.max)) {
+        errors.push(`${field.label} 不能大于 ${field.max}`);
+      }
+      continue;
+    }
     if (typeof value !== 'number' || !Number.isFinite(value)) {
       errors.push(`${field.label} 必须是数字`);
       continue;
@@ -1023,7 +1087,15 @@ window.addEventListener('DOMContentLoaded', async () => {
     return;
   }
   bindTopbar();
-  await loadAll();
+  // 设置窗口在 app 启动时就创建（hidden），但用户可能整场都不打开它。
+  // 不可见时不做加载，等第一次 settings://shown 再拉取。
+  const current = window.__TAURI__?.window?.getCurrent?.();
+  const visible = current?.isVisible ? await current.isVisible().catch(() => true) : true;
+  if (visible) {
+    await loadAll();
+  } else {
+    setStatus('就绪');
+  }
   // 设置窗口关闭只是 hide()，前端状态会一直活着；
   // 不重新拉取的话，用户会拿启动时的快照去覆盖浮窗里的改动。
   if (window.__TAURI__?.event?.listen) {

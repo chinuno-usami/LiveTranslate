@@ -627,6 +627,9 @@ async function bindActions() {
 
   // 快捷键说明弹窗
   els.helpBtn.addEventListener('click', () => {
+    // 打开模态前收起输入源弹层，避免两个浮层同时可交互
+    els.sourcesPopover.classList.add('hidden');
+    els.sourcesBtn.setAttribute('aria-expanded', 'false');
     els.helpModal.classList.remove('hidden');
   });
   els.helpClose.addEventListener('click', () => {

@@ -290,7 +290,8 @@ body {
 .modal {
   position: fixed;
   inset: 0;
-  z-index: 10;
+  /* 必须高于输入源弹层（40），否则弹层会浮在“模态”之上并保持可交互 */
+  z-index: 50;
   display: flex;
   align-items: center;
   justify-content: center;
