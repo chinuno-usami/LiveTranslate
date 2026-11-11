@@ -101,21 +101,31 @@ pub fn ensure_initialized(config_path: &Path) -> Result<(), String> {
 
 fn ensure_initialized_unlocked(config_path: &Path) -> Result<(), String> {
     let dir = profiles_dir(config_path);
-    fs::create_dir_all(&dir).map_err(|e| format!("创建配置档目录失败: {e}"))?;
-
     let default_path = dir.join(format!("{DEFAULT_PROFILE}.toml"));
-    if !default_path.exists() {
+    let pending_default = if !default_path.exists() {
         let text = match fs::read_to_string(config_path) {
-            Ok(text) => text,
+            Ok(text) => {
+                validated_text(&text).map_err(|e| {
+                    format!("当前配置文件存在待修复项（{e}），请先保存修复后再操作配置档")
+                })?;
+                text
+            }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => seed_text(),
             // 权限 / 编码错误不要退化成“文件不存在”，否则会静默生成无注释默认档
             Err(e) => return Err(format!("读取当前配置失败: {e}")),
         };
+        Some(text)
+    } else {
+        None
+    };
+
+    fs::create_dir_all(&dir).map_err(|e| format!("创建配置档目录失败: {e}"))?;
+    if let Some(text) = pending_default {
         writer::write_atomic_unlocked(&default_path, &text)?;
     }
 
     let meta = meta_path(config_path);
-    if !meta.exists() {
+    if !meta.exists() || read_meta(config_path).is_none() {
         let active = read_active(config_path).unwrap_or_else(|| DEFAULT_PROFILE.to_string());
         write_active_unlocked(config_path, &active)?;
     }
@@ -159,7 +169,7 @@ pub fn validate_name(name: &str) -> Result<(), String> {
     }
     if !chars
         .iter()
-        .all(|c| c.is_alphanumeric() || *c == '_' || *c == '-')
+        .all(|c| (c.is_alphanumeric() && !matches!(c, '\u{00B2}' | '\u{00B3}' | '\u{00B9}')) || *c == '_' || *c == '-')
     {
         return Err("配置档名只能包含字母、数字、中文、下划线和短横线".to_string());
     }
@@ -195,8 +205,9 @@ pub fn list_status_with_init(config_path: Option<&Path>, allow_init: bool) -> Pr
             profiles: Vec::new(),
         };
     }
+    let _guard = writer::lock_writes();
     if allow_init {
-        if let Err(e) = ensure_initialized(config_path) {
+        if let Err(e) = ensure_initialized_unlocked(config_path) {
             return ProfilesStatus {
                 enabled: false,
                 reason: Some(e),
@@ -385,14 +396,36 @@ pub fn delete(config_path: &Path, name: &str) -> Result<(), String> {
     fs::remove_file(&path).map_err(|e| format!("删除失败: {e}"))
 }
 
+/// 在大小写不敏感文件系统上解析磁盘上真实存在的配置档名，避免 active 与文件名大小写漂移
+fn resolve_existing_name(config_path: &Path, requested: &str) -> Option<(String, PathBuf)> {
+    let candidate = profile_path(config_path, requested);
+    if !candidate.exists() {
+        return None;
+    }
+    if let Ok(entries) = fs::read_dir(profiles_dir(config_path)) {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.extension().and_then(|e| e.to_str()) == Some("toml") && same_path(&p, &candidate) {
+                if let Some(stem) = p.file_stem().and_then(|s| s.to_str()) {
+                    return Some((stem.to_string(), p));
+                }
+            }
+        }
+    }
+    Some((requested.to_string(), candidate))
+}
+
 /// 校验目标配置档并返回其文本（实际替换由调用方在持有 lifecycle 锁时完成）
 pub fn switch(config_path: &Path, name: &str) -> Result<String, String> {
     validate_name(name)?;
-    ensure_initialized(config_path)?;
-    let path = profile_path(config_path, name);
-    if !path.exists() {
-        return Err(format!("配置档「{name}」不存在"));
+    let _guard = writer::lock_writes();
+    // 若 profiles 目录尚未建立才尝试初始化；已建立时允许在降级态下直接切回完好的配置档恢复
+    if !profiles_dir(config_path).exists() || !meta_path(config_path).exists() {
+        ensure_initialized_unlocked(config_path)?;
     }
+    let Some((_, path)) = resolve_existing_name(config_path, name) else {
+        return Err(format!("配置档「{name}」不存在"));
+    };
     let text = fs::read_to_string(&path).map_err(|e| format!("读取配置档失败: {e}"))?;
     validated_text(&text)?;
     Ok(text)
@@ -405,11 +438,12 @@ pub fn switch(config_path: &Path, name: &str) -> Result<String, String> {
 pub fn switch_to(config_path: &Path, name: &str) -> Result<String, String> {
     validate_name(name)?;
     let _guard = writer::lock_writes();
-    ensure_initialized_unlocked(config_path)?;
-    let path = profile_path(config_path, name);
-    if !path.exists() {
-        return Err(format!("配置档「{name}」不存在"));
+    if !profiles_dir(config_path).exists() || !meta_path(config_path).exists() {
+        ensure_initialized_unlocked(config_path)?;
     }
+    let Some((canonical_name, path)) = resolve_existing_name(config_path, name) else {
+        return Err(format!("配置档「{name}」不存在"));
+    };
     let text = fs::read_to_string(&path).map_err(|e| format!("读取配置档失败: {e}"))?;
     validated_text(&text)?;
 
@@ -418,7 +452,7 @@ pub fn switch_to(config_path: &Path, name: &str) -> Result<String, String> {
     // 若先写 active 再备份，中途失败会留下「active 指向新档、config 还是旧内容」，
     // 下一次 mirror 就会把旧内容写进新档，把用户刚切的配置毁掉。
     writer::backup(config_path)?;
-    write_active_unlocked(config_path, name)?;
+    write_active_unlocked(config_path, &canonical_name)?;
     if let Err(e) = writer::write_atomic_unlocked(config_path, &text) {
         if let Some(previous) = previous {
             if let Err(revert) = write_active_unlocked(config_path, &previous) {
@@ -634,6 +668,25 @@ mod tests {
         assert!(!profiles_dir(&config).exists());
         assert!(!meta_path(&config).exists());
 
+        // 即使直接调用 create / ensure_initialized，也不得把损坏的 config.toml 拷入 default.toml
+        assert!(create(&config, "vr", None).is_err());
+        assert!(!profiles_dir(&config).join("default.toml").exists());
+
+        let _ = fs::remove_dir_all(config.parent().unwrap());
+    }
+
+    #[test]
+    fn switch_to_preserves_canonical_case_on_insensitive_fs() {
+        let config = setup("switch-case");
+        fs::write(&config, AppConfig::default().to_toml_string().unwrap()).unwrap();
+        ensure_initialized(&config).unwrap();
+        create(&config, "vr", None).unwrap();
+
+        if same_path(&profile_path(&config, "vr"), &profile_path(&config, "VR")) {
+            switch_to(&config, "VR").unwrap();
+            assert_eq!(read_active(&config).as_deref(), Some("vr"));
+        }
+        assert!(validate_name("COM\u{00B9}").is_err());
         let _ = fs::remove_dir_all(config.parent().unwrap());
     }
 }

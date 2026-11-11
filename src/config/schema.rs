@@ -145,15 +145,15 @@ pub fn build(config: &AppConfig) -> SettingsSchema {
                     "帧长（毫秒）",
                     "仅 energy 后端；silero 固定 512 样本。",
                     10.0,
-                    60.0,
+                    100.0,
                 ),
                 float(
                     config,
                     "vad.margin_db",
                     "噪声余量 (dB)",
                     "环境嘈杂调大。",
-                    2.0,
-                    24.0,
+                    0.0,
+                    40.0,
                     0.5,
                 ),
                 float(
@@ -185,16 +185,16 @@ pub fn build(config: &AppConfig) -> SettingsSchema {
                     "vad.min_speech_ms",
                     "最短语音（毫秒）",
                     "短于此的片段被丢弃。",
-                    50.0,
-                    2000.0,
+                    20.0,
+                    10000.0,
                 ),
                 int(
                     config,
                     "vad.min_silence_ms",
                     "句尾静音（毫秒）",
                     "静音持续这么久才确认说完。",
-                    100.0,
-                    3000.0,
+                    50.0,
+                    5000.0,
                 ),
                 int(
                     config,
@@ -249,7 +249,7 @@ pub fn build(config: &AppConfig) -> SettingsSchema {
                     "auto 为自动检测；也可在浮窗下拉框切换（立即生效）。",
                     "whisper",
                 ),
-                int(config, "asr.timeout_secs", "超时（秒）", "", 5.0, 300.0),
+                int(config, "asr.timeout_secs", "超时（秒）", "", 3.0, 300.0),
                 string(
                     config,
                     "asr.request_path",
@@ -286,7 +286,7 @@ pub fn build(config: &AppConfig) -> SettingsSchema {
                     "asr.edge.timeout_secs",
                     "Edge 超时（秒）",
                     "",
-                    5.0,
+                    3.0,
                     120.0,
                 ),
                 secret_adv(
@@ -818,25 +818,31 @@ fn json_to_toml(value: &JsonValue, path: &str) -> Result<toml::Value, String> {
             if s.trim().is_empty() {
                 return Ok(toml::Value::Table(Default::default()));
             }
-            toml::from_str(s).map_err(|e| {
+            let parsed: toml::Value = toml::from_str(s).map_err(|e| {
                 format!(
                     "extra_body TOML 解析失败: {}",
                     crate::config::toml_error_text(&e)
                 )
-            })?
+            })?;
+            if !parsed.is_table() {
+                return Err("translate.extra_body 必须是 TOML 表结构".to_string());
+            }
+            parsed
         }
         JsonValue::String(s) => toml::Value::String(s.clone()),
         JsonValue::Array(items) => {
             let mut out = Vec::with_capacity(items.len());
-            for item in items {
-                out.push(json_to_toml(item, path)?);
+            for (index, item) in items.iter().enumerate() {
+                let child_path = format!("{path}[{index}]");
+                out.push(json_to_toml(item, &child_path)?);
             }
             toml::Value::Array(out)
         }
         JsonValue::Object(map) => {
             let mut table = toml::map::Map::new();
             for (key, item) in map {
-                table.insert(key.clone(), json_to_toml(item, path)?);
+                let child_path = format!("{path}.{key}");
+                table.insert(key.clone(), json_to_toml(item, &child_path)?);
             }
             toml::Value::Table(table)
         }
@@ -1145,6 +1151,19 @@ mod tests {
         )
         .unwrap();
         assert!(cfg.translate.extra_body.is_some());
+
+        // 结构化 JSON 对象（如从 SHIPPED_DEFAULT 读取再回写）不能把子字符串误当作 TOML 文档解析
+        let shipped = AppConfig::from_str(AppConfig::SHIPPED_DEFAULT).unwrap();
+        let schema = build(&shipped);
+        let field = schema
+            .groups
+            .iter()
+            .flat_map(|g| &g.fields)
+            .find(|f| f.path == "translate.extra_body")
+            .unwrap();
+        let mut copy = shipped.clone();
+        apply_change(&mut copy, &field.path, &field.value).unwrap();
+        assert_eq!(copy.translate.extra_body, shipped.translate.extra_body);
     }
 
     #[test]

@@ -58,31 +58,52 @@ fn tmp_path_for(path: &Path) -> PathBuf {
 /// 调用方需自行持有 [`lock_writes`]（`apply_changes` / `save_raw` 已经在锁内，
 /// 不能重复加锁——`std::sync::Mutex` 不可重入）。
 pub(crate) fn write_atomic_unlocked(path: &Path, content: &str) -> Result<(), String> {
-    if let Some(parent) = path.parent() {
+    // 若目标是已存在的符号链接（如 dotfiles 软链），解引用写真实目标，避免 rename 把软链替换成普通文件
+    let resolved = if fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) {
+        fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+    } else {
+        path.to_path_buf()
+    };
+    let target = resolved.as_path();
+
+    if let Some(parent) = target.parent() {
         if !parent.as_os_str().is_empty() {
             fs::create_dir_all(parent).map_err(|e| format!("创建目录失败: {e}"))?;
         }
     }
-    let tmp = tmp_path_for(path);
-    if let Err(e) = write_file_durable(&tmp, content) {
+    let orig_meta = fs::metadata(target).ok();
+    let tmp = tmp_path_for(target);
+    if let Err(e) = write_file_durable(&tmp, content.as_bytes()) {
         let _ = fs::remove_file(&tmp);
         return Err(format!("写入临时文件失败: {e}"));
     }
-    // 临时文件在 Unix 上已按 0600 创建；若原文件存在则沿用用户自定义权限位
-    if let Ok(meta) = fs::metadata(path) {
-        let _ = fs::set_permissions(&tmp, meta.permissions());
+    // Unix 下保留原文件非只读的自定义权限位（write_file_durable 默认已按 0600 创建）
+    #[cfg(unix)]
+    if let Some(meta) = &orig_meta {
+        if !meta.permissions().readonly() {
+            let _ = fs::set_permissions(&tmp, meta.permissions());
+        }
     }
-    if let Err(e) = fs::rename(&tmp, path) {
+    // Windows 下目标文件带只读属性时 MoveFileExW 会拒绝覆盖，需先解除目标只读位
+    #[cfg(windows)]
+    if let Some(meta) = &orig_meta {
+        let mut perms = meta.permissions();
+        if perms.readonly() {
+            perms.set_readonly(false);
+            let _ = fs::set_permissions(target, perms);
+        }
+    }
+    if let Err(e) = fs::rename(&tmp, target) {
         let _ = fs::remove_file(&tmp);
         return Err(format!("替换配置文件失败: {e}"));
     }
     // rename 只保证「名字切换」原子，落盘还要同步父目录，
     // 否则掉电后可能留下一个长度为 0 的配置文件（里面存着 api_key）。
-    sync_parent_dir(path);
+    sync_parent_dir(target);
     Ok(())
 }
 
-fn write_file_durable(path: &Path, content: &str) -> std::io::Result<()> {
+fn write_file_durable(path: &Path, content: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
     let mut options = fs::OpenOptions::new();
     options.write(true).create(true).truncate(true);
@@ -93,7 +114,13 @@ fn write_file_durable(path: &Path, content: &str) -> std::io::Result<()> {
         options.mode(0o600);
     }
     let mut file = options.open(path)?;
-    file.write_all(content.as_bytes())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        // 若目标文件此前已存在（如 .bak），确保权限收紧到 0600
+        let _ = file.set_permissions(fs::Permissions::from_mode(0o600));
+    }
+    file.write_all(content)?;
     file.sync_all()?;
     Ok(())
 }
@@ -118,30 +145,23 @@ pub fn write_atomic(path: &Path, content: &str) -> Result<(), String> {
 
 /// 备份到 `<file>.bak`，返回备份路径（源文件不存在时不备份）
 pub fn backup(path: &Path) -> Result<Option<PathBuf>, String> {
-    if !path.exists() {
-        return Ok(None);
-    }
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("读取备份源文件失败: {e}")),
+    };
     let mut name = path.as_os_str().to_os_string();
     name.push(".bak");
     let backup = PathBuf::from(name);
-    // 若上一轮备份继承了原文件的只读位，先放开写权限以免二次备份失败
+    #[cfg(windows)]
     if let Ok(meta) = fs::metadata(&backup) {
         let mut perms = meta.permissions();
         if perms.readonly() {
-            #[allow(clippy::permissions_set_readonly_false)]
             perms.set_readonly(false);
             let _ = fs::set_permissions(&backup, perms);
         }
     }
-    fs::copy(path, &backup).map_err(|e| format!("备份配置失败: {e}"))?;
-    if let Ok(meta) = fs::metadata(&backup) {
-        let mut perms = meta.permissions();
-        if perms.readonly() {
-            #[allow(clippy::permissions_set_readonly_false)]
-            perms.set_readonly(false);
-            let _ = fs::set_permissions(&backup, perms);
-        }
-    }
+    write_file_durable(&backup, &bytes).map_err(|e| format!("备份配置失败: {e}"))?;
     Ok(Some(backup))
 }
 
@@ -277,10 +297,17 @@ fn collect_unknown(
     }
 }
 
-/// 确认某个改动真的落到了结构体里（而不是被 serde 当作未知键丢掉）
+/// 确认某个改动真的落到了结构体里（而不是被 serde 当作未知键丢掉或顺序被还原）
 fn verify_change_applied(cfg: &AppConfig, dotted: &str, value: &JsonValue) -> Result<(), String> {
-    // 这两项在写入时会被重写成结构化形态，取值语义不同，跳过比对
-    if dotted == "audio.sources" || dotted == "translate.extra_body" {
+    if dotted == "audio.sources" {
+        let expected = parse_sources(value)?;
+        if cfg.audio.sources == expected {
+            return Ok(());
+        }
+        return Err("配置项 audio.sources 写入后结果或顺序不一致".to_string());
+    }
+    // extra_body 支持 TOML 文本重写成结构化表，取值形态不同，已由 validate/from_str 校验
+    if dotted == "translate.extra_body" {
         return Ok(());
     }
     let actual = crate::config::schema::get_value(cfg, dotted)
@@ -367,17 +394,29 @@ fn set_sources(doc: &mut DocumentMut, sources: &[AudioSourceConfig]) {
         .and_then(Item::as_table)
         .and_then(|audio| audio.get("sources"))
         .and_then(Item::as_array_of_tables);
-    let first_decor = existing
+    // toml_edit::DocumentMut::fmt 会按每个 Table 的 doc_position 稳定排序；
+    // 旧表若携带不同的 doc_position，重排后会被自动排回原文件顺序。
+    // 统一赋为原数组表首项位置，既让整组保持在原配置段位置，又按新顺序输出。
+    let base_pos = existing.and_then(|arr| arr.iter().filter_map(Table::position).min());
+    let first_prefix = existing
         .and_then(|arr| arr.get(0))
-        .map(|table| table.decor().clone());
+        .and_then(|table| table.decor().prefix())
+        .and_then(|raw| raw.as_str())
+        .map(str::to_string);
     let first_id = existing
         .and_then(|arr| arr.get(0))
         .and_then(|table| table.get("id"))
         .and_then(Item::as_str)
         .map(str::to_string);
-    let first_removed = first_id
-        .as_deref()
-        .is_some_and(|id| !sources.iter().any(|s| s.id == id));
+    let first_changed = first_id.as_deref() != sources.first().map(|s| s.id.as_str());
+    // 若首项变更（被删除或重排后移），从旧首项提取段头注释挂到新首项上
+    let (section_header, old_first_own) = match (first_changed, first_prefix.as_deref()) {
+        (true, Some(prefix)) if !prefix.trim().is_empty() => match prefix.split_once("\n\n") {
+            Some((header, rest)) => (Some(header.to_string()), format!("\n{rest}")),
+            None => (Some(prefix.trim_end_matches('\n').to_string()), "\n".to_string()),
+        },
+        _ => (None, "\n".to_string()),
+    };
     let mut old_tables: Vec<Table> = existing
         .map(|arr| arr.iter().cloned().collect())
         .unwrap_or_default();
@@ -387,13 +426,31 @@ fn set_sources(doc: &mut DocumentMut, sources: &[AudioSourceConfig]) {
         let matched = old_tables
             .iter()
             .position(|t| t.get("id").and_then(Item::as_str) == Some(source.id.as_str()));
+        let was_old_first = first_id.as_deref() == Some(source.id.as_str());
         let mut table = match matched {
             Some(pos) => old_tables.remove(pos),
             None => Table::new(),
         };
-        if idx == 0 && (matched.is_none() || first_removed) && table.decor().prefix().is_none() {
-            if let Some(decor) = &first_decor {
-                *table.decor_mut() = decor.clone();
+        if let Some(pos) = base_pos {
+            table.set_position(pos);
+        }
+        if was_old_first && idx > 0 && section_header.is_some() {
+            table.decor_mut().set_prefix(old_first_own.clone());
+        }
+        if idx == 0 {
+            if let Some(header) = &section_header {
+                let own = table
+                    .decor()
+                    .prefix()
+                    .and_then(|raw| raw.as_str())
+                    .unwrap_or("")
+                    .trim_start_matches('\n');
+                let merged = if own.is_empty() {
+                    format!("{header}\n")
+                } else {
+                    format!("{header}\n\n{own}")
+                };
+                table.decor_mut().set_prefix(merged);
             }
         }
         update_table_scalar(&mut table, "id", Value::from(source.id.clone()));
@@ -436,10 +493,15 @@ fn set_path(doc: &mut DocumentMut, dotted: &str, mut item: Item) -> Result<(), S
         return Err("配置路径为空".to_string());
     }
 
+    let parent_count = parts.len() - 1;
     let mut table: &mut Table = doc.as_table_mut();
-    for part in &parts[..parts.len() - 1] {
+    for (depth, part) in parts[..parent_count].iter().enumerate() {
         if !table.contains_key(part) {
-            table.insert(part, Item::Table(Table::new()));
+            let mut created = Table::new();
+            if depth + 1 < parent_count {
+                created.set_implicit(true);
+            }
+            table.insert(part, Item::Table(created));
         }
         let entry = table
             .get_mut(part)
@@ -928,5 +990,68 @@ devce = "mic:0"
 "#;
         let unknown = unknown_keys(toml);
         assert_eq!(unknown, vec!["audio.sources[0].devce"]);
+    }
+
+    #[test]
+    fn reordering_and_deleting_first_source_persist_order_and_comments() {
+        let path = temp_path("sources-reorder");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, AppConfig::SHIPPED_DEFAULT).unwrap();
+
+        let cfg = AppConfig::from_file(&path).unwrap();
+        let reordered = vec![cfg.audio.sources[1].clone(), cfg.audio.sources[0].clone()];
+        let saved = apply_changes(
+            &path,
+            &[(
+                "audio.sources".into(),
+                serde_json::to_value(&reordered).unwrap(),
+            )],
+        )
+        .unwrap();
+        assert_eq!(saved.audio.sources[0].id, "game");
+        assert_eq!(saved.audio.sources[1].id, "default");
+        let on_disk = AppConfig::from_file(&path).unwrap();
+        assert_eq!(on_disk.audio.sources[0].id, "game");
+        assert_eq!(on_disk.audio.sources[1].id, "default");
+
+        let text = fs::read_to_string(&path).unwrap();
+        let header_pos = text.find("# 多输入源：每个源一条").expect("段头注释应保留");
+        let first_arr_pos = text.find("\n[[audio.sources]]").unwrap();
+        assert!(header_pos < first_arr_pos, "段头注释应仍在首个源之前:\n{text}");
+        assert!(text.contains("# 回环采集仅 Windows 支持"));
+
+        // 删除首项后，段头注释仍应保留在新首项上
+        let only_second = vec![saved.audio.sources[1].clone()];
+        let after_del = apply_changes(
+            &path,
+            &[(
+                "audio.sources".into(),
+                serde_json::to_value(&only_second).unwrap(),
+            )],
+        )
+        .unwrap();
+        assert_eq!(after_del.audio.sources.len(), 1);
+        assert_eq!(after_del.audio.sources[0].id, "default");
+        let text_after = fs::read_to_string(&path).unwrap();
+        assert!(text_after.contains("# 多输入源：每个源一条"));
+
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn backup_uses_private_0600_mode_even_for_readonly_source() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = temp_path("backup-perms");
+        seed(&path);
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o400)).unwrap();
+
+        let bak = backup(&path).unwrap().unwrap();
+        let mode = fs::metadata(&bak).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "备份文件不能放开组/全局读写位: {mode:#o}");
+
+        let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600));
+        let _ = fs::remove_dir_all(path.parent().unwrap());
     }
 }

@@ -785,50 +785,12 @@ impl AppConfig {
     }
 
     /// 用户配置目录 `config.toml` 加载失败时的恢复逻辑：
-    /// 1. 先将损坏原文件备份为 `.bad-*`；
-    /// 2. 若当前激活配置档（`profiles/<active>.toml`）存在且校验合法，优先从该快照恢复，避免丢失 `api_key` 等设置；
-    /// 3. 否则回退到内置默认配置，并标记 `degraded = true` 以阻止后续运行期自动镜像覆盖完好的配置档文件。
+    /// 1. 若 `config.toml` 自身 TOML 语法完好（仅字段范围/组合校验未通过），原样保留磁盘文件并进入降级态，
+    ///    避免旧配置档快照覆盖用户刚手改的 `api_key` 或输入源；
+    /// 2. 若 `config.toml` 语法损坏且当前激活配置档（`profiles/<active>.toml`）可解析，优先从该快照恢复；
+    /// 3. 否则备份坏文件并回退到内置默认配置，标记 `degraded = true`。
     pub(crate) fn recover_user_config(user_path: &Path, err_msg: &str) -> ResolvedConfig {
-        if let Some(active) = profiles::read_active(user_path) {
-            if profiles::validate_name(&active).is_ok() {
-                let snap = profiles::profiles_dir(user_path).join(format!("{active}.toml"));
-                if let Ok(text) = fs::read_to_string(&snap) {
-                    if let Ok(cfg) = Self::from_str(&text).and_then(|cfg| {
-                        cfg.validate().map_err(AppError::Config)?;
-                        Ok(cfg)
-                    }) {
-                        let quarantined = Self::quarantine(user_path);
-                        let restored =
-                            quarantined.is_some() && writer::write_atomic(user_path, &text).is_ok();
-                        let warning = match (&quarantined, restored) {
-                            (Some(bad), true) => format!(
-                                "配置 {} 无法加载（{err_msg}），已备份为 {} 并从配置档「{active}」恢复",
-                                user_path.display(),
-                                bad.display()
-                            ),
-                            (Some(bad), false) => format!(
-                                "配置 {} 无法加载（{err_msg}），已备份为 {}，本次使用配置档「{active}」运行",
-                                user_path.display(),
-                                bad.display()
-                            ),
-                            (None, _) => format!(
-                                "配置 {} 无法加载（{err_msg}），本次使用配置档「{active}」运行",
-                                user_path.display()
-                            ),
-                        };
-                        tracing::error!("{warning}");
-                        return ResolvedConfig {
-                            config: cfg,
-                            path: Some(user_path.to_path_buf()),
-                            warning: Some(warning),
-                            degraded: !restored,
-                        };
-                    }
-                }
-            }
-        }
-
-        // 若 TOML 结构本身可解析（仅字段范围/组合校验未通过），保留原文件不覆盖为默认模板，
+        // 若 TOML 结构本身可解析（仅字段范围/组合校验未通过），保留原文件不覆盖，
         // 让用户在「设置」页仍能看到自己的 api_key / 输入源并直接修正越界项。
         if Self::from_file(user_path).is_ok() {
             let warning = format!(
@@ -842,6 +804,57 @@ impl AppConfig {
                 warning: Some(warning),
                 degraded: true,
             };
+        }
+
+        if let Some(active) = profiles::read_active(user_path) {
+            if profiles::validate_name(&active).is_ok() {
+                let snap = profiles::profiles_dir(user_path).join(format!("{active}.toml"));
+                if let Ok(text) = fs::read_to_string(&snap) {
+                    if let Ok(parsed) = Self::from_str(&text) {
+                        let quarantined = Self::quarantine(user_path);
+                        let restored =
+                            quarantined.is_some() && writer::write_atomic(user_path, &text).is_ok();
+                        if parsed.validate().is_ok() {
+                            let warning = match (&quarantined, restored) {
+                                (Some(bad), true) => format!(
+                                    "配置 {} 无法加载（{err_msg}），已备份为 {} 并从配置档「{active}」恢复",
+                                    user_path.display(),
+                                    bad.display()
+                                ),
+                                (Some(bad), false) => format!(
+                                    "配置 {} 无法加载（{err_msg}），已备份为 {}，本次使用配置档「{active}」运行",
+                                    user_path.display(),
+                                    bad.display()
+                                ),
+                                (None, _) => format!(
+                                    "配置 {} 无法加载（{err_msg}），本次使用配置档「{active}」运行",
+                                    user_path.display()
+                                ),
+                            };
+                            tracing::error!("{warning}");
+                            return ResolvedConfig {
+                                config: parsed,
+                                path: Some(user_path.to_path_buf()),
+                                warning: Some(warning),
+                                degraded: !restored,
+                            };
+                        } else if restored {
+                            // 激活配置档语法完好但含越界项：恢复该快照供设置页修复，避免被默认模板覆盖丢失密钥
+                            let warning = format!(
+                                "配置 {} 损坏且配置档「{active}」存在待修正项，已恢复配置档内容；请打开「设置」修正后保存",
+                                user_path.display()
+                            );
+                            tracing::error!("{warning}");
+                            return ResolvedConfig {
+                                config: AppConfig::default(),
+                                path: Some(user_path.to_path_buf()),
+                                warning: Some(warning),
+                                degraded: true,
+                            };
+                        }
+                    }
+                }
+            }
         }
 
         // 语法损坏且无可用配置档快照：备份坏文件并写入默认模板兜底
@@ -959,6 +972,10 @@ impl AppConfig {
                     source.device
                 ));
             }
+            let src_lang = source.language.trim();
+            if !src_lang.is_empty() && !is_valid_lang_tag(src_lang) {
+                errors.push(format!("{label}: 语言标签「{src_lang}」格式无效"));
+            }
         }
 
         if self.audio.max_active_sources == 0 || self.audio.max_active_sources > 8 {
@@ -998,6 +1015,12 @@ impl AppConfig {
         if self.subtitle.window_height < 80 || self.subtitle.window_height > 4320 {
             errors.push("subtitle.window_height 必须在 80–4320 之间".to_string());
         }
+        if !(-20_000..=20_000).contains(&self.subtitle.position_x) {
+            errors.push("subtitle.position_x 必须在 -20000–20000 之间".to_string());
+        }
+        if !(-20_000..=20_000).contains(&self.subtitle.position_y) {
+            errors.push("subtitle.position_y 必须在 -20000–20000 之间".to_string());
+        }
 
         // VAD
         if !matches!(self.vad.backend.as_str(), "energy" | "silero") {
@@ -1021,6 +1044,9 @@ impl AppConfig {
             0.0,
             1.0,
         );
+        if !(20..=10_000).contains(&self.vad.min_speech_ms) {
+            errors.push("vad.min_speech_ms 必须在 20–10000 之间".to_string());
+        }
         if self.vad.min_speech_ms > self.vad.max_speech_ms {
             errors.push("vad.min_speech_ms 不能大于 vad.max_speech_ms".to_string());
         }
@@ -1032,6 +1058,17 @@ impl AppConfig {
         }
 
         // 翻译
+        if self.translate.enabled {
+            if self.translate.base_url.trim().is_empty() {
+                errors.push("translate.base_url 不能为空（已启用翻译）".to_string());
+            }
+            if self.translate.model.trim().is_empty() {
+                errors.push("translate.model 不能为空（已启用翻译）".to_string());
+            }
+            if self.translate.target_language.trim().is_empty() {
+                errors.push("translate.target_language 不能为空（已启用翻译）".to_string());
+            }
+        }
         if self.translate.timeout_secs < 3 || self.translate.timeout_secs > 300 {
             errors.push("translate.timeout_secs 必须在 3–300 之间".to_string());
         }
@@ -1042,6 +1079,24 @@ impl AppConfig {
             0.0,
             2.0,
         );
+        if !matches!(
+            self.translate
+                .disable_thinking
+                .trim()
+                .to_ascii_lowercase()
+                .as_str(),
+            "" | "none" | "reasoning_effort" | "enable_thinking" | "chat_template"
+        ) {
+            errors.push(
+                "translate.disable_thinking 只能为空、reasoning_effort、enable_thinking 或 chat_template"
+                    .to_string(),
+            );
+        }
+        if let Some(extra) = &self.translate.extra_body {
+            if !extra.is_table() {
+                errors.push("translate.extra_body 必须是表（table）结构".to_string());
+            }
+        }
 
         // 识别（原始配置编辑器只有 from_str + validate 两道关，这里不能留空）
         if !matches!(self.asr.backend.as_str(), "whisper" | "edge") {
@@ -1049,6 +1104,14 @@ impl AppConfig {
         }
         if !(3..=300).contains(&self.asr.timeout_secs) {
             errors.push("asr.timeout_secs 必须在 3–300 之间".to_string());
+        }
+        let whisper_lang = self.asr.language.trim();
+        if !whisper_lang.is_empty() && !is_valid_lang_tag(whisper_lang) {
+            errors.push("asr.language 格式无效".to_string());
+        }
+        let edge_lang_any = self.asr.edge.language.trim();
+        if !edge_lang_any.is_empty() && !is_valid_lang_tag(edge_lang_any) {
+            errors.push("asr.edge.language 格式无效".to_string());
         }
         if self.asr.backend == "whisper" {
             if self.asr.base_url.trim().is_empty() {
@@ -1130,6 +1193,12 @@ impl AppConfig {
         if !(12..=96).contains(&vr.font_size_px) {
             errors.push("output.steamvr.font_size_px 必须在 12–96 之间".to_string());
         }
+        if vr.hide_on_silence_secs > 600 {
+            errors.push("output.steamvr.hide_on_silence_secs 必须在 0–600 之间".to_string());
+        }
+        if !(1..=60).contains(&vr.reconnect_interval_secs) {
+            errors.push("output.steamvr.reconnect_interval_secs 必须在 1–60 之间".to_string());
+        }
         for (index, value) in vr.line_alphas.iter().enumerate() {
             check_range(
                 &mut errors,
@@ -1140,18 +1209,22 @@ impl AppConfig {
             );
         }
         for (index, value) in vr.world_position.iter().enumerate() {
-            if !value.is_finite() {
-                errors.push(format!(
-                    "output.steamvr.world_position[{index}] 必须是有限值"
-                ));
-            }
+            check_range(
+                &mut errors,
+                &format!("output.steamvr.world_position[{index}]"),
+                *value,
+                -100.0,
+                100.0,
+            );
         }
         for (index, value) in vr.world_rotation_deg.iter().enumerate() {
-            if !value.is_finite() {
-                errors.push(format!(
-                    "output.steamvr.world_rotation_deg[{index}] 必须是有限值"
-                ));
-            }
+            check_range(
+                &mut errors,
+                &format!("output.steamvr.world_rotation_deg[{index}]"),
+                *value,
+                -360.0,
+                360.0,
+            );
         }
         for (key, color) in [
             ("background", &vr.background),
@@ -1300,6 +1373,14 @@ fn check_range(errors: &mut Vec<String>, name: &str, value: f32, min: f32, max: 
     if !value.is_finite() || value < min || value > max {
         errors.push(format!("{name} 必须在 {min}–{max} 之间"));
     }
+}
+
+fn is_valid_lang_tag(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 32
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
 }
 
 /// `#RGB` / `#RRGGBB` / `#RRGGBBAA`
@@ -1571,6 +1652,10 @@ mod tests {
     fn recover_user_config_keeps_parseable_invalid_config_for_settings_repair() {
         let path = temp_config_path("recover-validation-only");
         fs::create_dir_all(path.parent().unwrap()).unwrap();
+        // 先完成首次配置档初始化（模拟真实启动过一次的用户环境）
+        fs::write(&path, AppConfig::default().to_toml_string().unwrap()).unwrap();
+        profiles::ensure_initialized(&path).unwrap();
+
         let mut cfg = AppConfig::default();
         cfg.translate.api_key = "sk-precious".to_string();
         cfg.subtitle.font_size = 999; // 仅单个字段越界，TOML 语法完好
@@ -1579,11 +1664,27 @@ mod tests {
         let resolved = AppConfig::recover_user_config(&path, "subtitle.font_size 越界");
         assert!(resolved.degraded);
         assert_eq!(resolved.config.subtitle.font_size, 28);
-        // 磁盘原文件未被默认模板覆盖，设置页仍可回读 sk-precious 并修正 font_size
+        // 磁盘原文件未被旧配置档或默认模板覆盖，设置页仍可回读 sk-precious 并修正 font_size
         let on_disk = AppConfig::from_file(&path).unwrap();
         assert_eq!(on_disk.translate.api_key, "sk-precious");
         assert_eq!(on_disk.subtitle.font_size, 999);
 
         let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn validation_catches_non_table_extra_body_and_invalid_bounds() {
+        let mut cfg = AppConfig::default();
+        cfg.translate.extra_body = Some(toml::Value::String("not-a-table".into()));
+        cfg.translate.disable_thinking = "bogus".into();
+        cfg.subtitle.position_x = -32000;
+        cfg.asr.edge.language = "en-US&foo=1".into();
+        cfg.output.steamvr.reconnect_interval_secs = 0;
+        let err = cfg.validate().unwrap_err();
+        assert!(err.contains("extra_body"), "{err}");
+        assert!(err.contains("disable_thinking"), "{err}");
+        assert!(err.contains("position_x"), "{err}");
+        assert!(err.contains("asr.edge.language"), "{err}");
+        assert!(err.contains("reconnect_interval_secs"), "{err}");
     }
 }
