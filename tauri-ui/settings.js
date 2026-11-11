@@ -43,6 +43,7 @@ const state = {
   currentGroup: 'sources',
   dirty: new Map(),
   invalidInputs: new Map(),
+  rawInputs: new Map(),
   originalSourcesJson: '[]',
   previewTimer: null,
   hasLoaded: false,
@@ -69,12 +70,15 @@ function openDialog({
   okText = '确定',
   cancelText = '取消',
   danger = false,
+  dismissValue,
 }) {
   closeActiveDialog();
 
   return new Promise((resolve) => {
     const previousFocus = document.activeElement;
     const isPrompt = mode === 'prompt';
+    const resolvedDismiss =
+      dismissValue !== undefined ? dismissValue : isPrompt ? null : false;
 
     els.dialogTitle.textContent = title;
     els.dialogMessage.textContent = message;
@@ -116,16 +120,19 @@ function openDialog({
     const onCancel = () => {
       finish(isPrompt ? null : false);
     };
+    const onDismiss = () => {
+      finish(resolvedDismiss);
+    };
     const onBackdrop = (event) => {
       if (event.target === els.dialogModal) {
-        onCancel();
+        onDismiss();
       }
     };
     const onKeyDown = (event) => {
       if (event.key === 'Escape') {
         event.preventDefault();
         event.stopPropagation();
-        onCancel();
+        onDismiss();
       } else if (event.key === 'Enter' && document.activeElement !== els.dialogCancel) {
         event.preventDefault();
         event.stopPropagation();
@@ -133,7 +140,7 @@ function openDialog({
       }
     };
 
-    activeDialogCancel = onCancel;
+    activeDialogCancel = onDismiss;
     els.dialogOk.addEventListener('click', onOk);
     els.dialogCancel.addEventListener('click', onCancel);
     els.dialogModal.addEventListener('click', onBackdrop);
@@ -154,6 +161,10 @@ function uiConfirm(message, opts = {}) {
   return openDialog({ mode: 'confirm', message, ...opts });
 }
 
+function uiChoice(message, opts = {}) {
+  return openDialog({ mode: 'confirm', message, dismissValue: null, ...opts });
+}
+
 function uiPrompt(message, defaultValue = '', opts = {}) {
   return openDialog({ mode: 'prompt', message, defaultValue, ...opts });
 }
@@ -165,8 +176,16 @@ function clearPreviewTimer() {
   }
 }
 
+function clearLocalEdits() {
+  state.dirty.clear();
+  state.invalidInputs.clear();
+  state.rawInputs.clear();
+  state.rawDirty = false;
+}
+
 function dirtyCount() {
-  return state.dirty.size + (state.rawDirty ? 1 : 0);
+  const modified = new Set([...state.dirty.keys(), ...state.invalidInputs.keys()]);
+  return modified.size + (state.rawDirty ? 1 : 0);
 }
 
 function escapeControlChars(value) {
@@ -252,10 +271,12 @@ async function loadAll() {
     // 注意：这里**不能** state.dirty.clear()。
     // 设置窗口在 await 期间仍然可交互，清空会把用户刚输入的内容吞掉；
     // 丢弃修改只应该在 reloadOnShow 的确认框里显式发生。
-    state.invalidInputs.clear();
     pruneDirty();
 
     els.configPath.textContent = raw.path || '（内置默认配置，首次保存时创建）';
+    if (schema?.warning) {
+      showError(schema.warning);
+    }
     renderProfileBar();
     renderNav();
     renderContent();
@@ -283,6 +304,12 @@ function pruneDirty() {
   for (const path of [...state.dirty.keys()]) {
     if (!known.has(path)) state.dirty.delete(path);
   }
+  for (const path of [...state.invalidInputs.keys()]) {
+    if (!known.has(path)) state.invalidInputs.delete(path);
+  }
+  for (const path of [...state.rawInputs.keys()]) {
+    if (!known.has(path)) state.rawInputs.delete(path);
+  }
 }
 
 async function refreshSchemaOnly(preferredProfile) {
@@ -302,11 +329,15 @@ async function refreshSchemaOnly(preferredProfile) {
     state.rawText = raw.text || '';
   }
   els.configPath.textContent = raw.path || '（内置默认配置，首次保存时创建）';
+  if (schema?.warning) {
+    showError(schema.warning);
+  }
   state.sources = deepClone(sources.sources || []);
   state.originalSourcesJson = JSON.stringify(state.sources);
   state.devices = devices.devices || [];
   state.languages = languages.options || [];
   state.invalidInputs.clear();
+  state.rawInputs.clear();
   renderContent();
 }
 
@@ -378,9 +409,7 @@ async function switchProfile(name) {
   try {
     const result = await invoke('switch_profile', { name });
     // 旧配置档的未保存编辑不能带进新配置档
-    state.dirty.clear();
-    state.invalidInputs.clear();
-    state.rawDirty = false;
+    clearLocalEdits();
     await refreshSchemaOnly(name);
     updateDirtyIndicator();
     setStatus(result.message || '已切换配置档', 'ok');
@@ -398,14 +427,15 @@ async function createProfile() {
     okText: '下一步',
   });
   if (!name) return;
-  const copyCurrent = await uiConfirm(
-    '是否复制当前配置作为新配置档的初始内容？\n（选择「创建默认」则使用内置默认配置）',
+  const copyCurrent = await uiChoice(
+    '是否复制当前配置作为新配置档的初始内容？\n（选择「创建默认」则使用内置默认配置，按 Esc 取消创建）',
     {
       title: '初始配置来源',
       okText: '复制当前配置',
       cancelText: '创建默认',
     },
   );
+  if (copyCurrent === null) return;
   try {
     await invoke('create_profile', { name, copyCurrent });
     const [profiles, raw] = await Promise.all([invoke('get_profiles'), invoke('get_config_raw')]);
@@ -475,9 +505,7 @@ async function deleteProfile() {
     clearPreviewTimer();
     try {
       await invoke('switch_profile', { name: fallback });
-      state.dirty.clear();
-      state.invalidInputs.clear();
-      state.rawDirty = false;
+      clearLocalEdits();
       await invoke('delete_profile', { name });
       await loadAll();
       setStatus(`已切换回「${fallback}」并删除配置档「${name}」`, 'ok');
@@ -510,7 +538,6 @@ function switchToGroup(groupId) {
   const groups = state.schema?.groups || [];
   if (!groups.some((group) => group.id === groupId)) return;
   state.currentGroup = groupId;
-  state.invalidInputs.clear();
   els.search.value = '';
   renderNav();
   renderContent();
@@ -663,13 +690,17 @@ function renderField(field) {
 function renderControl(field, value) {
   const path = escapeHtml(field.path);
   if (Array.isArray(value)) {
+    const rawValues = state.rawInputs.get(field.path);
     return value
-      .map(
-        (item, index) =>
-          `<input type="number" class="array-input" data-path="${path}" data-array-index="${index}" step="0.01" value="${escapeHtml(
-            item,
-          )}" />`,
-      )
+      .map((item, index) => {
+        const displayItem =
+          Array.isArray(rawValues) && index < rawValues.length ? rawValues[index] : item;
+        const invalidClass =
+          state.invalidInputs.has(field.path) && displayItem === '' ? ' invalid' : '';
+        return `<input type="number" class="array-input${invalidClass}" data-path="${path}" data-array-index="${index}" step="0.01" value="${escapeHtml(
+          displayItem,
+        )}" />`;
+      })
       .join('');
   }
   switch (field.kind) {
@@ -677,12 +708,17 @@ function renderControl(field, value) {
       return `<input type="checkbox" data-path="${path}" ${value ? 'checked' : ''} />`;
     case 'int':
     case 'float':
-    case 'number':
-      return `<input type="number" data-path="${path}" value="${escapeHtml(value)}" ${
+    case 'number': {
+      const displayValue = state.rawInputs.has(field.path)
+        ? state.rawInputs.get(field.path)
+        : value;
+      const invalidAttr = state.invalidInputs.has(field.path) ? ' class="invalid"' : '';
+      return `<input type="number"${invalidAttr} data-path="${path}" value="${escapeHtml(displayValue)}" ${
         field.min != null ? `min="${field.min}"` : ''
       } ${field.max != null ? `max="${field.max}"` : ''} ${
         field.step != null ? `step="${field.step}"` : ''
       } />`;
+    }
     case 'secret':
       // 默认遮蔽：密钥不该在不经意间被旁人/录屏看到
       return `<input type="password" data-path="${path}" value="${escapeHtml(value)}" spellcheck="false" autocomplete="off" />
@@ -1025,7 +1061,7 @@ function renderRawGroup() {
 }
 
 async function saveRawConfig() {
-  if (state.dirty.size > 0) {
+  if (state.dirty.size > 0 || state.invalidInputs.size > 0) {
     const confirmed = await uiConfirm(
       '保存原始 TOML 将覆盖其它分组尚未保存的表单修改，继续？',
       { title: '覆盖未保存修改', okText: '继续保存', danger: true },
@@ -1040,9 +1076,7 @@ async function saveRawConfig() {
   els.save.disabled = true;
   try {
     const result = await invoke('save_config_raw', { text: state.rawText });
-    state.dirty.clear();
-    state.invalidInputs.clear();
-    state.rawDirty = false;
+    clearLocalEdits();
     showError('');
     if (result.restart_required) {
       els.restartBanner.classList.remove('hidden');
@@ -1099,14 +1133,18 @@ function bindFieldEvents() {
         const inputs = Array.from(
           els.content.querySelectorAll(`[data-path="${CSS.escape(path)}"][data-array-index]`),
         );
-        if (inputs.some((input) => input.validity && input.validity.badInput)) {
-          state.invalidInputs.set(path, findField(path)?.label || path);
-          updateDirtyIndicator();
-          return;
-        }
-        state.invalidInputs.delete(path);
         const values = inputs.map((input) => input.value);
-        if (values.some((raw) => raw === '')) {
+        const hasBad = inputs.some(
+          (input) => (input.validity && input.validity.badInput) || input.value === '',
+        );
+        inputs.forEach((input) => {
+          input.classList.toggle(
+            'invalid',
+            Boolean((input.validity && input.validity.badInput) || input.value === ''),
+          );
+        });
+        if (hasBad) {
+          state.rawInputs.set(path, values);
           state.invalidInputs.set(path, findField(path)?.label || path);
           if (state.dirty.delete(path)) {
             schedulePreview(path);
@@ -1114,17 +1152,16 @@ function bindFieldEvents() {
           updateDirtyIndicator();
           return;
         }
+        state.rawInputs.delete(path);
+        state.invalidInputs.delete(path);
         value = values.map(Number);
       } else if (element.type === 'checkbox') {
         value = element.checked;
       } else if (element.type === 'number') {
-        if (element.validity && element.validity.badInput) {
-          state.invalidInputs.set(path, findField(path)?.label || path);
-          updateDirtyIndicator();
-          return;
-        }
-        // 清空数字输入框时不能静默忽略，否则用户点保存会误以为改动已生效
-        if (element.value === '') {
+        // 清空或非法数字输入框时持久记录在 rawInputs/invalidInputs，切换分组或搜索也不会静默复原通过保存
+        if ((element.validity && element.validity.badInput) || element.value === '') {
+          element.classList.add('invalid');
+          state.rawInputs.set(path, '');
           state.invalidInputs.set(path, findField(path)?.label || path);
           if (state.dirty.delete(path)) {
             schedulePreview(path);
@@ -1132,6 +1169,8 @@ function bindFieldEvents() {
           updateDirtyIndicator();
           return;
         }
+        element.classList.remove('invalid');
+        state.rawInputs.delete(path);
         state.invalidInputs.delete(path);
         value = Number(element.value);
       } else {
@@ -1298,7 +1337,12 @@ function validateNumbers(changes) {
 }
 
 async function save() {
-  if (state.currentGroup === 'advanced' && state.rawDirty && state.dirty.size === 0) {
+  if (
+    state.currentGroup === 'advanced' &&
+    state.rawDirty &&
+    state.dirty.size === 0 &&
+    state.invalidInputs.size === 0
+  ) {
     await saveRawConfig();
     return;
   }
@@ -1330,9 +1374,7 @@ async function save() {
       setStatus('保存失败', 'err');
       return;
     }
-    state.dirty.clear();
-    state.invalidInputs.clear();
-    state.rawDirty = false;
+    clearLocalEdits();
     state.originalSourcesJson = JSON.stringify(state.sources);
     setStatus(result.message || '已保存', 'ok');
     showError('');
@@ -1357,9 +1399,7 @@ async function save() {
 
 async function cancel() {
   clearPreviewTimer();
-  state.dirty.clear();
-  state.invalidInputs.clear();
-  state.rawDirty = false;
+  clearLocalEdits();
   state.sources = JSON.parse(state.originalSourcesJson);
   try {
     await invoke('cancel_preview');
@@ -1390,9 +1430,7 @@ async function reload() {
     }
   }
   clearPreviewTimer();
-  state.dirty.clear();
-  state.invalidInputs.clear();
-  state.rawDirty = false;
+  clearLocalEdits();
   await invoke('cancel_preview').catch(() => {});
   try {
     const result = await invoke('reload_config');
@@ -1419,7 +1457,6 @@ function bindTopbar() {
   );
 
   els.search.addEventListener('input', () => {
-    state.invalidInputs.clear();
     renderContent();
   });
   els.save.addEventListener('click', save);
@@ -1441,15 +1478,13 @@ async function reloadOnShow() {
   const count = dirtyCount();
   let keptDirty = false;
   if (count > 0) {
-    const keep = await uiConfirm(`当前有 ${count} 项未保存的修改，是否保留并继续编辑？`, {
+    const choice = await uiChoice(`当前有 ${count} 项未保存的修改，是否保留并继续编辑？`, {
       title: '未保存的修改',
       okText: '保留修改',
       cancelText: '丢弃并重新加载',
     });
-    if (!keep) {
-      state.dirty.clear();
-      state.invalidInputs.clear();
-      state.rawDirty = false;
+    if (choice === false) {
+      clearLocalEdits();
     } else {
       keptDirty = true;
     }

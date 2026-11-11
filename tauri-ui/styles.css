@@ -47,6 +47,7 @@ body {
   border: 1px solid rgba(255, 255, 255, 0.1);
   backdrop-filter: blur(10px);
   /* 鼠标移出时收起；用 margin 而非父容器 gap，方便一次性折叠干净 */
+  flex-shrink: 0;
   overflow: hidden;
   max-height: 160px;
   transition:
@@ -58,7 +59,8 @@ body {
 }
 
 .toolbar:not(.collapsed) {
-  max-height: min(160px, calc(100vh - 20px));
+  /* 紧凑窗口（如 window_height = 80..150）悬停展开时限制工具栏最大高度，给字幕面板留出可见空间 */
+  max-height: min(160px, max(32px, calc(100vh - 68px)));
   overflow-y: auto;
 }
 
@@ -152,6 +154,7 @@ body {
 
 .subtitle-panel {
   flex: 1;
+  min-height: 0;
   display: flex;
   align-items: center;
   justify-content: center;

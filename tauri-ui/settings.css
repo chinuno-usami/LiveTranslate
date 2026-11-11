@@ -86,6 +86,11 @@ textarea:focus {
   border-color: var(--accent);
 }
 
+input.invalid,
+input.invalid:focus {
+  border-color: var(--danger);
+}
+
 /* 焦点可见性：上面统一 outline: none 后，button 必须显式补回焦点环 */
 button:focus-visible,
 .btn:focus-visible,
