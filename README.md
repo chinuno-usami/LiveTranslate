@@ -491,7 +491,7 @@ export ORT_DYLIB_PATH=/path/to/libonnxruntime.dylib
 Silero VAD 初始化失败，已回退到能量 VAD：未找到 ONNX Runtime 动态库…
 ```
 
-如果不想要这个后端，可以用 `--no-default-features` 重新构建（去掉 `silero-vad`）。
+如果不想要这个后端，可以用 `--no-default-features --features custom-protocol` 重新构建（去掉 `silero-vad`，同时保留桌面端前端静态资源内嵌）。
 
 ### 调参建议
 

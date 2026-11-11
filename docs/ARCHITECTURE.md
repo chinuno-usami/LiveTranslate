@@ -18,8 +18,7 @@ livetranslate/
 ├── PLAN.md                         # 技术方案文档
 │
 ├── config/
-│   ├── default.toml               # 开发默认配置
-│   └── config.example.toml        # 随包示例配置
+│   └── default.toml               # 开发与内置默认配置（打包脚本据此生成随包 config.example.toml）
 │
 ├── tauri-ui/                      # 静态前端（无前端打包链）
 │   ├── index.html / styles.css / app.js          # 桌面透明字幕浮窗
@@ -73,114 +72,79 @@ livetranslate/
 
 ### 1. audio/capture.rs - 音频采集
 
-**职责**：从 Windows 音频设备采集音频流
+**职责**：跨平台采集麦克风与系统回环（WASAPI Loopback）音频流
 
 **关键特性**：
-- 使用 `cpal` 库进行跨平台音频采集
-- 支持多种采样格式（F32、I16、U16）自动转换
-- 异步数据推送通过 tokio mpsc 通道
-- 支持设备枚举和选择
+- 使用 `cpal` 进行麦克风采集，Windows 下额外提供 WASAPI Loopback 系统回环采集
+- 支持多种采样格式（F32、I16、U16）自动转换与单声道下混重采样（`audio/resample.rs`）
+- 异步数据推送通过 tokio mpsc 通道，停止时析构流句柄立即释放硬件占用
 
 **关键函数**：
 ```rust
 pub fn list_devices() -> AppResult<Vec<DeviceInfo>>
-pub async fn new(device_name: &str, sample_rate: u32, channels: u16) -> AppResult<Self>
+pub fn new(device_spec: &str, sample_rate: u32, channels: u16) -> AppResult<Self>
 pub async fn next_chunk(&mut self) -> Option<Vec<f32>>
 ```
 
-### 2. audio/chunker.rs - 音频分片
+### 2. audio/{detector,vad,silero,chunker}.rs - 语音活动检测与分段
 
-**职责**：将连续音频流切分为固定大小的块
+**职责**：按自然语段切分连续音频流（VAD 优先，固定时长分片回退）
 
 **关键特性**：
-- 支持固定分片长度（默认 2 秒）
-- 支持重叠处理（25% 重叠 = 300-500ms）
-- 静音检测和过滤
-- 缓冲区管理
-
-**关键算法**：
-```
-输入: 连续 PCM 流
-→ 缓存到缓冲区
-→ 当缓冲区 >= chunk_samples 时提取一个分片
-→ 检查是否静音
-  ├─ 是: 跳过
-  └─ 否: 进行 ASR
-```
+- 默认启用 VAD（`SpeechSegmenter`）：支持 `silero`（ONNX Runtime 动态加载 Silero VAD v6.2）与 `energy`（自适应噪声底能量阈值）双后端，初始化失败自动回退到能量 VAD
+- 关闭 VAD 时回退到 `AudioChunker`（固定分片长度 + 25% 重叠 + 能量静音过滤 + 相邻片段文本去重）
 
 ### 3. audio/wav.rs - WAV 编码
 
-**职责**：将 f32 PCM 数据编码为 WAV 格式
+**职责**：将 f32 PCM 数据编码为 16-bit 单声道 WAV 格式
 
 **处理流程**：
 - f32 样本（范围 -1.0 到 1.0）→ i16（范围 -32768 到 32767）
-- 添加 WAV 头部信息
-- 返回完整的 WAV 二进制数据
+- 添加标准 RIFF/WAV 头部，供语音识别接口直接消费
 
-### 4. asr/mod.rs - 语音识别客户端
+### 4. asr/{mod,edge,languages}.rs - 语音识别客户端
 
-**职责**：调用本地 Whisper 兼容 API 进行识别
-
-**请求流程**：
-```
-WAV 数据
-→ multipart/form-data 编码
-→ POST 到 {base_url}{request_path}
-  参数: file, model, language
-→ JSON 响应解析
-→ 返回识别文本
-```
+**职责**：调用自建 Whisper 兼容 API 或微软 Edge 在线识别服务
 
 **关键特性**：
-- 可配置 API base_url（不限于 localhost）
-- 支持自定义请求路径
-- 请求超时控制
-- 错误处理和日志
+- `whisper` 后端：`multipart/form-data` POST 到 `{base_url}{request_path}`，兼容 faster-whisper-server / whisper.cpp / OpenAI
+- `edge` 后端：免部署在线语音识别，按后端规范化语言代码（`asr/languages.rs`）
+- 内置静音/常见幻听短语过滤（`filter_hallucination`）
 
 ### 5. translate/mod.rs - 翻译客户端
 
-**职责**：调用 OpenAI 兼容 API 进行翻译
+**职责**：调用 OpenAI 兼容 Chat Completions API 进行翻译
 
-**请求流程**：
-```
-识别文本
-→ 构造 Chat API 请求
-  ├─ system: 翻译提示词
-  └─ user: "Translate to {target_lang}: {text}"
-→ POST 到 {base_url}/chat/completions
-  Header: Authorization: Bearer {api_key}
-→ JSON 响应解析
-→ 返回翻译文本
+**关键特性**：
+- 兼容 OpenAI / DeepSeek / 本地推理服务，支持 `extra_body` 扩展参数透传
+- 自动剥离推理模型 `<think>...</think>` 思考块，支持全局与单源独立的翻译开关
+
+### 6. subtitle/mod.rs - 多源字幕管理
+
+**职责**：维护多输入源滚动字幕历史与来源标识格式化
+
+**核心结构**：
+```rust
+pub struct SubtitleLine {
+    pub source_id: String,
+    pub label: String,
+    pub source: String,
+    pub translated: String,
+}
+
+pub struct DisplayLine {
+    pub source_id: String,
+    pub label: Option<String>,
+    pub source: String,
+    pub translated: String,
+    pub lines: Vec<String>,
+    pub text: String,
+}
 ```
 
 **关键特性**：
-- OpenAI API 完全兼容
-- 支持 Azure OpenAI、LocalAI 等
-- 可配置目标语言和提示词
-- 温度参数设置为 0.2（降低幻觉）
-
-### 6. subtitle/mod.rs - 字幕管理
-
-**职责**：维护字幕历史和滚动显示
-
-**数据结构**：
-```rust
-pub struct Subtitle {
-    pub source: String,      // 原文
-    pub translated: String,  // 译文
-}
-
-pub struct SubtitleState {
-    history: VecDeque<Subtitle>,  // FIFO 字幕队列
-    max_lines: usize,             // 最多显示行数
-    show_source: bool,            // 是否显示原文
-}
-```
-
-**关键方法**：
-- `push(subtitle)` - 添加新字幕，自动维持最多 max_lines 条
-- `get_text()` - 获取当前显示文本
-- `clear()` - 清空历史
+- 保留各输出（桌面浮窗 / SteamVR / OSC）所需的最大历史窗口
+- `LabelMode`（`Auto` / `Always` / `Never`）在多源并发或历史混排时自动附加 `[来源]` 标签
 
 ### 7. config/ - 配置管理与多配置档
 
@@ -205,84 +169,46 @@ pub struct AppConfig {
 4. 系统用户配置目录的 `config.toml`（不存在则自动生成默认配置；损坏则隔离备份并恢复）
 5. 程序内置默认值（`AppConfig::default()`）
 
-### 8. app.rs - 应用核心
+### 8. app.rs & output/ - 多源流水线与统一输出层
 
-**职责**：协调各个模块，管理数据流
-
-**主循环流程**：
-```
-启动 → 初始化音频采集 → 后台异步处理循环
-       
-后台循环：
-  1. 接收音频块 (from AudioCapture)
-  2. 缓冲到 AudioChunker
-  3. 当有完整分片时：
-     ├─ 检查静音 → 跳过
-     └─ 编码为 WAV
-        ├─ 调用 ASR（Whisper）
-        │  ├─ 失败 → 记录错误，继续
-        │  └─ 成功 → 获取识别文本
-        │     └─ 调用翻译（OpenAI）
-        │        ├─ 失败 → 记录错误，继续
-        │        └─ 成功 → 创建 Subtitle 对象
-        │           └─ 通过 mpsc 通道发送
-  4. 循环...
-
-主线程：
-  接收 Subtitle 通道消息 → 打印日志
-```
+**职责**：每路启用输入源独立运行 `run_source`，汇总事件后分发到桌面与 VR 输出
 
 ## 🔄 数据流
 
 ```
-┌──────────────────────────┐
-│    Windows Audio Input    │
-│  (Microphone/Loopback)    │
-└────────────┬─────────────┘
-             │ PCM f32 samples
-             ▼
-        ┌─────────────┐
-        │AudioCapture │
-        └────┬────────┘
-             │ Vec<f32> chunks
-             ▼
-      ┌────────────────┐
-      │ AudioChunker   │
-      │  - Buffer      │
-      │  - Chunk       │
-      │  - Silence Det │
-      └────┬───────────┘
-           │ Vec<f32> frames
-           ▼
-    ┌──────────────────┐
-    │  WAV Encoding    │
-    └────┬─────────────┘
-         │ Vec<u8> (WAV)
-         ▼
-   ┌──────────────────────────────┐
-   │  Whisper HTTP API :8765      │
-   │  POST /v1/audio/transcriptions│
-   └────┬─────────────────────────┘
-        │ text (识别结果)
-        ▼
-  ┌──────────────────────────────┐
-  │  OpenAI Chat Completions API │
-  │  POST /v1/chat/completions   │
-  └────┬─────────────────────────┘
-       │ text (翻译结果)
-       ▼
-  ┌──────────────────┐
-  │  Subtitle {      │
-  │    source,       │
-  │    translated    │
-  │  }               │
-  └────┬─────────────┘
-       │ mpsc channel
-       ▼
-  ┌──────────────────┐
-  │   Main Thread    │
-  │  (Console/UI)    │
-  └──────────────────┘
+┌────────────────────────────┐
+│  多路音频输入源 (1..N)      │
+│  Microphone / Loopback     │
+└─────────────┬──────────────┘
+              │ 每源独立 run_source 任务
+              ▼
+   ┌──────────────────────┐
+   │ AudioCapture + 重采样 │
+   └──────────┬───────────┘
+              ▼
+   ┌──────────────────────┐
+   │ SpeechSegmenter(VAD) │
+   │  / AudioChunker 回退 │
+   └──────────┬───────────┘
+              │ 语段队列 (utterance mpsc)
+              ▼
+   ┌──────────────────────┐
+   │ ASR (Whisper / Edge) │
+   │ + 可选 LLM 翻译      │
+   └──────────┬───────────┘
+              │ PipelineEvent::Subtitle
+              ▼
+   ┌──────────────────────┐
+   │    SubtitleState     │
+   │ (多源历史与标签排版) │
+   └────┬─────────┬───────┘
+        │         └──────────────────────────┐
+        ▼                                    ▼
+┌───────────────────┐            ┌───────────────────────┐
+│ Tauri 桌面透明浮窗 │            │     OutputManager     │
+│  (subtitle://...) │            │ ├─ SteamVR Overlay    │
+└───────────────────┘            │ └─ VRChat OSC Chatbox │
+                                 └───────────────────────┘
 ```
 
 ## 🔑 关键设计决策
