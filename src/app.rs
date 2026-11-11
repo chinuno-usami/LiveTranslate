@@ -343,8 +343,19 @@ async fn process_segment(
 
             tracing::debug!("[{}] Recognized text: {}", label, text);
 
+            // 先按原文去重/去重叠，再翻译：固定分片有 overlap 时若先翻译会得到重复译文碎片
+            if processor.is_duplicate(&text, "") {
+                tracing::debug!("Duplicate subtitle detected, skipping");
+                return Ok(true);
+            }
+            let (clean_text, _) = processor.deduplicate_overlap(&text, "");
+            if clean_text.trim().is_empty() {
+                tracing::debug!("Subtitle empty after overlap removal, skipping");
+                return Ok(true);
+            }
+
             let translated = if translate_enabled {
-                match translator.translate(&text).await {
+                match translator.translate(&clean_text).await {
                     Ok(translated) => translated,
                     Err(e) => {
                         tracing::error!("Translation failed: {}", e);
@@ -358,29 +369,21 @@ async fn process_segment(
                 String::new()
             };
 
-            if processor.is_duplicate(&text, &translated) {
-                tracing::debug!("Duplicate subtitle detected, skipping");
-            } else {
-                let (clean_text, clean_trans) = processor.deduplicate_overlap(&text, &translated);
+            {
+                processor.record(&clean_text, &translated);
 
-                if clean_text.is_empty() {
-                    tracing::debug!("Subtitle empty after overlap removal, skipping");
-                } else {
-                    processor.record(&text, &translated);
-
-                    if tx
-                        .send(PipelineEvent::Subtitle(SubtitleLine::new(
-                            source_id,
-                            label,
-                            clean_text,
-                            clean_trans,
-                        )))
-                        .await
-                        .is_err()
-                    {
-                        tracing::warn!("Subtitle receiver dropped, stopping pipeline");
-                        return Ok(false);
-                    }
+                if tx
+                    .send(PipelineEvent::Subtitle(SubtitleLine::new(
+                        source_id,
+                        label,
+                        clean_text,
+                        translated,
+                    )))
+                    .await
+                    .is_err()
+                {
+                    tracing::warn!("Subtitle receiver dropped, stopping pipeline");
+                    return Ok(false);
                 }
             }
         }

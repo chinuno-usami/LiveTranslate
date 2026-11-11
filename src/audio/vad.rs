@@ -58,8 +58,19 @@ impl EnergyVad {
         if frame.is_empty() {
             return -100.0;
         }
-        let sum_sq: f32 = frame.iter().map(|s| s * s).sum();
-        let rms = (sum_sq / frame.len() as f32).sqrt();
+        // 过滤驱动异常吐出的 NaN/Inf，避免污染噪声底滑动窗口
+        let mut count = 0usize;
+        let mut sum_sq = 0.0f32;
+        for &sample in frame {
+            if sample.is_finite() {
+                sum_sq += sample * sample;
+                count += 1;
+            }
+        }
+        if count == 0 {
+            return -100.0;
+        }
+        let rms = (sum_sq / count as f32).sqrt();
         20.0 * rms.max(1e-7).log10()
     }
 
@@ -126,6 +137,16 @@ mod tests {
         (0..len)
             .map(|i| amplitude * (2.0 * std::f32::consts::PI * freq * i as f32 / sample_rate).sin())
             .collect()
+    }
+
+    #[test]
+    fn frame_db_ignores_non_finite_samples() {
+        let mixed = [0.25, f32::NAN, f32::INFINITY, -0.25];
+        let clean = [0.25, -0.25];
+        let db_mixed = EnergyVad::frame_db(&mixed);
+        let db_clean = EnergyVad::frame_db(&clean);
+        assert!((db_mixed - db_clean).abs() < 1e-3);
+        assert!(EnergyVad::frame_db(&[f32::NAN, f32::INFINITY]) <= -99.0);
     }
 
     #[test]

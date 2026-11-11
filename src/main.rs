@@ -238,7 +238,17 @@ impl SourceRegistry {
     fn mark_all_stopped(&mut self) {
         for runtime in &mut self.runtimes {
             runtime.running = false;
-            if runtime.enabled {
+            if !runtime.enabled {
+                continue;
+            }
+            // 保留跳过/失败等具体原因，避免被统一改成「已停止」后无法排查
+            let keep = runtime.message.contains("跳过")
+                || runtime.message.starts_with("已停止:")
+                || runtime.message.starts_with("超出")
+                || runtime.message.contains("失败")
+                || runtime.message.contains("中断")
+                || runtime.message.contains("错误");
+            if !keep {
                 runtime.message = "已停止".to_string();
             }
         }
@@ -308,6 +318,8 @@ pub(crate) struct SharedState {
     shutdown_done: AtomicBool,
     /// 浮窗拖动位置持久化的防抖序号
     move_seq: AtomicU64,
+    /// 设置页预览世代：cancel / 关窗 / 保存时递增，用于丢弃在途的 preview_settings
+    preview_epoch: AtomicU64,
     /// 全局语言
     language_tx: watch::Sender<String>,
     _language_rx: watch::Receiver<String>,
@@ -393,6 +405,7 @@ impl SharedState {
             shutdown_lock: Mutex::new(()),
             shutdown_done: AtomicBool::new(false),
             move_seq: AtomicU64::new(0),
+            preview_epoch: AtomicU64::new(0),
             language_tx,
             _language_rx: language_rx,
             translate_tx,
@@ -504,23 +517,23 @@ impl SharedState {
 
 /// 切换窗口点击穿透，并同步到前端、持久配置与托盘
 pub(crate) fn toggle_click_through(app: &AppHandle) {
-    let state = app.state::<Arc<SharedState>>();
-    let new_value = !state.click_through.load(Ordering::SeqCst);
-    apply_click_through(app, new_value);
-
-    // 必须写回配置：否则下一次 apply_window_config（窗口尺寸变化时）
-    // 会用配置里的旧值把穿透改回去，而前端仍然显示“穿透开”。
-    let state = state.inner().clone();
+    // 必须在 config_update 锁内读改写：连续快捷键两次时，若先改窗口再异步落盘，
+    // 两个任务会抢到相同的旧值导致窗口与配置/工具栏状态反了。
+    let state = app.state::<Arc<SharedState>>().inner().clone();
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
         match state
             .update_and_persist_config(&app, |config| {
+                let new_value = !config.subtitle.click_through;
                 config.subtitle.click_through = new_value;
                 Ok(vec![("subtitle.click_through", new_value.into())])
             })
             .await
         {
-            Ok(config) => emit_config(&app, &config),
+            Ok(config) => {
+                apply_click_through(&app, config.subtitle.click_through);
+                emit_config(&app, &config);
+            }
             Err(e) => tracing::warn!("切换点击穿透失败: {e}"),
         }
     });
@@ -1318,18 +1331,24 @@ async fn set_translate_enabled(
     state: State<'_, Arc<SharedState>>,
     enabled: bool,
 ) -> Result<(), String> {
-    let config = state
-        .update_and_persist_config(&app, |config| {
-            config.translate.enabled = enabled;
-            Ok(vec![("translate.enabled", enabled.into())])
-        })
-        .await?;
+    // 持有 config_update 直至运行态 watch/registry 同步完成，避免与 save_settings 交错覆盖
+    let _guard = state.config_update.lock().await;
+    let mut config = state.config();
+    config.translate.enabled = enabled;
+    config.validate()?;
+    state.set_config(config.clone());
+    persist_or_report(
+        &app,
+        state.inner(),
+        &[("translate.enabled", enabled.into())],
+    );
     let _ = state.translate_tx.send(enabled);
     {
         let mut registry = state.sources.lock().await;
         registry.set_translate_all(enabled);
     }
     emit_config(&app, &config);
+    drop(_guard);
     emit_source_status(&app, &state).await;
     tracing::info!(
         "Mode set to: {}",
@@ -1731,6 +1750,7 @@ async fn save_settings(
 ) -> Result<SaveResult, String> {
     // 与 mutate_sources / switch_profile 用同一把锁，避免与浮窗热更新命令互相覆盖。
     // 锁顺序固定为 lifecycle -> config_update，不存在反向嵌套。
+    state.preview_epoch.fetch_add(1, Ordering::SeqCst);
     let _lifecycle = state.lifecycle.lock().await;
     let _config_guard = state.config_update.lock().await;
     let was_degraded = state.is_config_degraded();
@@ -1774,7 +1794,12 @@ async fn preview_settings(
     state: State<'_, Arc<SharedState>>,
     changes: Vec<SettingChange>,
 ) -> Result<(), String> {
+    let epoch = state.preview_epoch.load(Ordering::SeqCst);
     let _config_guard = state.config_update.lock().await;
+    // 在途请求若在排队期间已被 cancel/关窗/保存作废，直接丢弃
+    if state.preview_epoch.load(Ordering::SeqCst) != epoch {
+        return Ok(());
+    }
     // 若设置窗已在 IPC 飞行期间关闭隐藏，直接丢弃迟到的预览请求，避免覆盖 cancel_preview 回滚结果
     if let Some(window) = app.get_window("settings") {
         if !window.is_visible().unwrap_or(false) {
@@ -1785,14 +1810,13 @@ async fn preview_settings(
     let (mut preview, _) = state.settings_base_config();
     apply_settings_changes(&mut preview, &changes)?;
     preview.validate()?;
-    state.outputs.apply_config(&preview.output).await;
+    // 预览只动桌面浮窗视觉与字幕展示开关，不触碰 OSC/SteamVR（避免未保存就连 VR / 发包）
+    // 也不下调 history max_lines，否则预览期间新字幕会永久裁掉历史。
     {
         let mut subtitle_state = state.subtitle_state.lock().await;
-        subtitle_state.set_max_lines(history_limit(&preview));
         subtitle_state.set_show_source(preview.subtitle.show_source);
         subtitle_state.set_label_mode(preview.subtitle.label_sources);
     }
-    publish_subtitle_snapshot(&state).await;
     // 仅覆盖纯视觉预览字段，不伪造点击穿透、翻译开关、识别语言等运行态按钮状态
     let mut payload = OverlayConfigPayload::from_config(&saved);
     payload.font_size = preview.subtitle.font_size;
@@ -1805,7 +1829,6 @@ async fn preview_settings(
     payload.label_sources = preview.subtitle.label_sources.as_str().to_string();
     let _ = app.emit_all(CONFIG_EVENT, payload);
     emit_subtitle_with_config(&app, &state, &preview).await;
-    emit_output_status(&app, &state);
     Ok(())
 }
 
@@ -1816,19 +1839,18 @@ async fn cancel_preview(app: AppHandle, state: State<'_, Arc<SharedState>>) -> R
 
 /// 撤销实时预览（也用于设置窗口关闭时，避免运行态与配置长期不一致）
 async fn cancel_preview_impl(app: AppHandle, state: Arc<SharedState>) -> Result<(), String> {
+    // 先作废在途 preview_settings，再恢复，避免迟到的预览盖回滚结果
+    state.preview_epoch.fetch_add(1, Ordering::SeqCst);
     let _config_guard = state.config_update.lock().await;
     let config = state.config();
-    state.outputs.apply_config(&config.output).await;
     {
         let mut subtitle_state = state.subtitle_state.lock().await;
         subtitle_state.set_max_lines(history_limit(&config));
         subtitle_state.set_show_source(config.subtitle.show_source);
         subtitle_state.set_label_mode(config.subtitle.label_sources);
     }
-    publish_subtitle_snapshot(&state).await;
     emit_config(&app, &config);
     emit_subtitle_with_config(&app, &state, &config).await;
-    emit_output_status(&app, &state);
     Ok(())
 }
 
@@ -1846,10 +1868,12 @@ async fn save_config_raw(
     let parsed = AppConfig::from_str(&text).map_err(|e| e.to_string())?;
     parsed.validate()?;
     let (cap_steamvr, cap_osc) = output::capabilities();
-    if !cap_steamvr && parsed.output.steamvr.enabled && !old.output.steamvr.enabled {
+    // 降级态下内存 old 可能是默认值；能力门禁应对齐设置页基线（磁盘可修复配置）
+    let (baseline, _) = state.settings_base_config();
+    if !cap_steamvr && parsed.output.steamvr.enabled && !baseline.output.steamvr.enabled {
         return Err("当前构建为标准版，未包含 SteamVR 支持，请下载 Full 版".to_string());
     }
-    if !cap_osc && parsed.output.osc.enabled && !old.output.osc.enabled {
+    if !cap_osc && parsed.output.osc.enabled && !baseline.output.osc.enabled {
         return Err("当前构建为标准版，未包含 OSC 支持，请下载 Full 版".to_string());
     }
     let new = writer::save_raw(&path, &text)?;
@@ -1964,6 +1988,16 @@ fn require_profile_path(state: &SharedState) -> Result<PathBuf, String> {
     Ok(path)
 }
 
+fn reject_if_config_degraded(state: &SharedState) -> Result<(), String> {
+    if state.is_config_degraded() {
+        return Err(
+            "当前配置文件存在待修复项并处于回退保护状态，请先在「设置」中修复并保存"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
 #[tauri::command]
 async fn create_profile(
     state: State<'_, Arc<SharedState>>,
@@ -1971,6 +2005,7 @@ async fn create_profile(
     copy_current: bool,
 ) -> Result<(), String> {
     let _config_guard = state.config_update.lock().await;
+    reject_if_config_degraded(&state)?;
     let path = require_profile_path(&state)?;
     let source = if copy_current {
         Some(path.as_path())
@@ -1987,6 +2022,7 @@ async fn duplicate_profile(
     to: String,
 ) -> Result<(), String> {
     let _config_guard = state.config_update.lock().await;
+    reject_if_config_degraded(&state)?;
     let path = require_profile_path(&state)?;
     profiles::duplicate(&path, &from, &to)
 }
@@ -1998,6 +2034,7 @@ async fn rename_profile(
     new: String,
 ) -> Result<(), String> {
     let _config_guard = state.config_update.lock().await;
+    reject_if_config_degraded(&state)?;
     let path = require_profile_path(&state)?;
     profiles::rename(&path, &old, &new)
 }
@@ -2005,6 +2042,7 @@ async fn rename_profile(
 #[tauri::command]
 async fn delete_profile(state: State<'_, Arc<SharedState>>, name: String) -> Result<(), String> {
     let _config_guard = state.config_update.lock().await;
+    reject_if_config_degraded(&state)?;
     let path = require_profile_path(&state)?;
     profiles::delete(&path, &name)
 }

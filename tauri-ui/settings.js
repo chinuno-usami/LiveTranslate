@@ -47,8 +47,32 @@ const state = {
   rawInputs: new Map(),
   originalSourcesJson: '[]',
   previewTimer: null,
+  previewToken: 0,
+  busy: false,
   hasLoaded: false,
 };
+
+function setBusy(busy) {
+  state.busy = Boolean(busy);
+  const targets = [
+    els.save,
+    els.cancel,
+    els.reload,
+    els.profileSelect,
+    els.profileSwitch,
+    els.profileNew,
+    els.profileDup,
+    els.profileRename,
+    els.profileDelete,
+    els.profileOpen,
+  ];
+  for (const el of targets) {
+    if (el) el.disabled = state.busy;
+  }
+  if (!state.busy) {
+    updateProfileActionButtons();
+  }
+}
 
 // ---------------- 页内模态对话框 ----------------
 
@@ -417,8 +441,8 @@ async function switchProfile(name) {
     return;
   }
   clearPreviewTimer();
-  els.save.disabled = true;
-  if (els.profileSwitch) els.profileSwitch.disabled = true;
+  state.previewToken += 1;
+  setBusy(true);
   try {
     const result = await invoke('switch_profile', { name });
     // 旧配置档的未保存编辑不能带进新配置档
@@ -431,8 +455,7 @@ async function switchProfile(name) {
     showError(`切换配置档失败: ${error}`);
     renderProfileBar(name);
   } finally {
-    els.save.disabled = false;
-    updateProfileActionButtons();
+    setBusy(false);
   }
 }
 
@@ -1127,12 +1150,14 @@ async function saveRawConfig() {
     }
   }
   clearPreviewTimer();
+  state.previewToken += 1;
   const saveRawBtn = document.getElementById('save-raw-btn');
   if (saveRawBtn) saveRawBtn.disabled = true;
-  els.save.disabled = true;
+  setBusy(true);
   try {
     const result = await invoke('save_config_raw', { text: state.rawText });
     clearLocalEdits();
+    state.originalRawText = state.rawText;
     showError('');
     if (result.restart_required) {
       els.restartBanner.classList.remove('hidden');
@@ -1147,7 +1172,7 @@ async function saveRawConfig() {
     setStatus('保存失败', 'err');
   } finally {
     if (saveRawBtn) saveRawBtn.disabled = false;
-    els.save.disabled = false;
+    setBusy(false);
   }
 }
 
@@ -1316,10 +1341,12 @@ function isPreviewablePath(path) {
 }
 
 function schedulePreview(changedPath) {
-  if (!isPreviewablePath(changedPath)) return;
+  if (!isPreviewablePath(changedPath) || state.busy) return;
   clearPreviewTimer();
+  const token = ++state.previewToken;
   state.previewTimer = setTimeout(async () => {
     state.previewTimer = null;
+    if (token !== state.previewToken || state.busy) return;
     const changes = [...state.dirty]
       .filter(([path]) => isPreviewablePath(path))
       .map(([path, value]) => ({ path, value }));
@@ -1417,7 +1444,8 @@ async function save() {
     // 降级保护态下磁盘已是合法恢复配置，但仍需一次空保存来 clear_config_degraded
     if (state.schema?.warning) {
       clearPreviewTimer();
-      els.save.disabled = true;
+      state.previewToken += 1;
+      setBusy(true);
       try {
         const result = await invoke('save_settings', { changes: [] });
         clearLocalEdits();
@@ -1430,7 +1458,7 @@ async function save() {
         showError(`保存失败: ${error}`);
         setStatus('保存失败', 'err');
       } finally {
-        els.save.disabled = false;
+        setBusy(false);
       }
       return;
     }
@@ -1448,7 +1476,8 @@ async function save() {
   }
 
   clearPreviewTimer();
-  els.save.disabled = true;
+  state.previewToken += 1;
+  setBusy(true);
   try {
     let result;
     try {
@@ -1478,12 +1507,13 @@ async function save() {
       showError('已保存，但界面刷新失败，请点「重新加载」');
     }
   } finally {
-    els.save.disabled = false;
+    setBusy(false);
   }
 }
 
 async function cancel() {
   clearPreviewTimer();
+  state.previewToken += 1;
   clearLocalEdits();
   state.sources = JSON.parse(state.originalSourcesJson);
   try {
@@ -1515,6 +1545,8 @@ async function reload() {
     }
   }
   clearPreviewTimer();
+  state.previewToken += 1;
+  setBusy(true);
   await invoke('cancel_preview').catch(() => {});
   try {
     const result = await invoke('reload_config');
@@ -1525,6 +1557,8 @@ async function reload() {
   } catch (error) {
     showError(`重新加载失败: ${error}`);
     updateDirtyIndicator();
+  } finally {
+    setBusy(false);
   }
 }
 

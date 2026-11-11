@@ -295,46 +295,69 @@ impl AudioCapture {
         let (tx, rx) = mpsc::channel(128);
         // 消费端跟不上时的丢块计数（实时回调里不能阻塞，只能丢弃并记录）
         let dropped = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-        let err_fn = |err| {
-            tracing::error!("Audio stream error: {}", err);
+        let is_running = Arc::new(AtomicBool::new(true));
+        // 出错时 take 掉 Sender，关闭通道让 next_chunk() 返回 None，避免 USB 拔出后永久挂起
+        let sender_slot: Arc<std::sync::Mutex<Option<mpsc::Sender<Vec<f32>>>>> =
+            Arc::new(std::sync::Mutex::new(Some(tx)));
+
+        let make_err_fn = || {
+            let slot = sender_slot.clone();
+            let running = is_running.clone();
+            move |err| {
+                tracing::error!("Audio stream error: {}", err);
+                running.store(false, Ordering::SeqCst);
+                let _ = slot.lock().unwrap_or_else(|e| e.into_inner()).take();
+            }
         };
 
         // 根据采样格式选择回调，统一转换为单声道 f32
         let stream = match sample_format {
             cpal::SampleFormat::F32 => {
+                let slot = sender_slot.clone();
+                let dropped = dropped.clone();
                 let data_fn = move |data: &[f32], _: &cpal::InputCallbackInfo| {
                     let mono = resample::downmix_to_mono(data, native_channels);
-                    send_or_count(&tx, mono, &dropped);
+                    if let Some(tx) = slot.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+                        send_or_count(tx, mono, &dropped);
+                    }
                 };
                 device
-                    .build_input_stream(config, data_fn, err_fn, None)
+                    .build_input_stream(config, data_fn, make_err_fn(), None)
                     .map_err(|e| {
                         AppError::CpalBuildStream(format!("Failed to build F32 stream: {}", e))
                     })?
             }
             cpal::SampleFormat::I16 => {
+                let slot = sender_slot.clone();
+                let dropped = dropped.clone();
                 let data_fn = move |data: &[i16], _: &cpal::InputCallbackInfo| {
                     let converted: Vec<f32> = data.iter().map(|&s| s as f32 / 32768.0).collect();
                     let mono = resample::downmix_to_mono(&converted, native_channels);
-                    send_or_count(&tx, mono, &dropped);
+                    if let Some(tx) = slot.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+                        send_or_count(tx, mono, &dropped);
+                    }
                 };
                 device
-                    .build_input_stream(config, data_fn, err_fn, None)
+                    .build_input_stream(config, data_fn, make_err_fn(), None)
                     .map_err(|e| {
                         AppError::CpalBuildStream(format!("Failed to build I16 stream: {}", e))
                     })?
             }
             cpal::SampleFormat::U16 => {
+                let slot = sender_slot.clone();
+                let dropped = dropped.clone();
                 let data_fn = move |data: &[u16], _: &cpal::InputCallbackInfo| {
                     let converted: Vec<f32> = data
                         .iter()
                         .map(|&s| (s as f32 - 32768.0) / 32768.0)
                         .collect();
                     let mono = resample::downmix_to_mono(&converted, native_channels);
-                    send_or_count(&tx, mono, &dropped);
+                    if let Some(tx) = slot.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+                        send_or_count(tx, mono, &dropped);
+                    }
                 };
                 device
-                    .build_input_stream(config, data_fn, err_fn, None)
+                    .build_input_stream(config, data_fn, make_err_fn(), None)
                     .map_err(|e| {
                         AppError::CpalBuildStream(format!("Failed to build U16 stream: {}", e))
                     })?
@@ -356,7 +379,7 @@ impl AudioCapture {
         Ok(Self {
             _stream: stream,
             receiver: rx,
-            is_running: Arc::new(AtomicBool::new(true)),
+            is_running,
             native_sample_rate,
         })
     }
@@ -398,13 +421,17 @@ fn send_or_count(
     data: Vec<f32>,
     dropped: &std::sync::atomic::AtomicU64,
 ) {
-    if let Err(mpsc::error::TrySendError::Full(_)) = tx.try_send(data) {
-        let n = dropped.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-        if n == 1 || n.is_multiple_of(100) {
-            tracing::warn!(
-                "Audio consumer is lagging, dropped {} audio blocks so far",
-                n
-            );
+    match tx.try_send(data) {
+        Ok(()) => {}
+        Err(mpsc::error::TrySendError::Full(_)) => {
+            let n = dropped.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            if n == 1 || n.is_multiple_of(100) {
+                tracing::warn!(
+                    "Audio consumer is lagging, dropped {} audio blocks so far",
+                    n
+                );
+            }
         }
+        Err(mpsc::error::TrySendError::Closed(_)) => {}
     }
 }
