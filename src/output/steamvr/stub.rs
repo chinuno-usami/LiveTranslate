@@ -11,9 +11,7 @@ pub struct SteamVrSink {
 
 impl SteamVrSink {
     pub fn new(config: &SteamVrConfig, notify: Arc<tokio::sync::Notify>) -> Self {
-        let message = if cfg!(all(feature = "steamvr", target_os = "windows")) {
-            "SteamVR 输出不可用".to_string()
-        } else if cfg!(target_os = "windows") {
+        let message = if cfg!(target_os = "windows") {
             "当前构建未包含 SteamVR 支持（请下载 Full 版）".to_string()
         } else {
             "SteamVR 仅支持 Windows".to_string()

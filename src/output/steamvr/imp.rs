@@ -171,6 +171,10 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 fn set_status(shared: &Shared, connected: bool, message: impl Into<String>) {
     let changed = {
         let mut status = lock(&shared.status);
+        // 若外部已将输出停用，正在退出途中的工作线程不得再写回“已连接”状态
+        if !status.enabled && connected {
+            return;
+        }
         let message = message.into();
         let changed = status.connected != connected || status.message != message;
         status.connected = connected;
@@ -269,6 +273,9 @@ fn session(
     renderer: &mut render::Renderer,
 ) -> Result<(), SessionError> {
     let context = init_context()?;
+    if stop.load(Ordering::SeqCst) {
+        return Ok(());
+    }
     let system = context
         .system()
         .map_err(|e| SessionError::Message(format!("{e:?}")))?;
@@ -287,6 +294,7 @@ fn session(
     let mut target_opacity = 0.0f32;
     let mut last_animate = Instant::now();
     let mut had_upload_error = false;
+    let mut consecutive_upload_errors = 0u32;
     let mut last_upload_retry: Option<Instant> = None;
 
     loop {
@@ -296,14 +304,19 @@ fn session(
         }
 
         while let Some(info) = system.poll_next_event() {
-            if matches!(info.event, Event::Quit(_) | Event::DriverRequestedQuit) {
+            if matches!(
+                info.event,
+                Event::Quit(_) | Event::DriverRequestedQuit | Event::RestartRequested
+            ) {
                 system.acknowledge_quit_exiting();
                 return Ok(());
             }
         }
 
-        let config = lock(&shared.config).clone();
+        // 必须先读 revision 再锁 config/lines，否则并发 apply_config/publish 夹在中间时
+        // last_revision 会记录新版本号但应用旧快照，导致最近一次配置更新永久漏掉。
         let revision = shared.revision.load(Ordering::SeqCst);
+        let config = lock(&shared.config).clone();
 
         let retry_due = revision != last_revision
             && last_upload_retry
@@ -330,10 +343,18 @@ fn session(
             }
 
             let lines = lock(&shared.lines).clone();
+            let has_visible_text = lines
+                .iter()
+                .any(|l| !l.source.trim().is_empty() || !l.translated.trim().is_empty());
 
-            if lines.is_empty() {
+            if !has_visible_text {
                 last_revision = revision;
                 last_upload_retry = None;
+                consecutive_upload_errors = 0;
+                if had_upload_error {
+                    had_upload_error = false;
+                    set_status(shared, true, "已连接 SteamVR");
+                }
                 // 淡出后隐藏（由下面的动画循环在 opacity 接近 0 时隐藏）
                 target_opacity = 0.0;
             } else {
@@ -351,6 +372,7 @@ fn session(
                     Ok(()) => {
                         last_revision = revision;
                         last_upload_retry = None;
+                        consecutive_upload_errors = 0;
                         if had_upload_error {
                             had_upload_error = false;
                             set_status(shared, true, "已连接 SteamVR");
@@ -369,6 +391,12 @@ fn session(
                         return Err(SessionError::Message(format!("上传纹理失败: {e:?}")));
                     }
                     Err(e) => {
+                        consecutive_upload_errors += 1;
+                        if consecutive_upload_errors >= 10 {
+                            return Err(SessionError::Message(format!(
+                                "连续上传纹理失败（SteamVR 会话可能已断开）: {e:?}"
+                            )));
+                        }
                         // 单帧上传失败（SteamVR 瞬时忙）保留未提交的 revision，500ms 后自动重试
                         last_upload_retry = Some(Instant::now());
                         tracing::warn!(

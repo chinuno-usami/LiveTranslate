@@ -97,6 +97,8 @@ pub struct Renderer {
     cache: SwashCache,
     loaded_font_path: String,
     family: Option<String>,
+    loaded_fonts: std::collections::HashMap<String, Option<String>>,
+    last_font_size_px: u32,
 }
 
 impl Default for Renderer {
@@ -112,6 +114,8 @@ impl Renderer {
             cache: SwashCache::new(),
             loaded_font_path: String::new(),
             family: None,
+            loaded_fonts: std::collections::HashMap::new(),
+            last_font_size_px: 0,
         }
     }
 
@@ -121,12 +125,31 @@ impl Renderer {
             return;
         }
         self.loaded_font_path = path.to_string();
-        self.family = resolve_family(&mut self.font_system, path);
+        if path.is_empty() {
+            self.family = None;
+            return;
+        }
+        if let Some(cached) = self.loaded_fonts.get(path) {
+            self.family = cached.clone();
+            return;
+        }
+        let resolved = resolve_family(&mut self.font_system, path);
+        self.loaded_fonts.insert(path.to_string(), resolved.clone());
+        self.family = resolved;
     }
 
     /// 把字幕快照渲染成 RGBA 纹理（调用方负责上传到 Overlay）
     pub fn render(&mut self, lines: &[DisplayLine], config: &SteamVrConfig) -> RenderedFrame {
         self.ensure_font(&config.font_path);
+        let clamped_font_px = config.font_size_px.clamp(12, 96);
+        // 字号切换（尤其是实时预览连续拖动滑块）或缓存条目过多时释放光栅位图，防止内存无限增长
+        if (self.last_font_size_px != 0 && self.last_font_size_px != clamped_font_px)
+            || self.cache.image_cache.len() > 4096
+        {
+            self.cache.image_cache.clear();
+            self.cache.outline_command_cache.clear();
+        }
+        self.last_font_size_px = clamped_font_px;
         let family = self.family.clone();
         let font_system = &mut self.font_system;
         let cache = &mut self.cache;
@@ -165,7 +188,13 @@ impl Renderer {
                 continue;
             }
             let body = clip_chars(body, MAX_LINE_CHARS);
-            let source_text = clip_chars(&line.source, MAX_LINE_CHARS);
+            // 双语大字号下限制原文长度，避免原文占满整个 1024px 画布而把译文完全挤出可见区
+            let max_source_chars = if config.font_size_px >= 64 {
+                120
+            } else {
+                MAX_LINE_CHARS
+            };
+            let source_text = clip_chars(&line.source, max_source_chars);
 
             let source_buffer = if config.show_source
                 && !line.source.trim().is_empty()
@@ -297,7 +326,8 @@ impl Renderer {
     }
 }
 
-/// 便捷入口（测试 / 一次性渲染）；热路径请复用 [`Renderer`]
+/// 便捷入口（测试使用）；热路径请复用 [`Renderer`]
+#[cfg(test)]
 pub fn render(lines: &[DisplayLine], config: &SteamVrConfig) -> RenderedFrame {
     Renderer::new().render(lines, config)
 }
