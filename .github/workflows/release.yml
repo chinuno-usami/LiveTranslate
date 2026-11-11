@@ -177,17 +177,31 @@ jobs:
           Write-Host "downloading $ortUrl"
           Invoke-WebRequest -Uri $ortUrl -OutFile $ortZip
 
-          # 完整性校验：防止上游资产被替换 / 下载被篡改
-          $ortSha = @{ '1.30.0' = 'c6ba983baf5681af108599675d2a89c2d145512d02de28aed0bff177cd0ba949' }[$ortVersion]
-          if ($ortSha) {
-            $actual = (Get-FileHash -Algorithm SHA256 -Path $ortZip).Hash.ToLower()
-            if ($actual -ne $ortSha) {
-              throw "onnxruntime $ortVersion SHA-256 mismatch`n  expected: $ortSha`n  actual:   $actual"
+          # 完整性校验：校验和表与 scripts/fetch-onnxruntime.sh 共用 scripts/ort-checksums.txt，
+          # 升级 ORT_VERSION 时只补一处；缺校验和直接失败，不再 warning 放行。
+          $ortSha = $env:ORT_SHA256
+          if (-not $ortSha) {
+            $checksFile = 'scripts/ort-checksums.txt'
+            if (Test-Path $checksFile) {
+              foreach ($line in Get-Content $checksFile) {
+                $trimmed = $line.Trim()
+                if (-not $trimmed -or $trimmed.StartsWith('#')) { continue }
+                $parts = $trimmed -split '\s+'
+                if ($parts.Length -ge 2 -and $parts[0] -eq "win-x64/$ortVersion") {
+                  $ortSha = $parts[1]
+                  break
+                }
+              }
             }
-            Write-Host "checksum ok"
-          } else {
-            throw "没有 onnxruntime $ortVersion 的内置校验和；请先在 release.yml / fetch-onnxruntime.sh 补齐 SHA-256"
           }
+          if (-not $ortSha) {
+            throw "没有 onnxruntime $ortVersion 的内置校验和；请在 scripts/ort-checksums.txt 补齐 SHA-256"
+          }
+          $actual = (Get-FileHash -Algorithm SHA256 -Path $ortZip).Hash.ToLower()
+          if ($actual -ne $ortSha.ToLower()) {
+            throw "onnxruntime $ortVersion SHA-256 mismatch`n  expected: $ortSha`n  actual:   $actual"
+          }
+          Write-Host "checksum ok"
 
           Expand-Archive -Path $ortZip -DestinationPath $ortDir -Force
           $dll = Get-ChildItem $ortDir -Recurse -Filter 'onnxruntime.dll' | Select-Object -First 1

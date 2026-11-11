@@ -6,8 +6,9 @@
 #   scripts/fetch-onnxruntime.sh <linux-x64|macos-arm64|win-x64> <out-dir>
 #
 # 可用 ORT_VERSION 覆盖版本（默认 1.30.0，与 ort 2.x 期望的 API 兼容）。
-# 脚本内置了各平台/版本的 SHA-256，下载后会校验完整性；
-# 也可用 ORT_SHA256 显式指定期望值（覆盖内置表）。
+# 校验和取自同目录的 ort-checksums.txt（与 CI 共用唯一真源），
+# 下载后会校验完整性；也可用 ORT_SHA256 显式指定期望值（覆盖内置表）。
+# 未提供校验和时直接失败：宁可不打包，也不要绕过完整性校验。
 #
 # 说明: ONNX Runtime 官方只提供动态库（无静态库），
 # 因此这里是「随包附带动态库」，由程序启动时自动发现。
@@ -33,13 +34,13 @@ case "$PLATFORM" in
     ;;
 esac
 
-# 内置校验和表（版本/平台 -> SHA-256）；未知组合需用 ORT_SHA256 提供
-case "${PLATFORM}/${ORT_VERSION}" in
-  linux-x64/1.30.0)   DEFAULT_SHA256="a5ed5a3cac51fbb2e90da632ae43d19212faaa20e76484e62bcb7c23ddb3b3fd" ;;
-  macos-arm64/1.30.0) DEFAULT_SHA256="6ebb5062a934537c352937821f9fe9718e7de1a2db1122a93dd363ffd53a7012" ;;
-  win-x64/1.30.0)     DEFAULT_SHA256="c6ba983baf5681af108599675d2a89c2d145512d02de28aed0bff177cd0ba949" ;;
-  *)                  DEFAULT_SHA256="" ;;
-esac
+# 校验和表（版本/平台 -> SHA-256）；未知组合需用 ORT_SHA256 提供
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CHECKS_FILE="${SCRIPT_DIR}/ort-checksums.txt"
+DEFAULT_SHA256=""
+if [ -f "$CHECKS_FILE" ]; then
+  DEFAULT_SHA256="$(awk -v key="${PLATFORM}/${ORT_VERSION}" '$1 == key { print $2; exit }' "$CHECKS_FILE")"
+fi
 EXPECTED_SHA256="${ORT_SHA256:-$DEFAULT_SHA256}"
 
 sha256_of() {
@@ -95,7 +96,7 @@ if [ -n "$EXPECTED_SHA256" ]; then
   fi
   echo "  checksum ok"
 else
-  echo "error: 未提供 ${PLATFORM}/${ORT_VERSION} 的 SHA-256；请在脚本内置表或 ORT_SHA256 中补充后重试" >&2
+  echo "error: 未提供 ${PLATFORM}/${ORT_VERSION} 的 SHA-256；请在 ${CHECKS_FILE} 或 ORT_SHA256 中补充后重试" >&2
   exit 1
 fi
 

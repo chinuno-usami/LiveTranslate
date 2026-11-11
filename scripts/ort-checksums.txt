@@ -1,0 +1,10 @@
+# ONNX Runtime 预编译库的 SHA-256，格式：<平台>/<版本>  <sha256>
+#
+# 这份表是唯一真源：scripts/fetch-onnxruntime.sh（本地 + Linux/macOS 打包）
+# 与 .github/workflows/release.yml（Windows 打包）都从这里读。
+# 升级 ORT_VERSION 时只需要在这里加一行，忘了加会让下载直接失败而不是跳过校验。
+#
+# 自动发现脚本按 PLATFORM/ORT_VERSION 精确匹配；也可以用 ORT_SHA256 环境变量临时覆盖。
+linux-x64/1.30.0    a5ed5a3cac51fbb2e90da632ae43d19212faaa20e76484e62bcb7c23ddb3b3fd
+macos-arm64/1.30.0  6ebb5062a934537c352937821f9fe9718e7de1a2db1122a93dd363ffd53a7012
+win-x64/1.30.0      c6ba983baf5681af108599675d2a89c2d145512d02de28aed0bff177cd0ba949
