@@ -1121,13 +1121,11 @@ async fn stop_capture_locked(app: AppHandle, state: Arc<SharedState>) -> Result<
         let mut registry = state.sources.lock().await;
         registry.mark_all_stopped();
     }
-    {
-        let mut subtitle_state = state.subtitle_state.lock().await;
-        subtitle_state.clear();
-    }
+    // 停止时不再立刻 clear / emit_subtitle_reset：forwarder 刚排空的尾句
+    // 需要留给桌面浮窗与 OSC/SteamVR 先消费；下次 start_capture 会清屏。
+    // OSC 侧 set_active(false) 会保留未发送的非空 pending；SteamVR 依赖 hide_on_silence。
     state.outputs.set_capture_active(false);
 
-    emit_subtitle_reset(&app);
     emit_status(&app, false, "已停止");
     emit_source_status(&app, &state).await;
     emit_output_status(&app, &state);

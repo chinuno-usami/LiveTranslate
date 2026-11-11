@@ -81,10 +81,8 @@ impl OutputManager {
     pub fn set_capture_active(&self, active: bool) {
         self.capture_active.store(active, Ordering::SeqCst);
         self.osc.set_active(active);
-        if !active {
-            // 停止时清空 SteamVR 面板
-            self.steamvr.publish(&[]);
-        }
+        // 停止时不立刻 publish 空快照，避免覆盖刚排空的尾句；
+        // SteamVR 由 hide_on_silence_secs 自然熄灭，下次 start 会清屏。
     }
 
     pub fn status(&self) -> OutputStatusPayload {

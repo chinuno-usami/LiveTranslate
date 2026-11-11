@@ -63,6 +63,14 @@ impl Segmenter {
         }
     }
 
+    fn flush(&mut self) {
+        match self {
+            Segmenter::Vad(s) => s.flush(),
+            // 固定分片：不足一整片的尾巴不做半片识别，避免噪声误触发
+            Segmenter::Fixed(_) => {}
+        }
+    }
+
     fn is_silence(&self, chunk: &[f32]) -> bool {
         match self {
             Segmenter::Vad(_) => false,
@@ -342,7 +350,8 @@ async fn process_segment(
                         tracing::error!("Translation failed: {}", e);
                         send_notice(tx, last_notice, Some(source_id), format!("翻译失败: {e}"))
                             .await;
-                        return Ok(true);
+                        // 翻译失败仍保留原文上屏，避免整句识别结果被吞掉
+                        String::new()
                     }
                 }
             } else {
@@ -662,6 +671,26 @@ async fn run_source_inner(
     // 先显式析构 AudioCapture 以关闭底层 cpal::Stream 硬件句柄，再排空已在队列中的识别/翻译请求
     audio_capture.stop();
     drop(audio_capture);
+
+    // 停止时若仍有未达 min_silence_ms 的尾部语音，flush 出来交给识别 worker
+    segmenter.flush();
+    while let Some(chunk) = segmenter.next_chunk() {
+        if segmenter.is_silence(&chunk) {
+            continue;
+        }
+        match utterance_tx.try_send(chunk) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) => {
+                dropped_segments += 1;
+                tracing::warn!(
+                    "[{}] 停止排空时识别队列已满，丢弃一个尾部片段（累计 {} 个）",
+                    source.label,
+                    dropped_segments
+                );
+            }
+            Err(TrySendError::Closed(_)) => break,
+        }
+    }
 
     drop(utterance_tx);
     if let Some(mut worker) = worker_guard.0.take() {

@@ -193,6 +193,16 @@ impl SpeechSegmenter {
     pub fn pop(&mut self) -> Option<Vec<f32>> {
         self.ready.pop_front()
     }
+
+    /// 停止采集时强制收尾：若当前仍在说话且达到最短语音长度，输出最后一段。
+    /// 不足一帧的 leftover 无法做 VAD 判定，直接丢弃。
+    pub fn flush(&mut self) {
+        if self.in_speech && self.voiced_frames > 0 {
+            self.finish(false);
+        }
+        self.leftover.clear();
+        self.pre_buf.clear();
+    }
 }
 
 #[cfg(test)]
@@ -299,5 +309,19 @@ mod tests {
             "超长语音应被强制切分, got {}",
             segments.len()
         );
+    }
+
+    #[test]
+    fn flush_emits_in_progress_speech_without_trailing_silence() {
+        let mut seg = segmenter(&cfg());
+
+        seg.push(&tone(200, 0.001));
+        seg.push(&tone(500, 0.3)); // 已超过 min_speech，但尚未达到 min_silence
+        assert!(seg.pop().is_none(), "未到静音结束前不应出片");
+
+        seg.flush();
+        let segment = seg.pop().expect("flush 应输出进行中的尾段");
+        assert!(!segment.is_empty());
+        assert!(seg.pop().is_none());
     }
 }

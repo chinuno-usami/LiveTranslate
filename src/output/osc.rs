@@ -135,17 +135,15 @@ pub fn truncate_chars(text: &str, max_chars: usize) -> String {
         return clean;
     }
     let mut out = String::new();
-    let mut chars_used = 0usize;
     let mut utf16_used = 0usize;
     let char_budget = max_chars.saturating_sub(1);
     let utf16_budget = VRCHAT_MAX_UTF16.saturating_sub(1);
-    for ch in clean.chars() {
+    for (chars_used, ch) in clean.chars().enumerate() {
         let u16_len = ch.len_utf16();
-        if chars_used + 1 > char_budget || utf16_used + u16_len > utf16_budget {
+        if chars_used >= char_budget || utf16_used + u16_len > utf16_budget {
             break;
         }
         out.push(ch);
-        chars_used += 1;
         utf16_used += u16_len;
     }
     out.push('…');

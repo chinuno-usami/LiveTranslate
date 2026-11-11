@@ -74,6 +74,7 @@ pub fn handle_system_tray_event(app: &AppHandle, event: SystemTrayEvent) {
 
 fn show_main_window(app: &AppHandle) {
     if let Some(window) = app.get_window("main") {
+        let _ = window.unminimize();
         let _ = window.show();
         let _ = window.set_focus();
     }
