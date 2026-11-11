@@ -79,6 +79,8 @@ struct SourceRuntime {
     device: String,
     enabled: bool,
     running: bool,
+    /// 采集流是否真的在收到音频（回环设备没有播放时会一直静默）
+    audio: bool,
     message: String,
     /// 该源的识别语言覆盖；空 = 跟随全局
     language_override: String,
@@ -101,6 +103,7 @@ impl SourceRuntime {
             device: source.device.clone(),
             enabled: source.enabled,
             running: false,
+            audio: false,
             message: if source.enabled {
                 "未启动".to_string()
             } else {
@@ -179,6 +182,7 @@ impl SourceRegistry {
                 runtime.device = source.device.clone();
                 runtime.enabled = source.enabled;
                 if !runtime.running {
+                    runtime.audio = false;
                     runtime.message = if source.enabled {
                         "未启动".to_string()
                     } else {
@@ -237,9 +241,10 @@ impl SourceRegistry {
         }
     }
 
-    fn set_running(&mut self, id: &str, running: bool, message: impl Into<String>) {
+    fn set_running(&mut self, id: &str, running: bool, audio: bool, message: impl Into<String>) {
         if let Some(runtime) = self.runtimes.iter_mut().find(|r| r.id == id) {
             runtime.running = running;
+            runtime.audio = running && audio;
             runtime.message = message.into();
         }
     }
@@ -247,6 +252,7 @@ impl SourceRegistry {
     fn mark_all_stopped(&mut self) {
         for runtime in &mut self.runtimes {
             runtime.running = false;
+            runtime.audio = false;
             if !runtime.enabled {
                 continue;
             }
@@ -289,6 +295,7 @@ impl SourceRegistry {
                 id: r.id.clone(),
                 label: r.label.clone(),
                 running: r.running,
+                audio: r.audio,
                 enabled: r.enabled,
                 translate: r.translate_pref,
                 device: r.device.clone(),
@@ -892,26 +899,37 @@ async fn start_capture_locked(app: AppHandle, state: Arc<SharedState>) -> Result
         let mut registry = state.sources.lock().await;
         registry.sync_config(&config);
         let max = config.audio.max_active_sources.max(1);
-        let mut used_devices = std::collections::HashSet::new();
+        // 按归一化后的设备 spec 判重：`loopback` 与 `loopback:0` 是同一个端点，
+        // 否则两个源会同时打开同一设备，第二个只能静默失败（面板上只剩一个在跑）
+        let mut used_devices: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
         for runtime in &mut registry.runtimes {
             if !runtime.enabled {
                 runtime.running = false;
+                runtime.audio = false;
                 runtime.message = "已停用".to_string();
                 continue;
             }
             if contexts.len() >= max {
                 runtime.running = false;
+                runtime.audio = false;
                 runtime.message = format!("超出并发上限（{max}），未启动");
                 skipped.push((runtime.id.clone(), runtime.message.clone()));
                 continue;
             }
-            if !runtime.device.trim().is_empty() && !used_devices.insert(runtime.device.clone()) {
-                runtime.running = false;
-                runtime.message = "设备重复，已跳过".to_string();
-                skipped.push((runtime.id.clone(), runtime.message.clone()));
-                continue;
+            let key = config::canonical_device_spec(&runtime.device);
+            if key != "default" {
+                if let Some(owner) = used_devices.get(&key) {
+                    runtime.running = false;
+                    runtime.audio = false;
+                    runtime.message = format!("与「{owner}」是同一个设备，已跳过");
+                    skipped.push((runtime.id.clone(), runtime.message.clone()));
+                    continue;
+                }
+                used_devices.insert(key, runtime.id.clone());
             }
             runtime.running = true;
+            runtime.audio = false;
             runtime.message = "启动中".to_string();
             contexts.push(runtime.context());
         }
@@ -1040,17 +1058,32 @@ async fn start_capture_locked(app: AppHandle, state: Arc<SharedState>) -> Result
                 app::PipelineEvent::SourceState {
                     source_id,
                     running,
+                    audio,
                     message,
                 } => {
-                    let running_count = {
+                    let (running_count, label) = {
                         let mut registry = state_for_forwarder.sources.lock().await;
-                        registry.set_running(&source_id, running, message.clone());
+                        registry.set_running(&source_id, running, audio, message.clone());
                         let labels = registry.active_labels();
                         let count = registry.running_count();
+                        let label = registry
+                            .runtimes
+                            .iter()
+                            .find(|r| r.id == source_id)
+                            .map(|r| r.label.clone());
                         let mut subtitle_state = state_for_forwarder.subtitle_state.lock().await;
                         subtitle_state.set_active_labels(labels);
-                        count
+                        (count, label)
                     };
+                    // 采集任务异常退出（设备断开 / 打开失败）时不能只留在 tooltip 里，
+                    // 否则用户只会看到某一个源永远不出字幕
+                    if !running && message.starts_with("已停止:") {
+                        let text = match label {
+                            Some(label) => format!("[{label}] {message}"),
+                            None => message.clone(),
+                        };
+                        let _ = app_for_forwarder.emit_all(NOTICE_EVENT, text);
+                    }
                     if running_count > 0 {
                         let status_msg = match running_count {
                             1 => "字幕采集中".to_string(),

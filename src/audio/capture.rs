@@ -38,6 +38,8 @@ pub struct AudioCapture {
     _stream: cpal::Stream,
     receiver: mpsc::Receiver<Vec<f32>>,
     is_running: Arc<AtomicBool>,
+    /// 致命错误原因（回调线程写入，消费端取走用于报错文案）
+    last_error: Arc<std::sync::Mutex<Option<String>>>,
     /// 设备原生采样率（回调已下混为单声道）
     pub native_sample_rate: u32,
 }
@@ -299,12 +301,34 @@ impl AudioCapture {
         // 出错时 take 掉 Sender，关闭通道让 next_chunk() 返回 None，避免 USB 拔出后永久挂起
         let sender_slot: Arc<std::sync::Mutex<Option<mpsc::Sender<Vec<f32>>>>> =
             Arc::new(std::sync::Mutex::new(Some(tx)));
+        // 致命错误的原因，给上层用来把「音频输入已中断」写清楚
+        let last_error: Arc<std::sync::Mutex<Option<String>>> =
+            Arc::new(std::sync::Mutex::new(None));
+        // 非致命错误（Xrun / 路由变化）的计数，用于限流日志
+        let recoverable_errors = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
         let make_err_fn = || {
             let slot = sender_slot.clone();
             let running = is_running.clone();
-            move |err| {
-                tracing::error!("Audio stream error: {}", err);
+            let last_error = last_error.clone();
+            let recoverable_errors = recoverable_errors.clone();
+            move |err: cpal::Error| {
+                // WASAPI 回环在输出端点从静音恢复播放时，第一个数据包必然带
+                // AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY，cpal 会把它作为 Xrun 从
+                // 错误回调上报。以前把任何回调错误都当致命错误，结果就是
+                // 「一有声音就报音频输入已中断」。Xrun / 路由变更后再继续采集即可。
+                if is_recoverable(&err) {
+                    let n =
+                        recoverable_errors.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                    if n == 1 || n.is_multiple_of(100) {
+                        tracing::warn!(
+                            "Audio stream reported a recoverable error (#{n}), continuing: {err}"
+                        );
+                    }
+                    return;
+                }
+                tracing::error!("Audio stream error: {err}");
+                *last_error.lock().unwrap_or_else(|e| e.into_inner()) = Some(err.to_string());
                 running.store(false, Ordering::SeqCst);
                 let _ = slot.lock().unwrap_or_else(|e| e.into_inner()).take();
             }
@@ -380,8 +404,17 @@ impl AudioCapture {
             _stream: stream,
             receiver: rx,
             is_running,
+            last_error,
             native_sample_rate,
         })
+    }
+
+    /// 取出致命错误原因（采集流因设备断开 / 被抢占而结束时）
+    pub fn take_error(&self) -> Option<String> {
+        self.last_error
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
     }
 
     /// 获取下一个音频块
@@ -415,6 +448,18 @@ fn parse_suffix_index(spec: &str) -> Option<usize> {
     spec.split_once(':').and_then(|(_, idx)| idx.parse().ok())
 }
 
+/// 这些错误只表示丢了/跳了一段数据，采集流本身仍然有效，不能停机。
+///
+/// - `Xrun`：WASAPI 回环在端点从静音恢复播放时必然带来数据不连续；
+/// - `DeviceChanged`：系统把音频路由换到了另一个设备，流已自动跟随；
+/// - `RealtimeDenied`：只是实时优先级申请失败，音频仍能跑。
+fn is_recoverable(err: &cpal::Error) -> bool {
+    matches!(
+        err.kind(),
+        cpal::ErrorKind::Xrun | cpal::ErrorKind::DeviceChanged | cpal::ErrorKind::RealtimeDenied
+    )
+}
+
 /// 在音频回调中投递数据；通道满时计数并低频告警
 fn send_or_count(
     tx: &mpsc::Sender<Vec<f32>>,
@@ -433,5 +478,40 @@ fn send_or_count(
             }
         }
         Err(mpsc::error::TrySendError::Closed(_)) => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cpal::ErrorKind;
+
+    #[test]
+    fn xrun_is_recoverable_but_device_loss_is_not() {
+        // WASAPI 回环在端点恢复播放时会报 Xrun，不能当成致命错误
+        assert!(is_recoverable(&cpal::Error::new(ErrorKind::Xrun)));
+        assert!(is_recoverable(&cpal::Error::new(ErrorKind::DeviceChanged)));
+        assert!(is_recoverable(&cpal::Error::new(ErrorKind::RealtimeDenied)));
+
+        for kind in [
+            ErrorKind::DeviceNotAvailable,
+            ErrorKind::StreamInvalidated,
+            ErrorKind::HostUnavailable,
+            ErrorKind::PermissionDenied,
+            ErrorKind::UnsupportedConfig,
+            ErrorKind::BackendError,
+        ] {
+            assert!(
+                !is_recoverable(&cpal::Error::new(kind)),
+                "{kind} 应是致命错误"
+            );
+        }
+    }
+
+    #[test]
+    fn suffix_index_parsing() {
+        assert_eq!(parse_suffix_index("loopback:3"), Some(3));
+        assert_eq!(parse_suffix_index("mic:0"), Some(0));
+        assert_eq!(parse_suffix_index("loopback"), None);
     }
 }

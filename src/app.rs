@@ -38,6 +38,8 @@ pub enum PipelineEvent {
     SourceState {
         source_id: String,
         running: bool,
+        /// 采集流是否真的在收到音频；回环设备没有播放时会一直为 false
+        audio: bool,
         message: String,
     },
 }
@@ -275,6 +277,7 @@ fn handle_console_event(
         PipelineEvent::SourceState {
             source_id,
             running,
+            audio,
             message,
         } => {
             if let Some((_, _, slot_running)) = active_sources
@@ -291,9 +294,10 @@ fn handle_console_event(
                 outputs.publish(&subtitle_state.display_lines());
             }
             tracing::info!(
-                "Source {} {}: {}",
+                "Source {} {} (audio={}): {}",
                 source_id,
                 if running { "started" } else { "stopped" },
+                audio,
                 message
             );
         }
@@ -422,6 +426,7 @@ pub async fn run_source(
         .send(PipelineEvent::SourceState {
             source_id,
             running: false,
+            audio: false,
             message,
         })
         .await;
@@ -445,6 +450,7 @@ async fn run_source_inner(
         .send(PipelineEvent::SourceState {
             source_id: source.id.clone(),
             running: true,
+            audio: false,
             message: "采集中".to_string(),
         })
         .await;
@@ -594,6 +600,20 @@ async fn run_source_inner(
     // 非停止信号导致的流中断要带出去：只有当它变成 Err 时，
     // SourceState 与采集状态才会显示「已停止: 音频输入已中断（设备断开？）」而不是裸的「已停止」
     let mut stream_ended: Option<AppError> = None;
+    // 采样是否在真的流动：WASAPI 回环只在对应端点有播放时才推数据，
+    // 所以「连上了但没声音」必须是可观测状态，否则面板上只有绿灯 + 无字幕，无法排查
+    let mut has_audio = false;
+    // 本轮 tick 窗口内是否收到过音频块
+    let mut audio_in_window = false;
+    // 「已连接但没数据」是否已经上报过，避免每 2s 刷一条同样的状态
+    let mut reported_silent = false;
+    let mut audio_tick = {
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(2));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // interval 的第一次 tick 立即就绪，先消费掉，避免刚启动就报「暂无音频」
+        tick.tick().await;
+        tick
+    };
 
     'capture: loop {
         tokio::select! {
@@ -601,6 +621,30 @@ async fn run_source_inner(
                 if changed.is_err() || *stop_rx.borrow() {
                     tracing::info!("[{}] Received stop signal", source.label);
                     break;
+                }
+            }
+            _ = audio_tick.tick() => {
+                if audio_in_window {
+                    audio_in_window = false;
+                } else if !reported_silent {
+                    // 启动后一直没有数据，或上一个窗口还有数据、这个窗口一个块都没有：端点停播了
+                    reported_silent = true;
+                    let was_audible = has_audio;
+                    has_audio = false;
+                    tracing::warn!(
+                        "[{}] 已连接但未收到音频数据（was_audible={}）",
+                        source.label,
+                        was_audible
+                    );
+                    let _ = tx
+                        .send(PipelineEvent::SourceState {
+                            source_id: source.id.clone(),
+                            running: true,
+                            audio: false,
+                            message: "已连接，但没有音频数据（回环设备需有播放才会推送声音）"
+                                .to_string(),
+                        })
+                        .await;
                 }
             }
             samples = audio_capture.next_chunk() => {
@@ -612,20 +656,40 @@ async fn run_source_inner(
                         break;
                     }
                     tracing::warn!("[{}] Audio stream ended unexpectedly", source.label);
-                    send_notice(
-                        &tx,
-                        &mut last_notice,
-                        Some(&source.id),
-                        "音频输入已中断（设备断开？），该源已停止".to_string(),
-                    )
-                    .await;
-                    stream_ended = Some(AppError::AudioStreamEnded);
+                    // 回调里存下的致命错误原因（设备被拔出 / 被独占 / 后端错误）
+                    let detail = audio_capture.take_error();
+                    let (notice, err) = match detail {
+                        Some(detail) => (
+                            format!("音频输入已中断（{detail}），该源已停止"),
+                            AppError::AudioStreamFailed(detail),
+                        ),
+                        None => (
+                            "音频输入已中断（设备断开？），该源已停止".to_string(),
+                            AppError::AudioStreamEnded,
+                        ),
+                    };
+                    send_notice(&tx, &mut last_notice, Some(&source.id), notice).await;
+                    stream_ended = Some(err);
                     break 'capture;
                 };
 
                 let mut resampled = Vec::new();
                 resampler.process(&samples, &mut resampled);
                 segmenter.push(&resampled);
+
+                if !has_audio {
+                    has_audio = true;
+                    reported_silent = false;
+                    let _ = tx
+                        .send(PipelineEvent::SourceState {
+                            source_id: source.id.clone(),
+                            running: true,
+                            audio: true,
+                            message: "采集中".to_string(),
+                        })
+                        .await;
+                }
+                audio_in_window = true;
 
                 pushed_chunks += 1;
                 if pushed_chunks.is_multiple_of(500) {

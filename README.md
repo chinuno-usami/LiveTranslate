@@ -253,7 +253,12 @@ send_typing = true
 
 - 浮窗工具栏点 **源 (N)** 打开输入源面板：每行可切设备、开关该源翻译、启用/停用。
 - 完整的输入源表格（ID、展示名、语言覆盖、排序）在 **设置页 → 输入源**。
-- 同一设备不允许被两个启用中的源同时打开；冲突项会被跳过并在面板提示。
+- 同一设备不允许被两个启用中的源同时打开（`loopback` 与 `loopback:0` 视为同一设备）；
+  冲突项会被跳过，并在浮窗面板的源名称 tooltip 里写明「与「xxx」是同一个设备，已跳过」。
+- 状态点语义：**绿 = 采集中且持续有音频**；**橙 = 已连接但没有音频数据**
+  （WASAPI 回环只在对应输出设备真的有播放时才推数据）；**灰 = 未在采集**
+  （已停用 / 已停止 / 被跳过，原因见 tooltip 与日志）。
+- 只有一路回环能出字幕时，先看状态点：橙色说明它与另一路抢了同一端点，或该端点当前没有播放。
 - `audio.max_active_sources`（默认 4）限制同时采集数量，超出按列表顺序取前 N 个。
 - 多源同时运行时，字幕前会自动加 `[麦克风]` 这类来源前缀，可在
   `subtitle.label_sources = "auto" | "always" | "never"` 中调整。
@@ -749,6 +754,10 @@ OPTIONS:
 
 ## 已知限制
 
+- 🟡 **WASAPI 回环的 Xrun**：回环端点从静音恢复播放时，WASAPI 会带一个数据不连续标志（cpal 以 `Xrun`
+  从错误回调上报）。这类错误只会记一次 `warn`（`Audio stream reported a recoverable error`），
+  采集继续；只有 `DeviceNotAvailable` / `StreamInvalidated` / `BackendError` 等致命错误才会停掉该源，
+  并在状态栏 / 日志里带上具体原因。
 - 🟡 **能量 VAD 与背景音乐**：默认的 `energy` VAD 无法区分高能量背景音乐与人声；游戏/视频回环场景建议切换 `vad.backend = "silero"`（需 ONNX Runtime 动态库，Release 包已内置）
 - 🟡 **SteamVR Overlay 平台限制**：`output.steamvr` 依赖 OpenVR 运行时，仅在 Windows Full 版可用
 - 🟡 **点击穿透状态下的交互**：开启点击穿透后，浮窗按钮不能再点击，需用托盘菜单或快捷键 `Ctrl/⌘+Alt+T` 操作

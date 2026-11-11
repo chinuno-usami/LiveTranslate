@@ -65,6 +65,27 @@ impl AudioSourceConfig {
     }
 }
 
+/// 归一化 `audio.sources[].device` 的写法，仅用于「同一设备」判重。
+///
+/// 与 `AudioCapture::resolve_device` 的别名规则保持一致：
+/// - `""` / `default` → `default`
+/// - `mic` / `microphone` → `mic:0`
+/// - `loopback` → `loopback:0`
+/// - 设备名按大小写不敏感比较
+///
+/// 这样配置里同时写 `loopback` 与 `loopback:0` 时会被当作同一个设备，
+/// 不会再出现「两个源抢同一个回环端点、只有一个能出声」的隐式失败。
+pub fn canonical_device_spec(spec: &str) -> String {
+    let spec = spec.trim();
+    let lower = spec.to_ascii_lowercase();
+    match lower.as_str() {
+        "" | "default" => "default".to_string(),
+        "mic" | "microphone" => "mic:0".to_string(),
+        "loopback" => "loopback:0".to_string(),
+        _ => lower,
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AudioConfig {
     /// 兼容旧版本的单源字段：`sources` 为空时使用它合成一个默认源
@@ -965,10 +986,10 @@ impl AppConfig {
             if !self.audio.sources.is_empty()
                 && source.enabled
                 && !source.device.trim().is_empty()
-                && !devices.insert(source.device.clone())
+                && !devices.insert(canonical_device_spec(&source.device))
             {
                 errors.push(format!(
-                    "{label}: 设备「{}」已被其它启用中的输入源占用",
+                    "{label}: 设备「{}」已被其它启用中的输入源占用（同一设备不能重复采集）",
                     source.device
                 ));
             }
@@ -1528,6 +1549,35 @@ mod tests {
     #[test]
     fn validation_accepts_defaults() {
         AppConfig::default().validate().unwrap();
+    }
+
+    #[test]
+    fn device_aliases_count_as_the_same_device() {
+        // `loopback` 与 `loopback:0` 会打开同一个回环端点，必须当作重复设备拒绝
+        for (a, b) in [
+            ("loopback", "loopback:0"),
+            ("mic", "mic:0"),
+            ("microphone", "MIC:0"),
+            ("", "default"),
+        ] {
+            assert_eq!(
+                canonical_device_spec(a),
+                canonical_device_spec(b),
+                "{a} 与 {b} 应归一化为同一设备"
+            );
+        }
+        assert_ne!(
+            canonical_device_spec("loopback:0"),
+            canonical_device_spec("loopback:1")
+        );
+
+        let mut cfg = AppConfig::default();
+        cfg.audio.sources = vec![
+            AudioSourceConfig::new("speaker", "扬声器", "loopback"),
+            AudioSourceConfig::new("speaker2", "扬声器 2", "loopback:0"),
+        ];
+        let err = cfg.validate().unwrap_err();
+        assert!(err.contains("设备"), "{err}");
     }
 
     #[test]

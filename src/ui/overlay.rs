@@ -81,6 +81,8 @@ pub struct SourceStatusItem {
     pub id: String,
     pub label: String,
     pub running: bool,
+    /// 采集流是否真的在收到音频（false 且 running = 已连接但无数据）
+    pub audio: bool,
     pub enabled: bool,
     pub translate: bool,
     pub device: String,

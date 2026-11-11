@@ -484,11 +484,11 @@ function sourceRow(source, devices) {
   const fallback = known
     ? ''
     : `<option value="${escapeHtml(source.device)}" selected>${escapeHtml(source.device)}（未找到）</option>`;
-  const dot = source.running ? 'running' : 'idle';
+  const { cls, hint } = sourceDotState(source);
 
   return `
     <div class="source-row" data-id="${escapeHtml(source.id)}">
-      <span class="status-dot ${dot}"></span>
+      <span class="status-dot ${cls}" title="${escapeHtml(hint)}"></span>
       <span class="source-label" title="${escapeHtml(source.message || '')}">${escapeHtml(source.label)}</span>
       <select class="device-select source-device" title="选择设备（切换会重启采集）">
         ${fallback}${options}
@@ -502,6 +502,17 @@ function sourceRow(source, devices) {
         <span>启用</span>
       </label>
     </div>`;
+}
+
+/// 状态点语义：绿 = 采集中且有音频；橙 = 已连接但没有音频数据；灰 = 未在跑
+function sourceDotState(source) {
+  if (!source.running) {
+    return { cls: 'idle', hint: source.message || '未在采集' };
+  }
+  if (source.audio === false) {
+    return { cls: 'silent', hint: source.message || '已连接，但没有音频数据' };
+  }
+  return { cls: 'running', hint: source.message || '采集中' };
 }
 
 /// 按 id 就地更新状态点与控件状态；若设置页增删重排了输入源则整块刷新
@@ -523,7 +534,11 @@ function updateSourceRows(sources) {
     );
     if (!row) continue;
     const dot = row.querySelector('.status-dot');
-    if (dot) dot.className = `status-dot ${source.running ? 'running' : 'idle'}`;
+    if (dot) {
+      const { cls, hint } = sourceDotState(source);
+      dot.className = `status-dot ${cls}`;
+      dot.title = hint;
+    }
     const label = row.querySelector('.source-label');
     if (label) {
       label.textContent = source.label || '';

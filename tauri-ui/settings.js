@@ -988,7 +988,8 @@ function renderSourcesBlock(disabled) {
     </table>
     <div class="sources-actions">
       <button class="btn small" id="add-source-row">＋ 添加输入源</button>
-      <span class="hint">修改后点右下角「保存」写入配置；设备 / 启用变更会重启采集。</span>
+      <span class="hint">修改后点右下角「保存」写入配置；设备 / 启用变更会重启采集；
+        同一设备只能被一个启用中的源采集（loopback 与 loopback:0 是同一个设备）。</span>
     </div>`;
 
   if (disabled) {
@@ -1101,8 +1102,12 @@ function collectSourceErrors(sources) {
     const device = String(source.device || '').trim();
     if (source.enabled && !device) errors.push(`${row}: 启用中的输入源必须指定设备`);
     if (source.enabled && device) {
-      if (devices.has(device)) errors.push(`${row}: 设备「${device}」被多个启用中的输入源占用`);
-      devices.add(device);
+      // 与后端 canonical_device_spec 一致：loopback 与 loopback:0 是同一个端点
+      const key = canonicalDeviceSpec(device);
+      if (devices.has(key)) {
+        errors.push(`${row}: 设备「${device}」被多个启用中的输入源占用`);
+      }
+      devices.add(key);
     }
     if (
       effectiveAsrBackend() === 'edge' &&
@@ -1112,6 +1117,20 @@ function collectSourceErrors(sources) {
     }
   });
   return errors;
+}
+
+/**
+ * 归一化设备 spec，仅用于「同一设备」判重。
+ * 与后端 `config::canonical_device_spec` 保持一致。
+ */
+function canonicalDeviceSpec(spec) {
+  const value = String(spec || '')
+    .trim()
+    .toLowerCase();
+  if (value === '' || value === 'default') return 'default';
+  if (value === 'mic' || value === 'microphone') return 'mic:0';
+  if (value === 'loopback') return 'loopback:0';
+  return value;
 }
 
 function validateSources() {

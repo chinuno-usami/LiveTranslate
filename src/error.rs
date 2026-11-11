@@ -44,6 +44,10 @@ pub enum AppError {
     /// 采集流在收到停止信号之前就断了（USB 拔出 / 设备被抢占）
     #[error("音频输入已中断（设备断开？）")]
     AudioStreamEnded,
+
+    /// 采集流中断，且知道具体原因（后端回调上报的致命错误）
+    #[error("音频输入已中断: {0}")]
+    AudioStreamFailed(String),
 }
 
 impl From<cpal::Error> for AppError {

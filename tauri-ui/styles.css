@@ -98,6 +98,7 @@ body {
   border-radius: 999px;
   background: #6b7280;
   box-shadow: 0 0 8px rgba(107, 114, 128, 0.65);
+  flex: 0 0 auto;
 }
 
 .status-dot.running {
@@ -105,9 +106,16 @@ body {
   box-shadow: 0 0 10px rgba(34, 197, 94, 0.75);
 }
 
-.status-dot.idle {
+/* 已连接但没有音频数据（回环设备当前没有播放） */
+.status-dot.silent {
   background: #f59e0b;
   box-shadow: 0 0 10px rgba(245, 158, 11, 0.75);
+}
+
+/* 未在采集（已停用 / 已停止 / 被跳过） */
+.status-dot.idle {
+  background: #6b7280;
+  box-shadow: 0 0 8px rgba(107, 114, 128, 0.65);
 }
 
 .actions {
