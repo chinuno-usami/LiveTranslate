@@ -46,9 +46,18 @@ if [ -f "$ROOT_DIR/icons/icon.icns" ]; then
   cp "$ROOT_DIR/icons/icon.icns" "$APP_DIR/Contents/Resources/AppIcon.icns"
 fi
 
-# 构建风味说明（标准版 / Full 版差异）
+# 文档与样例配置（与 Linux/Windows 发布包对齐）
 if [ -f "$ROOT_DIR/docs/BUILD_FLAVORS.md" ]; then
   cp "$ROOT_DIR/docs/BUILD_FLAVORS.md" "$APP_DIR/Contents/Resources/BUILD_FLAVORS.md"
+fi
+if [ -f "$ROOT_DIR/README.md" ]; then
+  cp "$ROOT_DIR/README.md" "$APP_DIR/Contents/Resources/README.md"
+fi
+if [ -f "$ROOT_DIR/QUICKSTART.md" ]; then
+  cp "$ROOT_DIR/QUICKSTART.md" "$APP_DIR/Contents/Resources/QUICKSTART.md"
+fi
+if [ -f "$ROOT_DIR/config/default.toml" ]; then
+  cp "$ROOT_DIR/config/default.toml" "$APP_DIR/Contents/Resources/config.example.toml"
 fi
 
 # 随包附带 ONNX Runtime（供 silero VAD 后端使用）

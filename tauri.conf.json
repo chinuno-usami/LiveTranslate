@@ -45,7 +45,7 @@
         "label": "main",
         "title": "LiveTranslate Overlay",
         "width": 1200,
-        "height": 220,
+        "height": 260,
         "minWidth": 160,
         "minHeight": 80,
         "resizable": true,

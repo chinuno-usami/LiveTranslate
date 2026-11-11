@@ -103,11 +103,12 @@ jobs:
           cargo test --locked --all-targets --features extras
 
       # 关闭 silero-vad（无 ort/libloading）的降级路径
-      - name: cargo check + test (no default features)
+      - name: cargo check + clippy + test (no default features)
         shell: bash
         run: |
           set -euo pipefail
           cargo check --locked --all-targets --no-default-features --features custom-protocol
+          cargo clippy --locked --all-targets --no-default-features --features custom-protocol -- -D warnings
           cargo test --locked --all-targets --no-default-features --features custom-protocol
 
       # 标准包不能链接可选依赖（rosc / openvr / cosmic-text）
