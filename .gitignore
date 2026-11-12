@@ -15,6 +15,9 @@ Thumbs.db
 .vscode/
 *.swp
 
+# Pi agent local state
+.pi/
+
 # 运行期落盘的临时会话文件（如 SQLite 内存库产物）
 *.ses
 
