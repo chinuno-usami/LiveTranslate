@@ -2360,10 +2360,10 @@ fn list_translation_history_records(
 
 fn get_translation_history_record(
     store: Option<&history::HistoryStore>,
-    id: &str,
+    seq: u64,
 ) -> Result<Option<history::TranslationRecord>, String> {
     match store {
-        Some(store) => store.get(id).map_err(|e| e.to_string()),
+        Some(store) => store.get(seq).map_err(|e| e.to_string()),
         None => Ok(None),
     }
 }
@@ -2382,7 +2382,7 @@ fn clear_translation_history_store(
         store.clear().map_err(|e| e.to_string())?;
     }
     if let Some(store) = store {
-        tracing::info!(path = %store.path().display(), "已清空翻译历史");
+        tracing::info!(dir = %store.dir().display(), "已清空翻译历史");
     } else {
         tracing::info!("已清空翻译历史");
     }
@@ -2406,11 +2406,11 @@ async fn list_translation_history(
 #[tauri::command]
 async fn get_translation_record(
     state: State<'_, Arc<SharedState>>,
-    id: String,
+    seq: u64,
 ) -> Result<Option<history::TranslationRecord>, String> {
     let store = state.history_store.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        get_translation_history_record(store.as_ref(), &id)
+        get_translation_history_record(store.as_ref(), seq)
     })
     .await
     .map_err(|e| format!("读取翻译详情任务失败: {e}"))?
@@ -2420,11 +2420,22 @@ async fn get_translation_record(
 async fn clear_translation_history(state: State<'_, Arc<SharedState>>) -> Result<(), String> {
     let history = state.history.clone();
     let store = state.history_store.clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        clear_translation_history_store(&history, store.as_ref())
-    })
+    // 超时只让 UI 脱离 loading；worker 里的 Clear 仍会继续执行并删文件，并非取消。
+    // 不改 `clear_blocking` 的阻塞语义（`SyncSender` 没有 `send_timeout`）。
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        tauri::async_runtime::spawn_blocking(move || {
+            clear_translation_history_store(&history, store.as_ref())
+        }),
+    )
     .await
-    .map_err(|e| format!("清空翻译历史任务失败: {e}"))?
+    {
+        Ok(join) => join.map_err(|e| format!("清空翻译历史任务失败: {e}"))?,
+        Err(_) => {
+            tracing::warn!("清空翻译历史超时，后台 worker 仍会继续删除段文件");
+            Err("清空翻译历史超时，后台仍可能继续删除，请稍后刷新确认".into())
+        }
+    }
 }
 
 // ---------------- 系统集成 ----------------
@@ -3182,9 +3193,7 @@ mod tests {
             .unwrap()
             .items
             .is_empty());
-        assert!(get_translation_history_record(None, "any")
-            .unwrap()
-            .is_none());
+        assert!(get_translation_history_record(None, 0).unwrap().is_none());
         let err = clear_translation_history_store(&history::OptionalHistoryWriter::default(), None)
             .unwrap_err();
         assert!(err.contains("不可用"), "{err}");
@@ -3199,11 +3208,12 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("translations.jsonl");
-        let store = history::HistoryStore::with_path(&path, 100);
+        let path = dir.join("seg-000000.jsonl");
+        let store = history::HistoryStore::with_dir(&dir, 100);
         let writer = history::writer::HistoryWriter::spawn(store.clone(), 8);
         let history = history::OptionalHistoryWriter::new(Some(writer));
         let a = history::TranslationRecord {
+            seq: 0,
             id: "a".into(),
             created_at: 100,
             source_id: "mic".into(),
@@ -3212,6 +3222,7 @@ mod tests {
             translated: "一".into(),
         };
         let b = history::TranslationRecord {
+            seq: 0,
             id: "b".into(),
             created_at: 200,
             source_id: "mic".into(),
@@ -3219,27 +3230,31 @@ mod tests {
             source: "two".into(),
             translated: "二".into(),
         };
-        store.append(&a).unwrap();
-        store.append(&b).unwrap();
+        let a = store.append(a).unwrap();
+        let b = store.append(b).unwrap();
 
         let page = list_translation_history_records(Some(&store), None, Some(1)).unwrap();
         assert_eq!(page.items.len(), 1);
         assert_eq!(page.items[0].id, "b");
+        assert_eq!(page.items[0].seq, b.seq);
         assert!(page.has_more);
 
         // 游标翻页拿到更早的一条，且不再有下一页
         let cursor = history::HistoryCursor::of(&page.items[0]);
         let page = list_translation_history_records(Some(&store), Some(&cursor), Some(1)).unwrap();
         assert_eq!(page.items[0].id, "a");
+        assert_eq!(page.items[0].seq, a.seq);
         assert!(!page.has_more);
 
-        let got = get_translation_history_record(Some(&store), "a")
+        let got = get_translation_history_record(Some(&store), a.seq)
             .unwrap()
             .expect("record a");
         assert_eq!(got.source, "one");
-        assert!(get_translation_history_record(Some(&store), "missing")
-            .unwrap()
-            .is_none());
+        assert!(
+            get_translation_history_record(Some(&store), a.seq.wrapping_add(99))
+                .unwrap()
+                .is_none()
+        );
 
         clear_translation_history_store(&history, Some(&store)).unwrap();
         assert!(!path.exists());
@@ -3249,13 +3264,23 @@ mod tests {
             .is_empty());
 
         // 写线程不可用时清空必须回退到直接删存储，不能整个失效
-        store.append(&a).unwrap();
+        store.append(a).unwrap();
         let dead_history = history::OptionalHistoryWriter::new(Some(
             history::writer::HistoryWriter::disconnected(),
         ));
         assert!(dead_history.clear_blocking().is_err());
         clear_translation_history_store(&dead_history, Some(&store)).unwrap();
-        assert!(!path.exists());
+        let remaining_segs: Vec<_> = std::fs::read_dir(&dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with("seg-") && n.ends_with(".jsonl"))
+            .collect();
+        assert!(
+            remaining_segs.is_empty(),
+            "clear 后不应残留段文件: {remaining_segs:?}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

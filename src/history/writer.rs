@@ -7,8 +7,8 @@
 //! 入队只搬运字幕行本身，UUID 与记录构造推迟到写线程：队列满时不会白白生成
 //! 一个记录再丢掉。
 //!
-//! 隐私清空走同一条写线程队列：先抬升 epoch 丢弃在途 Append，再删 jsonl/tmp，
-//! 并通过 ack 通道同步等待完成，避免「清空后历史复活」。退出前用
+//! 隐私清空走同一条写线程队列：先抬升 epoch 丢弃在途 Append，再删全部 `seg-*.jsonl`
+//! 与遗留文件，并通过 ack 通道同步等待完成，避免「清空后历史复活」。退出前用
 //! [`HistoryWriter::flush_blocking`] 把队列刷盘，避免丢掉最后几条记录。
 
 use super::{HistoryStore, TranslationRecord};
@@ -85,6 +85,10 @@ impl HistoryWriter {
     }
 
     /// 阻塞清空：抬升 epoch、串行丢弃在途 Append、删除文件后返回。
+    ///
+    /// 命令侧（`clear_translation_history`）用 `tokio::time::timeout` 包住
+    /// `spawn_blocking` 只解脱 UI loading；超时**不会**取消本方法——worker 仍会
+    /// 继续执行 `Clear` 并删除文件。此处保持阻塞语义（`SyncSender` 无 `send_timeout`）。
     pub fn clear_blocking(&self) -> Result<(), String> {
         let _ = self.epoch.fetch_add(1, Ordering::SeqCst);
         let (ack_tx, ack_rx) = sync_channel(1);
@@ -149,10 +153,11 @@ fn worker_loop(store: HistoryStore, rx: Receiver<HistoryJob>, epoch: Arc<AtomicU
                     continue;
                 }
                 let record = TranslationRecord::from_subtitle_line(&line);
-                if let Err(err) = store.append(&record) {
+                let id = record.id.clone();
+                if let Err(err) = store.append(record) {
                     tracing::warn!(
                         error = %err,
-                        id = %record.id,
+                        id = %id,
                         "翻译历史写入失败"
                     );
                 }
@@ -290,8 +295,8 @@ mod tests {
     #[test]
     fn offer_persists_without_touching_caller() {
         let dir = test_dir("persist");
-        let path = dir.join("translations.jsonl");
-        let store = HistoryStore::with_path(&path, 100);
+        let path = dir.join("seg-000000.jsonl");
+        let store = HistoryStore::with_dir(&dir, 100);
         let writer = HistoryWriter::spawn(store, 8);
         let line = SubtitleLine::new("mic", "Mic", "hello".into(), "你好".into());
         writer.offer(&line);
@@ -314,8 +319,7 @@ mod tests {
     #[test]
     fn flush_blocking_persists_queued_records() {
         let dir = test_dir("flush");
-        let path = dir.join("translations.jsonl");
-        let store = HistoryStore::with_path(&path, 100);
+        let store = HistoryStore::with_dir(&dir, 100);
         let writer = HistoryWriter::spawn(store.clone(), 16);
         for i in 0..8 {
             writer.offer(&SubtitleLine::new(
@@ -353,12 +357,11 @@ mod tests {
 
     #[test]
     fn append_io_failure_is_swallowed_by_worker() {
-        // 指向「父路径是普通文件」使 create_dir_all / open 失败
+        // 把「目录」设成普通文件，使 create_dir_all / open 失败
         let dir = test_dir("iofail");
         let blocker = dir.join("not-a-dir");
         fs::write(&blocker, b"x").unwrap();
-        let bad_path = blocker.join("translations.jsonl");
-        let store = HistoryStore::with_path(bad_path, 10);
+        let store = HistoryStore::with_dir(&blocker, 10);
         let writer = HistoryWriter::spawn(store, 4);
         writer.offer(&SubtitleLine::new("mic", "Mic", "x".into(), "y".into()));
         // 写盘失败也要把任务处理掉，让 flush 能返回；skipped 仍为 0（已入队）
@@ -369,8 +372,8 @@ mod tests {
     #[test]
     fn clear_blocking_discards_queued_appends_and_deletes_file() {
         let dir = test_dir("clear-race");
-        let path = dir.join("translations.jsonl");
-        let store = HistoryStore::with_path(&path, 100);
+        let path = dir.join("seg-000000.jsonl");
+        let store = HistoryStore::with_dir(&dir, 100);
         // 容量 1：先塞满一条 Append，再 clear；worker 被 sleep 占住前先排队
         let writer = HistoryWriter::spawn(store.clone(), 1);
 
@@ -398,18 +401,18 @@ mod tests {
         }
         writer.clear_blocking().expect("clear");
 
-        assert!(!path.exists(), "clear 后 jsonl 应删除");
+        assert!(!path.exists(), "clear 后旧段应删除");
         // 给可能残留的旧 epoch 写入一点时间；文件不应被重建出 ghost 内容
         thread::sleep(Duration::from_millis(80));
-        if path.exists() {
-            let body = fs::read_to_string(&path).unwrap_or_default();
-            assert!(
-                !body.contains("ghost-"),
-                "清空后不应再落盘清空前的在途记录: {body}"
-            );
-        }
+        let any_ghost = fs::read_dir(&dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|e| fs::read_to_string(e.path()).ok())
+            .any(|body| body.contains("ghost-"));
+        assert!(!any_ghost, "清空后不应再落盘清空前的在途记录");
 
-        // 清空之后的新记录仍可写入
+        // 清空之后的新记录仍可写入（段号单调，落在 seg-000001）
         writer.offer(&SubtitleLine::new(
             "mic",
             "Mic",
@@ -417,7 +420,8 @@ mod tests {
             "后".into(),
         ));
         writer.flush_blocking().expect("flush");
-        assert!(fs::read_to_string(&path)
+        let after_path = dir.join("seg-000001.jsonl");
+        assert!(fs::read_to_string(&after_path)
             .map(|s| s.contains("after"))
             .unwrap_or(false));
     }

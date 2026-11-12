@@ -591,18 +591,19 @@ DEBUG livetranslate::app: VAD 噪声底 ≈ -52.3 dBFS (speech 阈值 ≈ -44.3 
 
 ### 翻译历史文件位置
 
-翻译结果会旁路写入本地 JSONL（失败只记日志，不影响实时浮窗 / OSC / SteamVR）。
-路径在用户**本地数据目录**下的 `history/translations.jsonl`（与配置目录可能不同，尤其是 Windows）：
+翻译结果会旁路写入本地分段 JSONL（失败只记日志，不影响实时浮窗 / OSC / SteamVR）。
+路径在用户**本地数据目录**下的 `history/seg-*.jsonl`（与配置目录可能不同，尤其是 Windows）：
 
 | 平台 | 路径 |
 |------|------|
-| macOS | `~/Library/Application Support/com.chinuno.LiveTranslate/history/translations.jsonl` |
-| Windows | `%LOCALAPPDATA%\chinuno\LiveTranslate\data\history\translations.jsonl` |
-| Linux | `~/.local/share/livetranslate/history/translations.jsonl` |
+| macOS | `~/Library/Application Support/com.chinuno.LiveTranslate/history/seg-*.jsonl` |
+| Windows | `%LOCALAPPDATA%\chinuno\LiveTranslate\data\history\seg-*.jsonl` |
+| Linux | `~/.local/share/livetranslate/history/seg-*.jsonl` |
 
-- **保留上限**：默认 5000 条；超出后裁掉最旧记录。
+- **保留上限**：不超过 5000 条（按 500 条粒度裁剪）。
+- **升级提示**：旧版本的单文件 `history/translations.jsonl`（含 `.tmp`）**不会迁移**，新版本启动时会直接删除；升级前想保留旧历史请先自行备份。
 - **与浮窗裁剪的关系**：历史文件独立于 `subtitle.max_lines`；浮窗 / OSC / SteamVR 仍只显示各自滚动窗口内的行。
-- **清空**：历史窗口的「清空」经写线程串行处理（丢弃在途写入后删除 JSONL 与临时文件；隐私清除，不可撤销）。它不会清空当前浮窗里已显示的字幕行，也不会改配置。
+- **清空**：历史窗口的「清空」经写线程串行处理（丢弃在途写入后删除全部 `seg-*.jsonl` 与遗留临时文件；隐私清除，不可撤销）。它不会清空当前浮窗里已显示的字幕行，也不会改配置。
 
 日志中会打印实际使用的配置路径，例如：
 ```

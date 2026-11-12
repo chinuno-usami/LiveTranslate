@@ -171,6 +171,7 @@ fn append(&mut self, record: TranslationRecord) -> AppResult<TranslationRecord> 
 - 保持 `f52ef81` 的「入队只搬运字幕行；`id` / `created_at` 等在写线程用 `from_subtitle_line` 构造」。**`seq` 不在构造时填真实值**（占位 0），由 `HistoryStore::append` 在持锁写入时分配——这依赖「只有写线程调用 append」的前提。`writer.rs` 生产代码需从 `store.append(&record)` 改为 `store.append(record)`（owned）。
 - `rotate()` 顺序：`file.flush()` → drop 句柄 → `create_new` 新段（冲突时递增重试）→ 目录 fsync（Unix 可选，Windows 忽略）。任一步失败只 `warn`（返回 `Err` 由 worker 吞掉），本条记录丢弃、`next_index` 不推进；下一次 append 会重试旋转，不影响实时链路。
 - 半写入（进程崩溃留下半行）按坏行跳过；因为 `next_index` 只在 `write_all` 成功后推进，正常路径**不会出现两条可解析记录共用同一个 `seq`**。唯一例外是「本条已写出完整行、但 `write_all` 返回错误，随后 `set_len` 回滚也失败」：残行可解析而 `next_index` 未推进 → 下一条复用同一个 `seq`。此时按坏行容忍（`get` 的 `binary_search` 只会命中其中一条），不要把它写成无条件保证。
+- **崩溃残留的半行必须在 `open` 时截断**（`repair_trailing_partial_line`）：`write_line` 只 `flush` 不 `fsync`，进程被杀/断电会留下无结尾 `\n` 的残行；若直接 `O_APPEND` 追加，下一条记录会与残行连成一条不可解析的坏行，**重启后写入的第一条记录静默丢失**。规则：文件非空且末字节不是 `\n` → `set_len(最后一个 \n 之后)`（找不到 `\n` 则清空），只 `warn`，截断失败则保持原样（当作坏行）。注意回归测试必须 `drop(store)` 后**重新打开**再断言磁盘内容：LRU 缓存会命中内存副本，把这类损坏完全遮蔽。
 - **缓存完整度是硬不变式**：写路径的 `push` 与读路径的 `segment` 必须对「完整/部分」达成一致。典型踩坑路径：首屏解析活动段（complete）→ 用户连续翻页读到 seg-2/1/0 → LRU 淘汰活动段 → 下一次 `append` 未命中 → 若此时插入单元素 Vec，之后任何读者都会看到「该段只有最新 1 条」，其余记录在 UI 上消失（磁盘仍在）。所以 miss 分支只能「先整段解析」，不允许插入部分条目；同理 `drop_oldest` 删段时必须连条目一起删（见下文 `drop_oldest` 要点）。
 - **写失败后要回滚文件长度**：`write_all` 失败时可能已经写出半行，紧随其后的下一次 append 会与残行首尾相连，把「残行 + 下一条」合成一条坏行 → 下一条静默丢失（正常路径 `seq` 不重复，但数据丢了）。实现时在写前记 `active.file.metadata()?.len()`，失败后 `set_len(len)` 截回（best-effort，截回失败只 `warn`）；这样「写失败只丢本条」才是真的。
 - `drop_oldest()` 在 Windows 上可能因句柄未关而失败（`ERROR_SHARING_VIOLATION`）：重试 1~2 次，仍失败则保留该段并在**下次 append 时**再试（保留检查在每次 `append` 都会执行，不是只在旋转时；只会短暂多占 ≤ `SEGMENT_RECORDS` 条）。**失败只记 warn，不向上返回 `Err`**，避免已经落盘的本条被当成写入失败。
@@ -179,11 +180,11 @@ fn append(&mut self, record: TranslationRecord) -> AppResult<TranslationRecord> 
 - **启动/打开时的恢复规则**（写在 `open` 里，不在 `append`）：
   1. `create_dir_all(dir)`；失败 → `open` 返回错误 → 既有降级「禁用持久化」。
   2. 删除遗留 `translations.jsonl`、`translations.jsonl.tmp`（`NotFound` 忽略；失败只 `warn`）。**这会丢弃开发机上的旧数据**，发版说明里写一句。
-  3. 扫描 `seg-<digits>.jsonl` 解析段号得 `segments`（允许空洞；不匹配的其它文件忽略），并置 `next_ordinal = max(段号) + 1`（目录为空时为 0）。分页用 `ord -= 1` 遍历时依赖「空/缺失段跳过 + oldest 下界」（见 §6）。**`clear` 之后不清零 `next_ordinal`**，这是 §6 旧游标守卫能生效的前提。
+  3. 扫描 `seg-<digits>.jsonl` 解析段号得 `segments`（允许空洞；不匹配的其它文件忽略），并置 `next_ordinal = max(段号) + 1`（目录为空时为 0）。分页**按 `segments` 里实际存在的段倒序遍历**（`filter(<= start)` + reverse），不要用段号数值递减：空洞大时每个不存在的段号都会做一次 `File::open`（持锁 + 污染 LRU）。**`clear` 之后不清零 `next_ordinal`**，这是 §6 旧游标守卫能生效的前提。
   4. 段数 > `max_segments` → 从最旧开始删到 `max_segments`（O(1)/段）。**这把裁剪时机从「首次 append」提前到「open」**：现有 `first_append_after_restart_trims_existing_overflow` 的语义随之改变，需改名并改断言（§10 测试 17）。
-  5. 打开最新段（`OpenOptions::new().append(true)`）为 `active`，`next_index = max(解析到的 index) + 1`（无可解析行为 0，空尾段直接复用而不新建）；若 `next_index >= segment_records`，首次 `append` 时旋转。
+  5. 打开最新段前先做残行修复（见下一条「崩溃残留的半行」）；再 `OpenOptions::new().append(true)` 打开为 `active`，`next_index = max(解析到的 index) + 1`（无可解析行为 0，空尾段直接复用而不新建），并 `.min(segment_records)`（段文件被污染 / `max_records` 调小导致 index 溢出时按满段处理，直接旋转，保证 `seq` 不重复）；若 `next_index >= segment_records`，首次 `append` 时旋转。
 - **`rotate` 用 `next_ordinal` 取新段号**（`seg-{next_ordinal:06}`，成功创建后 `next_ordinal += 1`），不要用 `segments.last() + 1`：`clear` 后 `segments` 为空，依赖它必然回到 `seg-0`，与 §6/§7 的段号单调前提冲突。
-- **`open` 必须 eager 且可失败**：`open(dir, max_records) -> AppResult<SegState>` 在构造存储时同步完成 §5 步骤 1~5，由 `OptionalHistoryWriter::try_spawn_default_with_store`（`writer.rs:207`）在 `HistoryWriter::spawn` **之前**调用，保证清理期间没有并发读者（§7）。测试用的 `with_dir(dir, max_records)` 保持不可失败签名，但内部同样 eager open：错误先存进状态（例如 `init: Result<SegState, AppError>`），由首次 `append` / `list_page` / `get` 返回 `Err`，与现有「`open` 失败 → 禁用持久化」的降级一致。**不要改成懒 open**：那会把删文件/裁剪挪到写路径上，并让「写线程启动前完成」的时序说明失效。
+- **`open` 必须 eager 且可失败**：`open(dir, max_records) -> AppResult<SegState>` 在构造存储时同步完成 §5 步骤 1~5，由 `OptionalHistoryWriter::try_spawn_default_with_store`（`writer.rs:207`）在 `HistoryWriter::spawn` **之前**调用，保证清理期间没有并发读者（§7）。测试用的 `with_dir(dir, max_records)` 保持不可失败签名，但内部同样在构造时 eager open（清理/裁剪立即生效）：失败只 `warn`、**错误不缓存**，由首次 `append` / `list_page` / `get` 返回 `Err`，并在下一次访问自动重试（瞬时故障可自愈，不要退化成「整个会话禁用历史」）。`open_default` 则把启动阶段的失败上报，保持「`open` 失败 → 禁用持久化」的降级。**不要把打开挪到写路径上**：那会把删文件/裁剪挪到写线程里，并让「写线程启动前完成」的时序说明失效。
 - 现有队列/epoch/`flush_blocking` 机制不变，只是 job 的处理体换成 `SegState::append`。
 
 ## 6. 读路径
@@ -355,13 +356,15 @@ pub fn get(&self, seq: u64) -> AppResult<Option<TranslationRecord>> {
 8. `cursor_behind_oldest_returns_empty`：retention unlink 最旧段后，仍持有已删段上的低位游标 → 空页，且不 `u32` 下溢/空转。
 9. `malformed_lines_do_not_break_cursor`：段内注入坏行后，跨页结果仍不重不漏（第 6 节「按 seq 二分」的回归）。
 10. `empty_or_missing_segment_is_skipped`：手工造 0 条活动段 / 删除中间段文件，`list_page` 不 panic、不报错、段内其它记录仍可读；读满一页后若更旧段全空，`has_more = false`。
-11. `restart_assigns_unique_seq`：重启后（含末行半写入）新记录的 `seq` 不与已有记录重复，`next_index` 正确恢复。
+11. `restart_assigns_unique_seq`：重启后（含末行半写入）新记录的 `seq` 不与已有记录重复，`next_index` 正确恢复；**必须 `drop(store)` 再重新打开**后断言磁盘上的记录集合（只看内存 LRU 会漏掉残行粘连）。
 12. `get_by_seq`：命中/未命中/清空后/游标段已裁掉均符合预期；`TranslationRecord::seq` 随记录返回。
 13. `clear_removes_all_segments_and_legacy`：目录清空、`list` 空页、`translations.jsonl.tmp` 一并消失；**清空后新写入的段号严格大于清空前的最大段号**（段号不归零，见 §7）；清空前拿到的游标 / `seq` 在清空后必须返回空页 / `None`（旧游标守卫的回归）。
 14. `legacy_files_are_ignored_and_removed`：放入旧 `translations.jsonl`（含坏行）+ `.tmp` → `open` 后不读取、被删除、`segments` 为空。
 15. `out_of_order_created_at_does_not_break_paging`：乱序 `created_at` 下分页仍严格按 `seq` 倒序、无重复无遗漏（替代原来对 `(created_at,id)` 的排序假设）。
 16. `has_more_true_when_next_older_segment_nonempty`（回归 §6 的 peek 区间）：构造「正好读满一页 + 下一个更旧段非空」，断言 `has_more = true` 且下一页能读到该段记录。最省事的做法是复用测试 1 的 `with_dir(dir, 501)`（`seg-0` 500 条 + `seg-1` 1 条），`limit = 1`：首页读完 `seg-1` 恰好满页，peek 必须看到 `seg-0` 非空。store 层不受命令层 `HISTORY_LIST_MAX_LIMIT = 200` 的钳制，也可以造自然可达的变体：`with_dir(dir, 1500)`（`segment_records = 500`、`max_segments = 3`）写 1001 条 → seg0=500 / seg1=500 / seg2=1，`limit = 501` 时首页正好读完 seg2+seg1 满页，peek 必须看到 seg0 非空。**不要**指望 `seg0=5 / seg1=20 / seg2=10` 这种形状能靠 append 造出来：`segment_records` 恒为 `min(500, max_records)`，不满 500 的段只可能是最新段，那种形状只能手写段文件。与测试 10（更旧段全空时 `has_more = false`）成对，覆盖 peek 的假阳性与假阴性两侧。
 17. `open_trims_overflow_segments`（替代 `first_append_after_restart_trims_existing_overflow`）：让目录里的段数超过 `max_segments`（先用大 `max_records` 写入再用小 `max_records` 打开，或手写多余段文件），断言 **`open` 当时**就把最旧段裁到 `max_segments`（不拖到首次 `append`），且 `list_page` 拿到的条数在 `MAX_SEGMENTS × SEGMENT_RECORDS` 上界内。
+18. `torn_tail_is_truncated_on_open`：手工在段尾追加无 `\n` 的半行 → 重新打开后文件长度回到完整行末尾、残行被截掉、新记录独占一行且重启后仍可读。
+19. `open_failure_is_retried_on_next_access`：把历史目录换成普通文件让 `open` 失败 → `append` / `list_page` 返回 `Err`；删掉障碍物后**不重建 store** 直接 `append` 成功（错误未被缓存）。
 
 **手工验证**
 
@@ -378,7 +381,7 @@ pub fn get(&self, seq: u64) -> AppResult<Option<TranslationRecord>> {
 - [ ] `has_more` 判定正确：读满一页且下一个更旧段非空 → `true`（测试 16），更旧段全空 → `false`（测试 10），不出现「提前停止翻页导致旧记录不可见」。
 - [ ] 保留条数硬上界为 `MAX_SEGMENTS × SEGMENT_RECORDS`（默认配置恰好 = 5000；`max_records` 非 500 整数倍时可超出 `max_records`，见 §3），且与 `history_list_page_limit` 一致；`drop_oldest` 失败时允许短暂超过，并在下次 append 重试。
 - [ ] `clear` 不重置段号（§7）：清空后新数据从 `seg-(N+1)` 起，§6 的 `ord < oldest` 守卫能挡住清空前的旧游标 / 旧 `seq`（测试 13）；前端 `clear` 后照常重置游标，但那只是双保险、不是唯一防线。
-- [ ] 启动时遗留单文件被清理且不被读取；`clear` 尽力删除全部数据文件并阻断在途写入。
+- [ ] 启动时遗留单文件被清理且不被读取；崩溃残留的半行在 `open` 时截断（测试 18），`clear` 尽力删除全部数据文件并阻断在途写入。
 - [ ] `cargo fmt --check` / `cargo clippy` / `cargo test` 全绿；README 与 `V0.2_FEATURE_PLAN` 的路径/上限描述与实际一致。
 
 ## 12. 备选方案（以及为什么不选）

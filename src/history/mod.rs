@@ -1,7 +1,8 @@
-//! 翻译历史记录（持久化层模型与本地 JSONL 存储）。
+//! 翻译历史记录（持久化层模型与本地分段 JSONL 存储）。
 //!
 //! 与滚动浮窗用的 [`crate::subtitle::SubtitleLine`] 解耦：
-//! 实时显示仍按 `max_lines` 裁剪；本类型带稳定 id 与时间戳，供本地存储与 UI 查询。
+//! 实时显示仍按 `max_lines` 裁剪；本类型带稳定 id、时间戳与 `seq`，
+//! 供 `history/seg-*.jsonl` 分段存储与按 `seq` 游标分页 / 详情查询。
 
 pub mod store;
 pub mod writer;
@@ -16,6 +17,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// 一条可持久化的翻译历史记录。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TranslationRecord {
+    /// 全局单调排序键；由存储层在写入时分配（构造时占位为 0）。
+    pub seq: u64,
     /// 稳定唯一 id（UUID v4）
     pub id: String,
     /// 创建时间：Unix 纪元毫秒（UTC）
@@ -27,7 +30,7 @@ pub struct TranslationRecord {
 }
 
 impl TranslationRecord {
-    /// 新建记录：自动生成 id 与当前 `created_at`。
+    /// 新建记录：自动生成 id 与当前 `created_at`；`seq` 占位为 0。
     pub fn new(
         source_id: impl Into<String>,
         label: impl Into<String>,
@@ -35,6 +38,7 @@ impl TranslationRecord {
         translated: impl Into<String>,
     ) -> Self {
         Self {
+            seq: 0,
             id: uuid::Uuid::new_v4().to_string(),
             created_at: unix_now_millis(),
             source_id: source_id.into(),
@@ -72,6 +76,7 @@ mod tests {
         let record = TranslationRecord::new("mic", "麦克风", "hello", "你好");
         let after = unix_now_millis();
 
+        assert_eq!(record.seq, 0);
         assert!(!record.id.is_empty());
         assert!(uuid::Uuid::parse_str(&record.id).is_ok());
         assert!(record.created_at >= before && record.created_at <= after);
@@ -86,6 +91,7 @@ mod tests {
         let line = SubtitleLine::new("sys", "系统音频", "world".into(), "世界".into());
         let record = TranslationRecord::from_subtitle_line(&line);
 
+        assert_eq!(record.seq, 0);
         assert_eq!(record.source_id, line.source_id);
         assert_eq!(record.label, line.label);
         assert_eq!(record.source, line.source);
@@ -98,6 +104,7 @@ mod tests {
     #[test]
     fn serde_roundtrip_preserves_fields() {
         let record = TranslationRecord {
+            seq: 42,
             id: "11111111-2222-3333-4444-555555555555".into(),
             created_at: 1_700_000_000_000,
             source_id: "mic".into(),

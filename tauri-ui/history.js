@@ -28,14 +28,16 @@ const els = {
   confirmCancel: document.getElementById('confirm-cancel'),
 };
 
-/** @type {Array<{id:string,created_at:number,source_id:string,label:string,source:string,translated:string}>} */
+/** @type {Array<{seq:number,id:string,created_at:number,source_id:string,label:string,source:string,translated:string}>} */
 let records = [];
-/** 上一页最后一条的游标；null 表示第一页。翻页期间有新记录写入也不会重复/漏条 */
+/** 上一页最后一条的游标 `{ seq }`；null 表示第一页。翻页期间有新记录写入也不会重复/漏条 */
 let cursor = null;
 let hasMore = false;
 let loading = false;
 let selectedId = null;
 let detailLoading = false;
+/** 详情请求序号：只接受最后一次请求的结果 */
+let detailRequestId = 0;
 
 function showError(message) {
   if (!els.errorBanner) return;
@@ -149,12 +151,15 @@ function timelineItemHtml(record) {
   const datetime = escapeHtml(formatDateTimeAttr(record.created_at));
   const source = escapeHtml(summarize(record.source, 96));
   const translated = escapeHtml(summarize(record.translated, 96));
+  // seq 缺失时不渲染 data-seq，避免写出 data-seq="NaN" 的假可点卡片
+  const seq = Number(record.seq);
+  const seqAttr = Number.isFinite(seq) ? ` data-seq="${seq}"` : '';
   return `
         <li class="timeline-item">
           <button
             type="button"
             class="timeline-card${selected}"
-            data-id="${escapeHtml(record.id)}"
+            data-id="${escapeHtml(record.id)}"${seqAttr}
             aria-pressed="${record.id === selectedId ? 'true' : 'false'}"
           >
             <div class="timeline-meta">
@@ -324,18 +329,26 @@ function fillDetail(record) {
 function closeDetail() {
   if (!els.detailModal) return;
   els.detailModal.classList.add('hidden');
+  // 丢弃在途详情请求，避免关闭后才把结果写回面板
+  detailRequestId += 1;
+  detailLoading = false;
   showDetailError('');
 }
 
-async function openDetail(id) {
-  if (!id) return;
-  selectRecord(id);
-  const cached = records.find((r) => r.id === id) || null;
+async function openDetail(seq) {
+  // seq=0 是首条合法值，不能用真值判断
+  if (!Number.isFinite(seq)) return;
+  // 并发点击时只让最后一次请求写面板（慢的旧响应会覆盖新记录）
+  const requestId = ++detailRequestId;
+  const cached = records.find((r) => r.seq === seq) || null;
   if (cached) {
+    selectRecord(cached.id);
     fillDetail(cached);
   } else {
+    selectRecord(null);
     fillDetail({
-      id,
+      seq,
+      id: '',
       created_at: 0,
       source_id: '',
       label: '',
@@ -357,14 +370,17 @@ async function openDetail(id) {
 
   detailLoading = true;
   try {
-    const record = await invoke('get_translation_record', { id });
+    const record = await invoke('get_translation_record', { seq });
+    if (requestId !== detailRequestId) return;
     if (!record) {
       showDetailError('记录不存在或已被清理');
       return;
     }
+    selectRecord(record.id);
     fillDetail(record);
     showDetailError('');
   } catch (error) {
+    if (requestId !== detailRequestId) return;
     console.error('加载翻译详情失败', error);
     if (!cached) {
       showDetailError(`加载详情失败: ${error}`);
@@ -372,7 +388,7 @@ async function openDetail(id) {
       showDetailError(`刷新详情失败，已显示本地缓存: ${error}`);
     }
   } finally {
-    detailLoading = false;
+    if (requestId === detailRequestId) detailLoading = false;
   }
 }
 
@@ -381,7 +397,7 @@ async function fetchPage(before) {
     throw new Error('Tauri invoke 不可用');
   }
   const page = await invoke('list_translation_history', {
-    before: before ? { created_at: before.created_at, id: before.id } : null,
+    before: before ? { seq: before.seq } : null,
     limit: PAGE_SIZE,
   });
   if (!page || !Array.isArray(page.items)) {
@@ -406,7 +422,7 @@ function mergeRecords(items) {
 function cursorOf(items) {
   if (!items.length) return null;
   const last = items[items.length - 1];
-  return { created_at: last.created_at, id: last.id };
+  return { seq: last.seq };
 }
 
 async function loadInitial() {
@@ -513,7 +529,13 @@ function bindUi() {
     els.timeline.addEventListener('click', (event) => {
       const card = event.target.closest('.timeline-card');
       if (!card) return;
-      openDetail(card.getAttribute('data-id'));
+      const seq = Number(card.dataset.seq);
+      if (!Number.isFinite(seq)) {
+        console.warn('历史卡片缺少 seq，无法加载详情', card.dataset.id);
+        showDetailError('该记录缺少定位序号，无法加载详情');
+        return;
+      }
+      openDetail(seq);
     });
   }
   if (els.detailClose) {
