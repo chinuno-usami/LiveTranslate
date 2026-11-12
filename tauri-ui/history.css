@@ -7,7 +7,6 @@
   --muted: #8b98a5;
   --accent: #38bdf8;
   --danger: #f87171;
-  --ok: #34d399;
   --chip-color: #7dd3fc;
   color-scheme: dark;
 }
@@ -112,7 +111,6 @@ button,
   color: #fecaca;
 }
 
-.banner.hidden,
 .hidden {
   display: none !important;
 }
@@ -127,10 +125,6 @@ button,
   margin: 48px auto;
   text-align: center;
   color: var(--muted);
-}
-
-.empty-state.hidden {
-  display: none;
 }
 
 .timeline {
@@ -274,10 +268,6 @@ button,
   padding: 16px;
   box-sizing: border-box;
   background: rgba(0, 0, 0, 0.45);
-}
-
-.modal.hidden {
-  display: none;
 }
 
 .modal-card {

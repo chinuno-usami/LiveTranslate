@@ -25,7 +25,8 @@ const els = {
 
 /** @type {Array<{id:string,created_at:number,source_id:string,label:string,source:string,translated:string}>} */
 let records = [];
-let nextOffset = 0;
+/** 上一页最后一条的游标；null 表示第一页。翻页期间有新记录写入也不会重复/漏条 */
+let cursor = null;
 let hasMore = false;
 let loading = false;
 let selectedId = null;
@@ -136,17 +137,14 @@ function updateChrome() {
   }
 }
 
-function renderTimeline() {
-  if (!els.timeline) return;
-  els.timeline.innerHTML = records
-    .map((record) => {
-      const selected = record.id === selectedId ? ' selected' : '';
-      const chip = escapeHtml(sourceLabel(record));
-      const time = escapeHtml(formatTime(record.created_at));
-      const datetime = escapeHtml(formatDateTimeAttr(record.created_at));
-      const source = escapeHtml(summarize(record.source, 96));
-      const translated = escapeHtml(summarize(record.translated, 96));
-      return `
+function timelineItemHtml(record) {
+  const selected = record.id === selectedId ? ' selected' : '';
+  const chip = escapeHtml(sourceLabel(record));
+  const time = escapeHtml(formatTime(record.created_at));
+  const datetime = escapeHtml(formatDateTimeAttr(record.created_at));
+  const source = escapeHtml(summarize(record.source, 96));
+  const translated = escapeHtml(summarize(record.translated, 96));
+  return `
         <li class="timeline-item">
           <button
             type="button"
@@ -170,8 +168,22 @@ function renderTimeline() {
             </div>
           </button>
         </li>`;
-    })
-    .join('');
+}
+
+/** 整表重绘（首屏 / 刷新 / 清空） */
+function renderTimeline() {
+  if (!els.timeline) return;
+  els.timeline.innerHTML = records.map(timelineItemHtml).join('');
+  updateChrome();
+}
+
+/** 追加渲染：只插入新条目，避免翻页时整表重建（O(n²)） */
+function appendTimeline(items) {
+  if (!els.timeline || items.length === 0) return;
+  els.timeline.insertAdjacentHTML(
+    'beforeend',
+    items.map(timelineItemHtml).join(''),
+  );
   updateChrome();
 }
 
@@ -278,18 +290,37 @@ async function openDetail(id) {
   }
 }
 
-async function fetchPage(offset) {
+async function fetchPage(before) {
   if (typeof invoke !== 'function') {
     throw new Error('Tauri invoke 不可用');
   }
   const page = await invoke('list_translation_history', {
-    offset,
+    before: before ? { created_at: before.created_at, id: before.id } : null,
     limit: PAGE_SIZE,
   });
-  if (!Array.isArray(page)) {
+  if (!page || !Array.isArray(page.items)) {
     throw new Error('历史列表返回格式无效');
   }
-  return page;
+  return { items: page.items, hasMore: Boolean(page.has_more) };
+}
+
+/** 按 id 去重后追加到本地列表（游标分页已避免重复，这里只是兼保险） */
+function mergeRecords(items) {
+  const seen = new Set(records.map((record) => record.id));
+  const fresh = [];
+  for (const record of items) {
+    if (!record || !record.id || seen.has(record.id)) continue;
+    seen.add(record.id);
+    fresh.push(record);
+  }
+  records = records.concat(fresh);
+  return fresh;
+}
+
+function cursorOf(items) {
+  if (!items.length) return null;
+  const last = items[items.length - 1];
+  return { created_at: last.created_at, id: last.id };
 }
 
 async function loadInitial() {
@@ -298,10 +329,11 @@ async function loadInitial() {
   showError('');
   updateChrome();
   try {
-    const page = await fetchPage(0);
-    records = page;
-    nextOffset = page.length;
-    hasMore = page.length >= PAGE_SIZE;
+    const page = await fetchPage(null);
+    records = [];
+    mergeRecords(page.items);
+    cursor = cursorOf(page.items);
+    hasMore = page.hasMore;
     if (selectedId && !records.some((r) => r.id === selectedId)) {
       selectedId = null;
       closeDetail();
@@ -311,7 +343,7 @@ async function loadInitial() {
   } catch (error) {
     console.error('加载翻译历史失败', error);
     records = [];
-    nextOffset = 0;
+    cursor = null;
     hasMore = false;
     renderTimeline();
     showError(`加载历史失败: ${error}`);
@@ -327,11 +359,13 @@ async function loadMore() {
   showError('');
   updateChrome();
   try {
-    const page = await fetchPage(nextOffset);
-    records = records.concat(page);
-    nextOffset += page.length;
-    hasMore = page.length >= PAGE_SIZE;
-    renderTimeline();
+    const page = await fetchPage(cursor);
+    const fresh = mergeRecords(page.items);
+    if (page.items.length > 0) {
+      cursor = cursorOf(page.items);
+    }
+    hasMore = page.hasMore;
+    appendTimeline(fresh);
   } catch (error) {
     console.error('加载更多历史失败', error);
     showError(`加载更多失败: ${error}`);
@@ -352,7 +386,7 @@ async function clearHistory() {
   try {
     await invoke('clear_translation_history');
     records = [];
-    nextOffset = 0;
+    cursor = null;
     hasMore = false;
     selectedId = null;
     closeDetail();

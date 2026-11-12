@@ -597,7 +597,7 @@ DEBUG livetranslate::app: VAD 噪声底 ≈ -52.3 dBFS (speech 阈值 ≈ -44.3 
 | 平台 | 路径 |
 |------|------|
 | macOS | `~/Library/Application Support/com.chinuno.LiveTranslate/history/translations.jsonl` |
-| Windows | `%LOCALAPPDATA%\chinuno\LiveTranslate\history\translations.jsonl` |
+| Windows | `%LOCALAPPDATA%\chinuno\LiveTranslate\data\history\translations.jsonl` |
 | Linux | `~/.local/share/livetranslate/history/translations.jsonl` |
 
 - **保留上限**：默认 5000 条；超出后裁掉最旧记录。

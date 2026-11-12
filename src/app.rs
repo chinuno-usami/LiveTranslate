@@ -6,8 +6,8 @@ use crate::audio::segmenter::SpeechSegmenter;
 use crate::audio::AudioCapture;
 use crate::config::AppConfig;
 use crate::error::{AppError, AppResult};
-use crate::output::OutputManager;
 use crate::history::OptionalHistoryWriter;
+use crate::output::OutputManager;
 use crate::subtitle::{SubtitleLine, SubtitleProcessor, SubtitleState};
 use crate::translate::OpenAiClient;
 use tokio::sync::mpsc::error::TrySendError;
@@ -253,6 +253,10 @@ pub async fn start_console(config: AppConfig) -> AppResult<()> {
 
     outputs.set_capture_active(false);
     outputs.shutdown_async().await;
+    // 退出前把旁路历史写队列刷盘，否则队列里最后几条记录会丢失
+    if let Err(err) = history.flush_blocking() {
+        tracing::warn!("翻译历史落盘失败: {err}");
+    }
     Ok(())
 }
 

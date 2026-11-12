@@ -26,8 +26,8 @@ use tracing_subscriber::EnvFilter;
 use ui::{
     ActiveSourcePayload, CapabilitiesPayload, OverlayConfigPayload, SaveResult, SourceStatusItem,
     SourcesPayload, StatusPayload, SubtitlePayload, CLICK_THROUGH_EVENT, CONFIG_EVENT, ERROR_EVENT,
-    HISTORY_SHOWN_EVENT, NOTICE_EVENT, OUTPUT_STATUS_EVENT, SETTINGS_HIDDEN_EVENT, SETTINGS_SHOWN_EVENT,
-    SOURCE_STATUS_EVENT, STATUS_EVENT, SUBTITLE_EVENT,
+    HISTORY_SHOWN_EVENT, NOTICE_EVENT, OUTPUT_STATUS_EVENT, SETTINGS_HIDDEN_EVENT,
+    SETTINGS_SHOWN_EVENT, SOURCE_STATUS_EVENT, STATUS_EVENT, SUBTITLE_EVENT,
 };
 
 #[derive(Parser, Debug)]
@@ -404,8 +404,12 @@ impl SharedState {
         } else {
             None
         };
-        let (history_store, history) =
-            history::OptionalHistoryWriter::try_spawn_default_with_store();
+        // 单测也会构造 SharedState：不要在测试里打开真实用户数据目录
+        let (history_store, history) = if cfg!(test) {
+            (None, history::OptionalHistoryWriter::default())
+        } else {
+            history::OptionalHistoryWriter::try_spawn_default_with_store()
+        };
 
         Self {
             config: RwLock::new(config),
@@ -645,8 +649,21 @@ async fn shutdown_once(app: &AppHandle) {
     {
         tracing::warn!("停止采集超时，继续退出");
     }
+    flush_history_before_exit(&state).await;
     state.outputs.shutdown_async().await;
     state.outputs.notify_status();
+}
+
+/// 退出前把旁路历史写队列刷盘，否则队列里最后几条记录会随进程一起丢掉。
+async fn flush_history_before_exit(state: &Arc<SharedState>) {
+    let history = state.history.clone();
+    let flush = tokio::task::spawn_blocking(move || history.flush_blocking());
+    match tokio::time::timeout(std::time::Duration::from_secs(2), flush).await {
+        Ok(Ok(Ok(()))) => {}
+        Ok(Ok(Err(err))) => tracing::warn!("翻译历史落盘失败: {err}"),
+        Ok(Err(err)) => tracing::warn!("翻译历史落盘任务失败: {err}"),
+        Err(_) => tracing::warn!("等待翻译历史落盘超时，继续退出"),
+    }
 }
 
 pub(crate) fn quit_app(app: &AppHandle) {
@@ -2328,18 +2345,17 @@ fn history_list_page_limit(requested: Option<usize>, store_max_records: usize) -
         .clamp(1, max_page)
 }
 
-/// 命令层可读路径：无存储时返回空列表，便于前端空态。
+/// 命令层可读路径：无存储时返回空页，便于前端空态。
 fn list_translation_history_records(
     store: Option<&history::HistoryStore>,
-    offset: Option<usize>,
+    before: Option<&history::HistoryCursor>,
     limit: Option<usize>,
-) -> Result<Vec<history::TranslationRecord>, String> {
+) -> Result<history::HistoryPage, String> {
     let Some(store) = store else {
-        return Ok(Vec::new());
+        return Ok(history::HistoryPage::default());
     };
-    let offset = offset.unwrap_or(0);
     let limit = history_list_page_limit(limit, store.max_records());
-    store.list(offset, limit).map_err(|e| e.to_string())
+    store.list_page(before, limit).map_err(|e| e.to_string())
 }
 
 fn get_translation_history_record(
@@ -2356,8 +2372,15 @@ fn clear_translation_history_store(
     history: &history::OptionalHistoryWriter,
     store: Option<&history::HistoryStore>,
 ) -> Result<(), String> {
-    // 走写线程串行清空：丢弃在途 Append + 删 jsonl/tmp，避免清空后「复活」
-    history.clear_blocking()?;
+    // 优先走写线程串行清空：丢弃在途 Append + 删 jsonl/tmp，避免清空后「复活」。
+    // 写线程不可用（启动失败 / 已退出）时干脆直接删存储，否则隐私清空会整个失效。
+    if let Err(err) = history.clear_blocking() {
+        let Some(store) = store else {
+            return Err(err);
+        };
+        tracing::warn!(error = %err, "翻译历史写线程不可用，回退直接清理存储");
+        store.clear().map_err(|e| e.to_string())?;
+    }
     if let Some(store) = store {
         tracing::info!(path = %store.path().display(), "已清空翻译历史");
     } else {
@@ -2369,12 +2392,12 @@ fn clear_translation_history_store(
 #[tauri::command]
 async fn list_translation_history(
     state: State<'_, Arc<SharedState>>,
-    offset: Option<usize>,
+    before: Option<history::HistoryCursor>,
     limit: Option<usize>,
-) -> Result<Vec<history::TranslationRecord>, String> {
+) -> Result<history::HistoryPage, String> {
     let store = state.history_store.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        list_translation_history_records(store.as_ref(), offset, limit)
+        list_translation_history_records(store.as_ref(), before.as_ref(), limit)
     })
     .await
     .map_err(|e| format!("读取翻译历史任务失败: {e}"))?
@@ -2394,9 +2417,7 @@ async fn get_translation_record(
 }
 
 #[tauri::command]
-async fn clear_translation_history(
-    state: State<'_, Arc<SharedState>>,
-) -> Result<(), String> {
+async fn clear_translation_history(state: State<'_, Arc<SharedState>>) -> Result<(), String> {
     let history = state.history.clone();
     let store = state.history_store.clone();
     tauri::async_runtime::spawn_blocking(move || {
@@ -3159,13 +3180,13 @@ mod tests {
     fn history_commands_work_without_store_and_through_temp_store() {
         assert!(list_translation_history_records(None, None, None)
             .unwrap()
+            .items
             .is_empty());
-        assert!(get_translation_history_record(None, "any").unwrap().is_none());
-        let err = clear_translation_history_store(
-            &history::OptionalHistoryWriter::default(),
-            None,
-        )
-        .unwrap_err();
+        assert!(get_translation_history_record(None, "any")
+            .unwrap()
+            .is_none());
+        let err = clear_translation_history_store(&history::OptionalHistoryWriter::default(), None)
+            .unwrap_err();
         assert!(err.contains("不可用"), "{err}");
 
         let dir = std::env::temp_dir().join(format!(
@@ -3201,10 +3222,16 @@ mod tests {
         store.append(&a).unwrap();
         store.append(&b).unwrap();
 
-        let page =
-            list_translation_history_records(Some(&store), Some(0), Some(1)).unwrap();
-        assert_eq!(page.len(), 1);
-        assert_eq!(page[0].id, "b");
+        let page = list_translation_history_records(Some(&store), None, Some(1)).unwrap();
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.items[0].id, "b");
+        assert!(page.has_more);
+
+        // 游标翻页拿到更早的一条，且不再有下一页
+        let cursor = history::HistoryCursor::of(&page.items[0]);
+        let page = list_translation_history_records(Some(&store), Some(&cursor), Some(1)).unwrap();
+        assert_eq!(page.items[0].id, "a");
+        assert!(!page.has_more);
 
         let got = get_translation_history_record(Some(&store), "a")
             .unwrap()
@@ -3218,7 +3245,17 @@ mod tests {
         assert!(!path.exists());
         assert!(list_translation_history_records(Some(&store), None, None)
             .unwrap()
+            .items
             .is_empty());
+
+        // 写线程不可用时清空必须回退到直接删存储，不能整个失效
+        store.append(&a).unwrap();
+        let dead_history = history::OptionalHistoryWriter::new(Some(
+            history::writer::HistoryWriter::disconnected(),
+        ));
+        assert!(dead_history.clear_blocking().is_err());
+        clear_translation_history_store(&dead_history, Some(&store)).unwrap();
+        assert!(!path.exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

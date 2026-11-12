@@ -6,7 +6,7 @@
 pub mod store;
 pub mod writer;
 
-pub use store::{HistoryStore, DEFAULT_MAX_RECORDS};
+pub use store::{HistoryCursor, HistoryPage, HistoryStore, DEFAULT_MAX_RECORDS};
 pub use writer::OptionalHistoryWriter;
 
 use crate::subtitle::SubtitleLine;

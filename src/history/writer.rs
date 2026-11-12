@@ -4,12 +4,16 @@
 //! 队列满则跳过并累计计数；`HistoryStore::append` 失败只 `warn`，
 //! 不回传到调用方，不影响 `SubtitleState` / 浮窗 / OSC / SteamVR。
 //!
+//! 入队只搬运字幕行本身，UUID 与记录构造推迟到写线程：队列满时不会白白生成
+//! 一个记录再丢掉。
+//!
 //! 隐私清空走同一条写线程队列：先抬升 epoch 丢弃在途 Append，再删 jsonl/tmp，
-//! 并通过 ack 通道同步等待完成，避免「清空后历史复活」。
+//! 并通过 ack 通道同步等待完成，避免「清空后历史复活」。退出前用
+//! [`HistoryWriter::flush_blocking`] 把队列刷盘，避免丢掉最后几条记录。
 
 use super::{HistoryStore, TranslationRecord};
 use crate::subtitle::SubtitleLine;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TryRecvError, TrySendError};
 use std::sync::Arc;
 use std::thread;
@@ -18,12 +22,16 @@ use std::thread;
 pub const DEFAULT_QUEUE_CAPACITY: usize = 128;
 
 enum HistoryJob {
+    /// 实时路径只搬运字幕行，记录（含 UUID）在写线程里构造
     Append {
-        record: TranslationRecord,
+        line: SubtitleLine,
         epoch: u64,
     },
     Clear {
         ack: SyncSender<Result<(), String>>,
+    },
+    Flush {
+        ack: SyncSender<()>,
     },
 }
 
@@ -34,6 +42,8 @@ pub struct HistoryWriter {
     skipped: Arc<AtomicU64>,
     /// 清空代数：`clear_blocking` 先自增，worker 丢弃旧 epoch 的 Append。
     epoch: Arc<AtomicU64>,
+    /// 写线程已退出：只提示一次，避免每条字幕都 warn 刷屏。
+    disabled: Arc<AtomicBool>,
 }
 
 impl HistoryWriter {
@@ -44,18 +54,21 @@ impl HistoryWriter {
         let skipped = Arc::new(AtomicU64::new(0));
         let epoch = Arc::new(AtomicU64::new(0));
         spawn_worker(store, rx, Arc::clone(&epoch));
-        Self { tx, skipped, epoch }
+        Self {
+            tx,
+            skipped,
+            epoch,
+            disabled: Arc::new(AtomicBool::new(false)),
+        }
     }
 
     /// 非阻塞投递；失败只记日志与计数，永不返回错误给调用方。
     pub fn offer(&self, line: &SubtitleLine) {
-        self.offer_record(TranslationRecord::from_subtitle_line(line));
-    }
-
-    /// 与 [`offer`] 相同，直接接受已构造的记录（测试与命令旁路可复用）。
-    pub fn offer_record(&self, record: TranslationRecord) {
         let epoch = self.epoch.load(Ordering::SeqCst);
-        match self.tx.try_send(HistoryJob::Append { record, epoch }) {
+        match self.tx.try_send(HistoryJob::Append {
+            line: line.clone(),
+            epoch,
+        }) {
             Ok(()) => {}
             Err(TrySendError::Full(_)) => {
                 let n = self.skipped.fetch_add(1, Ordering::Relaxed) + 1;
@@ -63,7 +76,10 @@ impl HistoryWriter {
             }
             Err(TrySendError::Disconnected(_)) => {
                 let n = self.skipped.fetch_add(1, Ordering::Relaxed) + 1;
-                tracing::warn!(skipped = n, "翻译历史写线程已退出，跳过本条");
+                // 线程已退出后逐条 warn 只会刷屏，降级提示一次即可
+                if !self.disabled.swap(true, Ordering::Relaxed) {
+                    tracing::warn!(skipped = n, "翻译历史写线程已退出，翻译历史持久化已停用");
+                }
             }
         }
     }
@@ -80,16 +96,44 @@ impl HistoryWriter {
             .map_err(|_| "等待翻译历史清空确认失败".to_string())?
     }
 
+    /// 等待队列中已受理的记录全部落盘（退出前调用）。
+    ///
+    /// 队列是 FIFO，前面所有 Append 处理完才会处理这条 Flush。
+    pub fn flush_blocking(&self) -> Result<(), String> {
+        let (ack_tx, ack_rx) = sync_channel(1);
+        self.tx
+            .send(HistoryJob::Flush { ack: ack_tx })
+            .map_err(|_| "翻译历史写线程已退出".to_string())?;
+        ack_rx
+            .recv()
+            .map_err(|_| "等待翻译历史落盘确认失败".to_string())
+    }
+
     /// 因队列满 / 断开而跳过的累计次数。
     #[allow(dead_code)] // 供诊断与后续单测 / 命令观测
     pub fn skipped_count(&self) -> u64 {
         self.skipped.load(Ordering::Relaxed)
+    }
+
+    /// 仅测试：构造一个接收端已释放的句柄（模拟写线程启动失败 / 已退出）。
+    #[cfg(test)]
+    pub fn disconnected() -> Self {
+        let (tx, rx) = sync_channel(1);
+        drop(rx);
+        Self {
+            tx,
+            skipped: Arc::new(AtomicU64::new(0)),
+            epoch: Arc::new(AtomicU64::new(0)),
+            disabled: Arc::new(AtomicBool::new(false)),
+        }
     }
 }
 
 fn spawn_worker(store: HistoryStore, rx: Receiver<HistoryJob>, epoch: Arc<AtomicU64>) {
     let builder = thread::Builder::new().name("history-writer".into());
     if let Err(err) = builder.spawn(move || worker_loop(store, rx, epoch)) {
+        // 线程没起来时接收端随闭包一起释放，后续 offer 走 Disconnected、
+        // clear/flush 走 Err，调用方据此降级（清空回退直接删文件）。
         tracing::warn!(error = %err, "无法启动翻译历史写线程，持久化已禁用");
     }
 }
@@ -97,10 +141,14 @@ fn spawn_worker(store: HistoryStore, rx: Receiver<HistoryJob>, epoch: Arc<Atomic
 fn worker_loop(store: HistoryStore, rx: Receiver<HistoryJob>, epoch: Arc<AtomicU64>) {
     while let Ok(job) = rx.recv() {
         match job {
-            HistoryJob::Append { record, epoch: job_epoch } => {
+            HistoryJob::Append {
+                line,
+                epoch: job_epoch,
+            } => {
                 if job_epoch != epoch.load(Ordering::SeqCst) {
                     continue;
                 }
+                let record = TranslationRecord::from_subtitle_line(&line);
                 if let Err(err) = store.append(&record) {
                     tracing::warn!(
                         error = %err,
@@ -109,19 +157,29 @@ fn worker_loop(store: HistoryStore, rx: Receiver<HistoryJob>, epoch: Arc<AtomicU
                     );
                 }
             }
+            HistoryJob::Flush { ack } => {
+                // FIFO：走到这里说明之前的 Append 都已落盘
+                let _ = ack.send(());
+            }
             HistoryJob::Clear { ack } => {
-                let mut nested_acks = vec![ack];
+                let mut clear_acks = vec![ack];
+                let mut flush_acks = Vec::new();
                 // 清空前排空队列中的在途任务，避免隐私清除后残留写入。
                 loop {
                     match rx.try_recv() {
                         Ok(HistoryJob::Append { .. }) => {}
-                        Ok(HistoryJob::Clear { ack: nested }) => nested_acks.push(nested),
+                        Ok(HistoryJob::Clear { ack: nested }) => clear_acks.push(nested),
+                        Ok(HistoryJob::Flush { ack }) => flush_acks.push(ack),
                         Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => break,
                     }
                 }
                 let result = store.clear().map_err(|e| e.to_string());
-                for nested in nested_acks {
+                for nested in clear_acks {
                     let _ = nested.send(result.clone());
+                }
+                // 被丢弃的 Append 也算「处理完」，等待落盘的调用方可以继续
+                for ack in flush_acks {
+                    let _ = ack.send(());
                 }
             }
         }
@@ -172,6 +230,14 @@ impl OptionalHistoryWriter {
         match &self.inner {
             Some(writer) => writer.clear_blocking(),
             None => Err("翻译历史存储不可用".to_string()),
+        }
+    }
+
+    /// 阻塞等待已入队记录落盘；未启用持久化时视为成功。
+    pub fn flush_blocking(&self) -> Result<(), String> {
+        match &self.inner {
+            Some(writer) => writer.flush_blocking(),
+            None => Ok(()),
         }
     }
 
@@ -244,19 +310,42 @@ mod tests {
         assert_eq!(line.translated, "你好");
     }
 
+    /// 退出前的 flush 必须保证已入队记录全部落盘（不依赖 sleep 猜测）
+    #[test]
+    fn flush_blocking_persists_queued_records() {
+        let dir = test_dir("flush");
+        let path = dir.join("translations.jsonl");
+        let store = HistoryStore::with_path(&path, 100);
+        let writer = HistoryWriter::spawn(store.clone(), 16);
+        for i in 0..8 {
+            writer.offer(&SubtitleLine::new(
+                "mic",
+                "Mic",
+                format!("s{i}"),
+                format!("t{i}"),
+            ));
+        }
+        writer.flush_blocking().expect("flush");
+
+        let page = store.list_page(None, 100).unwrap();
+        assert_eq!(page.items.len(), 8);
+        assert_eq!(writer.skipped_count(), 0);
+        // 未启用持久化时 flush 视为成功
+        assert!(OptionalHistoryWriter::default().flush_blocking().is_ok());
+    }
+
     #[test]
     fn full_queue_skips_and_counts() {
         let (tx, rx) = sync_channel::<HistoryJob>(1);
-        let skipped = Arc::new(AtomicU64::new(0));
-        let epoch = Arc::new(AtomicU64::new(0));
         let writer = HistoryWriter {
             tx,
-            skipped: skipped.clone(),
-            epoch,
+            skipped: Arc::new(AtomicU64::new(0)),
+            epoch: Arc::new(AtomicU64::new(0)),
+            disabled: Arc::new(AtomicBool::new(false)),
         };
         // 填满容量为 1 的队列（无消费者）
-        writer.offer_record(TranslationRecord::new("a", "A", "one", "一"));
-        writer.offer_record(TranslationRecord::new("b", "B", "two", "二"));
+        writer.offer(&SubtitleLine::new("a", "A", "one".into(), "一".into()));
+        writer.offer(&SubtitleLine::new("b", "B", "two".into(), "二".into()));
         assert_eq!(writer.skipped_count(), 1);
         // 释放接收端，避免 Drop 噪音
         drop(rx);
@@ -272,8 +361,8 @@ mod tests {
         let store = HistoryStore::with_path(bad_path, 10);
         let writer = HistoryWriter::spawn(store, 4);
         writer.offer(&SubtitleLine::new("mic", "Mic", "x".into(), "y".into()));
-        // 给 worker 时间尝试写盘；不应 panic，skipped 仍为 0（已入队）
-        thread::sleep(Duration::from_millis(100));
+        // 写盘失败也要把任务处理掉，让 flush 能返回；skipped 仍为 0（已入队）
+        writer.flush_blocking().expect("flush");
         assert_eq!(writer.skipped_count(), 0);
     }
 
@@ -286,16 +375,16 @@ mod tests {
         let writer = HistoryWriter::spawn(store.clone(), 1);
 
         // 先写入一条可观测内容
-        writer.offer(&SubtitleLine::new("mic", "Mic", "keep-me".into(), "留".into()));
-        assert!(wait_until(
-            || {
-                path.exists()
-                    && fs::read_to_string(&path)
-                        .map(|s| s.contains("keep-me"))
-                        .unwrap_or(false)
-            },
-            Duration::from_secs(2)
+        writer.offer(&SubtitleLine::new(
+            "mic",
+            "Mic",
+            "keep-me".into(),
+            "留".into(),
         ));
+        writer.flush_blocking().expect("flush");
+        assert!(fs::read_to_string(&path)
+            .map(|s| s.contains("keep-me"))
+            .unwrap_or(false));
 
         // 无消费者式填满后再 clear：即使队列里还有 Append，清空后文件也不该复活
         // 用阻塞 clear；同时并发 offer 若干条
@@ -321,16 +410,16 @@ mod tests {
         }
 
         // 清空之后的新记录仍可写入
-        writer.offer(&SubtitleLine::new("mic", "Mic", "after".into(), "后".into()));
-        assert!(wait_until(
-            || {
-                path.exists()
-                    && fs::read_to_string(&path)
-                        .map(|s| s.contains("after"))
-                        .unwrap_or(false)
-            },
-            Duration::from_secs(2)
+        writer.offer(&SubtitleLine::new(
+            "mic",
+            "Mic",
+            "after".into(),
+            "后".into(),
         ));
+        writer.flush_blocking().expect("flush");
+        assert!(fs::read_to_string(&path)
+            .map(|s| s.contains("after"))
+            .unwrap_or(false));
     }
 
     #[test]

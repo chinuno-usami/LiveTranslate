@@ -69,4 +69,4 @@ LiveTranslate 从 v0.2 开始提供两种构建风味。两者**版本号一致�
 - 包名（标准版 / Full 版）
 - 操作系统版本
 - SteamVR / VRChat 版本（如相关）
-- 日志文件：`<用户数据目录>/logs/livetranslate.log.<日期>`（macOS 为 `~/Library/Application Support/com.chinuno.LiveTranslate/logs`，Windows 为 `%LOCALAPPDATA%\chinuno\LiveTranslate\logs`）
+- 日志文件：`<用户数据目录>/logs/livetranslate.log.<日期>`（macOS 为 `~/Library/Application Support/com.chinuno.LiveTranslate/logs`，Windows 为 `%LOCALAPPDATA%\chinuno\LiveTranslate\data\logs`）
