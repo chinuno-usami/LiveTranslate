@@ -21,6 +21,11 @@ const els = {
   detailSource: document.getElementById('detail-source'),
   detailTranslated: document.getElementById('detail-translated'),
   detailId: document.getElementById('detail-id'),
+  confirmModal: document.getElementById('confirm-modal'),
+  confirmTitle: document.getElementById('confirm-title'),
+  confirmMessage: document.getElementById('confirm-message'),
+  confirmOk: document.getElementById('confirm-ok'),
+  confirmCancel: document.getElementById('confirm-cancel'),
 };
 
 /** @type {Array<{id:string,created_at:number,source_id:string,label:string,source:string,translated:string}>} */
@@ -201,6 +206,87 @@ function isDetailOpen() {
   return els.detailModal && !els.detailModal.classList.contains('hidden');
 }
 
+// ---------------- 页内确认对话框 ----------------
+// 不用 window.confirm：Tauri v1 把它重写成返回 Promise 的异步 IPC（且 dialog 未在
+// allowlist 里开放），守卫既不阻塞也拦不住，点「清空」会直接删掉历史。
+// 与设置页保持一致，使用自绘模态。
+
+let activeConfirmCancel = null;
+
+function uiConfirm({
+  title = '提示',
+  message = '',
+  okText = '确定',
+  cancelText = '取消',
+} = {}) {
+  const { confirmModal } = els;
+  if (!confirmModal || !els.confirmOk || !els.confirmCancel) {
+    console.warn('确认对话框未就绪，已取消本次操作');
+    return Promise.resolve(false);
+  }
+  // 同一时刻只保留一个确认框；旧的按取消处理
+  if (activeConfirmCancel) {
+    activeConfirmCancel();
+  }
+
+  return new Promise((resolve) => {
+    const previousFocus = document.activeElement;
+    els.confirmTitle.textContent = title;
+    els.confirmMessage.textContent = message;
+    els.confirmOk.textContent = okText;
+    els.confirmCancel.textContent = cancelText;
+    confirmModal.classList.remove('hidden');
+
+    let settled = false;
+    const finish = (result) => {
+      if (settled) return;
+      settled = true;
+      activeConfirmCancel = null;
+      confirmModal.classList.add('hidden');
+      els.confirmOk.removeEventListener('click', onOk);
+      els.confirmCancel.removeEventListener('click', onCancel);
+      confirmModal.removeEventListener('click', onBackdrop);
+      window.removeEventListener('keydown', onKeyDown, true);
+      if (previousFocus && typeof previousFocus.focus === 'function') {
+        previousFocus.focus();
+      }
+      resolve(result);
+    };
+
+    const onOk = () => finish(true);
+    const onCancel = () => finish(false);
+    const onBackdrop = (event) => {
+      if (event.target === confirmModal) {
+        finish(false);
+      }
+    };
+    const onKeyDown = (event) => {
+      if (event.isComposing || event.keyCode === 229) {
+        return;
+      }
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        event.stopPropagation();
+        finish(false);
+      } else if (event.key === 'Enter' && document.activeElement !== els.confirmCancel) {
+        event.preventDefault();
+        event.stopPropagation();
+        finish(true);
+      }
+    };
+
+    activeConfirmCancel = () => finish(false);
+    els.confirmOk.addEventListener('click', onOk);
+    els.confirmCancel.addEventListener('click', onCancel);
+    confirmModal.addEventListener('click', onBackdrop);
+    window.addEventListener('keydown', onKeyDown, true);
+    // 破坏性操作默认聚焦「取消」，避免误按回车直删
+    requestAnimationFrame(() => {
+      els.confirmCancel.focus();
+    });
+  });
+}
+
 function showDetailError(message) {
   if (!els.detailError) return;
   if (!message) {
@@ -377,7 +463,13 @@ async function loadMore() {
 
 async function clearHistory() {
   if (loading) return;
-  if (!window.confirm('确定清空全部本地翻译历史？此操作不可撤销。')) {
+  const confirmed = await uiConfirm({
+    title: '清空翻译历史',
+    message: '确定清空全部本地翻译历史？此操作不可撤销。',
+    okText: '清空',
+    cancelText: '取消',
+  });
+  if (!confirmed) {
     return;
   }
   loading = true;

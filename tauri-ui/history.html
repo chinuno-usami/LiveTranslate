@@ -32,6 +32,17 @@
       <span class="hint">点击条目查看完整原文 / 译文</span>
     </footer>
 
+    <div id="confirm-modal" class="modal confirm-modal hidden" role="dialog" aria-modal="true" aria-labelledby="confirm-title">
+      <div class="modal-card dialog-card" role="document">
+        <h3 id="confirm-title" class="dialog-title">提示</h3>
+        <p id="confirm-message" class="dialog-message"></p>
+        <div class="dialog-actions">
+          <button id="confirm-cancel" class="btn" type="button">取消</button>
+          <button id="confirm-ok" class="btn danger-fill" type="button">确定</button>
+        </div>
+      </div>
+    </div>
+
     <div id="detail-modal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="detail-title">
       <div class="modal-card" role="document">
         <div class="modal-header">

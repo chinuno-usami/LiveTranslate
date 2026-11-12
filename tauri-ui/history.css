@@ -84,7 +84,6 @@ button,
 .btn.danger {
   color: var(--danger);
 }
-
 .btn:disabled {
   opacity: 0.45;
   cursor: not-allowed;
@@ -291,6 +290,47 @@ button,
   margin-bottom: 12px;
   font-size: 15px;
   font-weight: 600;
+}
+
+/* 页内确认对话框：替代在 macOS WKWebView 中失效（Tauri v1 下返回 Promise）的原生 window.confirm */
+.confirm-modal {
+  z-index: 200;
+  background: rgba(5, 8, 13, 0.68);
+}
+
+.modal-card.dialog-card {
+  width: min(420px, 100%);
+  border-radius: 10px;
+}
+
+.dialog-title {
+  margin: 0 0 8px;
+  font-size: 15px;
+  font-weight: 600;
+}
+
+.dialog-message {
+  margin: 0 0 14px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.dialog-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.btn.danger-fill {
+  background: #991b1b;
+  border-color: #b91c1c;
+  color: #fee2e2;
+}
+
+.btn.danger-fill:hover {
+  background: #b91c1c;
 }
 
 .detail-meta {
