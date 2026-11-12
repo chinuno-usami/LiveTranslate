@@ -16,6 +16,7 @@ const els = {
   sourcesClose: document.getElementById('sources-close'),
   addSourceBtn: document.getElementById('add-source-btn'),
   settingsBtn: document.getElementById('settings-btn'),
+  historyBtn: document.getElementById('history-btn'),
   languageSelect: document.getElementById('language-select'),
   fontSlider: document.getElementById('font-slider'),
   fontSizeValue: document.getElementById('font-size-value'),
@@ -728,6 +729,16 @@ async function bindActions() {
       showActionError(`打开设置失败: ${error}`);
     }
   });
+  if (els.historyBtn) {
+    els.historyBtn.addEventListener('click', async () => {
+      try {
+        await invoke('open_history');
+      } catch (error) {
+        console.error('打开翻译历史失败', error);
+        showActionError(`打开翻译历史失败: ${error}`);
+      }
+    });
+  }
 
   // 识别语言：切换后立即生效，无需重启
   els.languageSelect.addEventListener('change', async () => {

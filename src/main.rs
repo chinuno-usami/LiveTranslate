@@ -5,6 +5,7 @@ mod asr;
 mod audio;
 mod config;
 mod error;
+mod history;
 mod output;
 mod subtitle;
 mod translate;
@@ -25,7 +26,7 @@ use tracing_subscriber::EnvFilter;
 use ui::{
     ActiveSourcePayload, CapabilitiesPayload, OverlayConfigPayload, SaveResult, SourceStatusItem,
     SourcesPayload, StatusPayload, SubtitlePayload, CLICK_THROUGH_EVENT, CONFIG_EVENT, ERROR_EVENT,
-    NOTICE_EVENT, OUTPUT_STATUS_EVENT, SETTINGS_HIDDEN_EVENT, SETTINGS_SHOWN_EVENT,
+    HISTORY_SHOWN_EVENT, NOTICE_EVENT, OUTPUT_STATUS_EVENT, SETTINGS_HIDDEN_EVENT, SETTINGS_SHOWN_EVENT,
     SOURCE_STATUS_EVENT, STATUS_EVENT, SUBTITLE_EVENT,
 };
 
@@ -342,6 +343,10 @@ pub(crate) struct SharedState {
     /// 磁盘配置加载失败并回退到默认值：显式保存前禁止自动镜像覆盖配置档，并在设置页透出告警
     config_degraded: AtomicBool,
     degraded_warning: std::sync::Mutex<Option<String>>,
+    /// 可读历史存储（与旁路 writer 同路径；打开失败则为 None）
+    history_store: Option<history::HistoryStore>,
+    /// 翻译历史有界旁路写（失败/满队列只 warn，不影响实时链路）
+    history: history::OptionalHistoryWriter,
 }
 
 /// 字幕历史保留上限：桌面浮窗与 SteamVR 的 max_lines 独立，取较大者
@@ -399,6 +404,8 @@ impl SharedState {
         } else {
             None
         };
+        let (history_store, history) =
+            history::OptionalHistoryWriter::try_spawn_default_with_store();
 
         Self {
             config: RwLock::new(config),
@@ -424,6 +431,8 @@ impl SharedState {
             startup_warning: std::sync::Mutex::new(startup_warning),
             config_degraded: AtomicBool::new(config_degraded),
             degraded_warning: std::sync::Mutex::new(degraded_warning),
+            history_store,
+            history,
         }
     }
 
@@ -584,6 +593,19 @@ pub(crate) fn open_settings_window(app: &AppHandle, group: Option<&str>) {
             }
         }
         None => tracing::warn!("Settings window not found in tauri.conf.json"),
+    }
+}
+
+pub(crate) fn open_history_window(app: &AppHandle) {
+    match app.get_window("history") {
+        Some(window) => {
+            let _ = window.show();
+            let _ = window.unminimize();
+            let _ = window.set_focus();
+            // 每次打开都通知前端刷新时间线，避免只看到上次缓存。
+            let _ = app.emit_all(HISTORY_SHOWN_EVENT, ());
+        }
+        None => tracing::warn!("History window not found in tauri.conf.json"),
     }
 }
 
@@ -1029,6 +1051,8 @@ async fn start_capture_locked(app: AppHandle, state: Arc<SharedState>) -> Result
                         let registry = state_for_forwarder.sources.lock().await;
                         (registry.active_labels(), registry.active_sources_payload())
                     };
+                    // 旁路持久化：非阻塞 try_send，失败只 warn，不参与实时裁剪语义
+                    state_for_forwarder.history.offer(&line);
                     let display = {
                         let mut subtitle_state = state_for_forwarder.subtitle_state.lock().await;
                         subtitle_state.set_active_labels(labels);
@@ -2015,6 +2039,12 @@ async fn open_settings(app: AppHandle, group: Option<String>) -> Result<(), Stri
 }
 
 #[tauri::command]
+async fn open_history(app: AppHandle) -> Result<(), String> {
+    open_history_window(&app);
+    Ok(())
+}
+
+#[tauri::command]
 fn is_window_visible(window: Window) -> bool {
     window.is_visible().unwrap_or(true)
 }
@@ -2279,6 +2309,101 @@ async fn set_click_through(
     apply_click_through(&app, enabled);
     emit_config(&app, &config);
     Ok(())
+}
+
+// ---------------- 翻译历史 ----------------
+
+/// 列表默认分页大小；上限避免一次读入过大响应（且不超过存储保留上限）。
+const HISTORY_LIST_DEFAULT_LIMIT: usize = 50;
+const HISTORY_LIST_MAX_LIMIT: usize = 200;
+
+/// 将 UI 请求的 `limit` 钳制到命令层安全页大小（与存储 `max_records` 取交）。
+fn history_list_page_limit(requested: Option<usize>, store_max_records: usize) -> usize {
+    let max_page = HISTORY_LIST_MAX_LIMIT
+        .min(history::DEFAULT_MAX_RECORDS)
+        .min(store_max_records)
+        .max(1);
+    requested
+        .unwrap_or(HISTORY_LIST_DEFAULT_LIMIT)
+        .clamp(1, max_page)
+}
+
+/// 命令层可读路径：无存储时返回空列表，便于前端空态。
+fn list_translation_history_records(
+    store: Option<&history::HistoryStore>,
+    offset: Option<usize>,
+    limit: Option<usize>,
+) -> Result<Vec<history::TranslationRecord>, String> {
+    let Some(store) = store else {
+        return Ok(Vec::new());
+    };
+    let offset = offset.unwrap_or(0);
+    let limit = history_list_page_limit(limit, store.max_records());
+    store.list(offset, limit).map_err(|e| e.to_string())
+}
+
+fn get_translation_history_record(
+    store: Option<&history::HistoryStore>,
+    id: &str,
+) -> Result<Option<history::TranslationRecord>, String> {
+    match store {
+        Some(store) => store.get(id).map_err(|e| e.to_string()),
+        None => Ok(None),
+    }
+}
+
+fn clear_translation_history_store(
+    history: &history::OptionalHistoryWriter,
+    store: Option<&history::HistoryStore>,
+) -> Result<(), String> {
+    // 走写线程串行清空：丢弃在途 Append + 删 jsonl/tmp，避免清空后「复活」
+    history.clear_blocking()?;
+    if let Some(store) = store {
+        tracing::info!(path = %store.path().display(), "已清空翻译历史");
+    } else {
+        tracing::info!("已清空翻译历史");
+    }
+    Ok(())
+}
+
+#[tauri::command]
+async fn list_translation_history(
+    state: State<'_, Arc<SharedState>>,
+    offset: Option<usize>,
+    limit: Option<usize>,
+) -> Result<Vec<history::TranslationRecord>, String> {
+    let store = state.history_store.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        list_translation_history_records(store.as_ref(), offset, limit)
+    })
+    .await
+    .map_err(|e| format!("读取翻译历史任务失败: {e}"))?
+}
+
+#[tauri::command]
+async fn get_translation_record(
+    state: State<'_, Arc<SharedState>>,
+    id: String,
+) -> Result<Option<history::TranslationRecord>, String> {
+    let store = state.history_store.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        get_translation_history_record(store.as_ref(), &id)
+    })
+    .await
+    .map_err(|e| format!("读取翻译详情任务失败: {e}"))?
+}
+
+#[tauri::command]
+async fn clear_translation_history(
+    state: State<'_, Arc<SharedState>>,
+) -> Result<(), String> {
+    let history = state.history.clone();
+    let store = state.history_store.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        clear_translation_history_store(&history, store.as_ref())
+    })
+    .await
+    .map_err(|e| format!("清空翻译历史任务失败: {e}"))?
 }
 
 // ---------------- 系统集成 ----------------
@@ -2645,8 +2770,13 @@ fn run(args: Args) -> anyhow::Result<()> {
                         }
                     });
                 }
+                "history" => {
+                    // 与设置页一致：关闭仅隐藏，保留前端列表状态；下次打开靠 history://shown 刷新。
+                    api.prevent_close();
+                    let _ = event.window().hide();
+                }
                 "main" => {
-                    // 隐藏的 settings 窗口会阻止 Tauri 自动触发退出，主窗口关闭时统一走完整退场
+                    // 隐藏的 settings/history 窗口会阻止 Tauri 自动触发退出，主窗口关闭时统一走完整退场
                     api.prevent_close();
                     quit_app(&event.window().app_handle());
                 }
@@ -2733,6 +2863,7 @@ fn run(args: Args) -> anyhow::Result<()> {
             set_output_enabled,
             get_capabilities,
             open_settings,
+            open_history,
             is_window_visible,
             get_settings_schema,
             save_settings,
@@ -2759,6 +2890,9 @@ fn run(args: Args) -> anyhow::Result<()> {
             set_window_bounds,
             persist_window_geometry,
             set_click_through,
+            list_translation_history,
+            get_translation_record,
+            clear_translation_history,
         ])
         .build(tauri::generate_context!())
         .map_err(|e| anyhow::anyhow!("Tauri runtime error: {e}"))?;
@@ -3003,5 +3137,117 @@ mod tests {
         assert!(!keeps_stop_reason("启动中"));
         assert!(!keeps_stop_reason("已停止"));
         assert!(!keeps_stop_reason("未启动"));
+    }
+
+    #[test]
+    fn history_list_page_limit_clamps_defaults_and_bounds() {
+        assert_eq!(
+            history_list_page_limit(None, history::DEFAULT_MAX_RECORDS),
+            HISTORY_LIST_DEFAULT_LIMIT
+        );
+        assert_eq!(history_list_page_limit(Some(0), 100), 1);
+        assert_eq!(
+            history_list_page_limit(Some(10_000), history::DEFAULT_MAX_RECORDS),
+            HISTORY_LIST_MAX_LIMIT
+        );
+        // 存储上限更小时，页大小不能超过 store.max_records
+        assert_eq!(history_list_page_limit(Some(80), 30), 30);
+        assert_eq!(history_list_page_limit(None, 10), 10);
+    }
+
+    #[test]
+    fn history_commands_work_without_store_and_through_temp_store() {
+        assert!(list_translation_history_records(None, None, None)
+            .unwrap()
+            .is_empty());
+        assert!(get_translation_history_record(None, "any").unwrap().is_none());
+        let err = clear_translation_history_store(
+            &history::OptionalHistoryWriter::default(),
+            None,
+        )
+        .unwrap_err();
+        assert!(err.contains("不可用"), "{err}");
+
+        let dir = std::env::temp_dir().join(format!(
+            "livetranslate-cmd-history-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("translations.jsonl");
+        let store = history::HistoryStore::with_path(&path, 100);
+        let writer = history::writer::HistoryWriter::spawn(store.clone(), 8);
+        let history = history::OptionalHistoryWriter::new(Some(writer));
+        let a = history::TranslationRecord {
+            id: "a".into(),
+            created_at: 100,
+            source_id: "mic".into(),
+            label: "Mic".into(),
+            source: "one".into(),
+            translated: "一".into(),
+        };
+        let b = history::TranslationRecord {
+            id: "b".into(),
+            created_at: 200,
+            source_id: "mic".into(),
+            label: "Mic".into(),
+            source: "two".into(),
+            translated: "二".into(),
+        };
+        store.append(&a).unwrap();
+        store.append(&b).unwrap();
+
+        let page =
+            list_translation_history_records(Some(&store), Some(0), Some(1)).unwrap();
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0].id, "b");
+
+        let got = get_translation_history_record(Some(&store), "a")
+            .unwrap()
+            .expect("record a");
+        assert_eq!(got.source, "one");
+        assert!(get_translation_history_record(Some(&store), "missing")
+            .unwrap()
+            .is_none());
+
+        clear_translation_history_store(&history, Some(&store)).unwrap();
+        assert!(!path.exists());
+        assert!(list_translation_history_records(Some(&store), None, None)
+            .unwrap()
+            .is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn desktop_float_clips_to_subtitle_max_lines_even_when_buffer_is_larger() {
+        // SubtitleState 按各输出 max 取并集保留；浮窗推送仍只能按 subtitle.max_lines 裁剪
+        let mut config = AppConfig::default();
+        config.subtitle.max_lines = 2;
+        config.output.steamvr.max_lines = 8;
+        config.output.osc.max_lines = 8;
+        assert_eq!(history_limit(&config), 8);
+
+        let mut state = SubtitleState::new(
+            history_limit(&config),
+            config.subtitle.show_source,
+            config.subtitle.label_sources,
+        );
+        for i in 0..6 {
+            state.push(subtitle::SubtitleLine::new(
+                "mic",
+                "Mic",
+                format!("s{i}"),
+                format!("t{i}"),
+            ));
+        }
+        assert_eq!(state.display_lines().len(), 6.min(history_limit(&config)));
+        let kept = desktop_entries(state.display_lines(), &config);
+        assert_eq!(kept.len(), 2);
+        assert_eq!(kept[0].translated, "t4");
+        assert_eq!(kept[1].translated, "t5");
     }
 }

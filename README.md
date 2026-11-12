@@ -31,6 +31,11 @@
 - 鼠标移出自动收起工具栏；开启点击穿透后只保留字幕
 - 字幕去重与重叠拼接（支持中文等无空格语言）
 
+✅ **翻译历史**
+- 本地 JSONL 持久化（与浮窗 `subtitle.max_lines` 滚动裁剪解耦）
+- 独立历史窗口：时间线预览 + 单条详情弹窗；支持分页 / 刷新 / 清空
+- 入口：浮窗工具栏 **历史**、托盘 **翻译历史…**
+
 ✅ **独立设置页**
 - 覆盖配置文件全部字段（含多源表格、密钥、`extra_body`、原始 TOML）
 - 热字段即时生效，冷字段提示「需重启采集」
@@ -228,6 +233,7 @@ send_typing = true
 | 状态灯 + 文本 | 显示运行状态 / 错误提示 |
 | **源 (N)** | 打开输入源面板：逐源切换设备 / 翻译开关 / 启停状态 |
 | **⚙ 设置** | 打开独立设置窗口 |
+| **历史** | 打开独立翻译历史窗口（时间线预览；点条目看详情） |
 | **语言下拉框** | 选择识别语言，**切换后立即生效**（无需重启）；候选随 ASR 后端变化 |
 | **字号滑块** | 实时调整字幕文字大小（12–72），松手后写回配置文件 |
 | **原文开关** | 切换是否在译文上方显示原文，立即重绘当前字幕 |
@@ -583,6 +589,21 @@ DEBUG livetranslate::app: VAD 噪声底 ≈ -52.3 dBFS (speech 阈值 ≈ -44.3 
 > 托盘菜单 → **打开配置目录** 可直接在文件管理器中打开该目录。
 > v0.2 起该目录下还会出现 `profiles/` 与 `profiles.toml`（多配置档，可选能力）。
 
+### 翻译历史文件位置
+
+翻译结果会旁路写入本地 JSONL（失败只记日志，不影响实时浮窗 / OSC / SteamVR）。
+路径在用户**本地数据目录**下的 `history/translations.jsonl`（与配置目录可能不同，尤其是 Windows）：
+
+| 平台 | 路径 |
+|------|------|
+| macOS | `~/Library/Application Support/com.chinuno.LiveTranslate/history/translations.jsonl` |
+| Windows | `%LOCALAPPDATA%\chinuno\LiveTranslate\history\translations.jsonl` |
+| Linux | `~/.local/share/livetranslate/history/translations.jsonl` |
+
+- **保留上限**：默认 5000 条；超出后裁掉最旧记录。
+- **与浮窗裁剪的关系**：历史文件独立于 `subtitle.max_lines`；浮窗 / OSC / SteamVR 仍只显示各自滚动窗口内的行。
+- **清空**：历史窗口的「清空」经写线程串行处理（丢弃在途写入后删除 JSONL 与临时文件；隐私清除，不可撤销）。它不会清空当前浮窗里已显示的字幕行，也不会改配置。
+
 日志中会打印实际使用的配置路径，例如：
 ```
 INFO livetranslate: Config file: config/default.toml
@@ -619,6 +640,7 @@ INFO livetranslate: Config file: config/default.toml
 - **显示**：显示并聚焦字幕浮窗
 - **开始 / 停止**：控制字幕采集
 - **切换点击穿透**：开启/关闭鼠标穿透
+- **翻译历史…**：打开独立翻译历史窗口（时间线 + 详情）
 - **设置…**：打开独立设置窗口
 - **打开配置目录**：在系统文件管理器中定位配置文件目录
 - **退出**：退出程序

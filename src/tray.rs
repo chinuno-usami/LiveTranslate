@@ -9,6 +9,7 @@ pub fn create_system_tray() -> SystemTray {
     let stop = CustomMenuItem::new("stop".to_string(), "停止");
     let through = CustomMenuItem::new("through".to_string(), "切换点击穿透");
     let settings = CustomMenuItem::new("settings".to_string(), "设置…");
+    let history = CustomMenuItem::new("history".to_string(), "翻译历史…");
     let config_dir = CustomMenuItem::new("config_dir".to_string(), "打开配置目录");
     let quit = CustomMenuItem::new("quit".to_string(), "退出");
 
@@ -19,6 +20,7 @@ pub fn create_system_tray() -> SystemTray {
         .add_native_item(SystemTrayMenuItem::Separator)
         .add_item(through)
         .add_item(settings)
+        .add_item(history)
         .add_item(config_dir)
         .add_native_item(SystemTrayMenuItem::Separator)
         .add_item(quit);
@@ -44,6 +46,9 @@ pub fn handle_system_tray_event(app: &AppHandle, event: SystemTrayEvent) {
             }
             "settings" => {
                 crate::open_settings_window(app, None);
+            }
+            "history" => {
+                crate::open_history_window(app);
             }
             "config_dir" => {
                 if let Err(e) = crate::open_config_dir(app) {

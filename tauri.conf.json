@@ -71,6 +71,22 @@
         "skipTaskbar": false,
         "visible": false,
         "center": true
+      },
+      {
+        "label": "history",
+        "url": "history.html",
+        "title": "LiveTranslate 翻译历史",
+        "width": 720,
+        "height": 780,
+        "minWidth": 520,
+        "minHeight": 480,
+        "resizable": true,
+        "decorations": true,
+        "transparent": false,
+        "alwaysOnTop": false,
+        "skipTaskbar": false,
+        "visible": false,
+        "center": true
       }
     ]
   }

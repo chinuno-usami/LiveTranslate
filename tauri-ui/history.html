@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>LiveTranslate 翻译历史</title>
+    <link rel="stylesheet" href="./history.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="title-block">
+        <h1 class="title">翻译历史</h1>
+        <span class="hint">本地时间线预览（与浮窗滚动缓冲独立）</span>
+      </div>
+      <div class="top-actions">
+        <button id="refresh-btn" class="btn" type="button">刷新</button>
+        <button id="load-more-btn" class="btn" type="button" disabled>加载更多</button>
+        <button id="clear-btn" class="btn danger" type="button">清空</button>
+      </div>
+    </header>
+
+    <div id="error-banner" class="banner error hidden" role="alert"></div>
+    <div id="status-banner" class="banner hidden" role="status" aria-live="polite"></div>
+
+    <main class="content">
+      <div id="empty-state" class="empty-state">暂无历史记录</div>
+      <ol id="timeline" class="timeline" aria-label="翻译历史时间线"></ol>
+    </main>
+
+    <footer class="statusbar">
+      <span id="list-status" role="status" aria-live="polite">加载中…</span>
+      <span class="hint">点击条目查看完整原文 / 译文</span>
+    </footer>
+
+    <div id="detail-modal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="detail-title">
+      <div class="modal-card" role="document">
+        <div class="modal-header">
+          <span id="detail-title">翻译详情</span>
+          <button id="detail-close" class="btn ghost" type="button">关闭</button>
+        </div>
+        <div class="detail-meta">
+          <time id="detail-time" class="timeline-time"></time>
+          <span id="detail-source-chip" class="source-chip"></span>
+        </div>
+        <div id="detail-error" class="detail-error hidden" role="alert"></div>
+        <div class="detail-section">
+          <div class="detail-label">原文</div>
+          <pre id="detail-source" class="detail-body source"></pre>
+        </div>
+        <div class="detail-section">
+          <div class="detail-label">译文</div>
+          <pre id="detail-translated" class="detail-body translated"></pre>
+        </div>
+        <div class="detail-note">
+          <span class="detail-id-label">记录 ID</span>
+          <code id="detail-id" class="detail-id"></code>
+        </div>
+      </div>
+    </div>
+
+    <script src="./history.js"></script>
+  </body>
+</html>

@@ -7,6 +7,7 @@ use crate::audio::AudioCapture;
 use crate::config::AppConfig;
 use crate::error::{AppError, AppResult};
 use crate::output::OutputManager;
+use crate::history::OptionalHistoryWriter;
 use crate::subtitle::{SubtitleLine, SubtitleProcessor, SubtitleState};
 use crate::translate::OpenAiClient;
 use tokio::sync::mpsc::error::TrySendError;
@@ -180,6 +181,7 @@ pub async fn start_console(config: AppConfig) -> AppResult<()> {
         config.subtitle.show_source,
         config.subtitle.label_sources,
     );
+    let history = OptionalHistoryWriter::try_spawn_default();
     let mut active_sources: Vec<(String, String, bool)> = sources
         .iter()
         .map(|s| (s.id.clone(), s.label.clone(), true))
@@ -227,7 +229,7 @@ pub async fn start_console(config: AppConfig) -> AppResult<()> {
         tokio::select! {
             maybe_event = rx.recv() => {
                 match maybe_event {
-                    Some(event) => handle_console_event(&mut subtitle_state, &mut active_sources, &outputs, event),
+                    Some(event) => handle_console_event(&mut subtitle_state, &mut active_sources, &outputs, &history, event),
                     None => break,
                 }
             }
@@ -240,7 +242,7 @@ pub async fn start_console(config: AppConfig) -> AppResult<()> {
                 let _ = stop_tx.send(true);
                 let drain = async {
                     while let Some(event) = rx.recv().await {
-                        handle_console_event(&mut subtitle_state, &mut active_sources, &outputs, event);
+                        handle_console_event(&mut subtitle_state, &mut active_sources, &outputs, &history, event);
                     }
                 };
                 let _ = tokio::time::timeout(std::time::Duration::from_secs(3), drain).await;
@@ -258,15 +260,18 @@ fn handle_console_event(
     subtitle_state: &mut SubtitleState,
     active_sources: &mut [(String, String, bool)],
     outputs: &OutputManager,
+    history: &OptionalHistoryWriter,
     event: PipelineEvent,
 ) {
     match event {
         PipelineEvent::Subtitle(line) if line.translated.is_empty() => {
+            history.offer(&line);
             subtitle_state.push(line.clone());
             outputs.publish(&subtitle_state.display_lines());
             tracing::info!("[{}] {}", line.label, line.source);
         }
         PipelineEvent::Subtitle(line) => {
+            history.offer(&line);
             subtitle_state.push(line.clone());
             outputs.publish(&subtitle_state.display_lines());
             tracing::info!("[{}] {} => {}", line.label, line.source, line.translated);

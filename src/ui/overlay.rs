@@ -15,6 +15,8 @@ pub const CLICK_THROUGH_EVENT: &str = "click-through://update";
 pub const SETTINGS_SHOWN_EVENT: &str = "settings://shown";
 /// 设置窗口被隐藏（前端清理预览定时器）
 pub const SETTINGS_HIDDEN_EVENT: &str = "settings://hidden";
+/// 历史窗口被显示（前端重新拉取时间线）
+pub const HISTORY_SHOWN_EVENT: &str = "history://shown";
 
 #[derive(Debug, Clone, Serialize)]
 pub struct SubtitleEntryPayload {
