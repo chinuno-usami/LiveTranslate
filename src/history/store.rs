@@ -778,7 +778,7 @@ fn load_segment_file(path: &Path) -> Vec<TranslationRecord> {
             }
         }
     }
-    records.sort_by(|a, b| a.seq.cmp(&b.seq));
+    records.sort_by_key(|a| a.seq);
     records
 }
 
