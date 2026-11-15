@@ -273,8 +273,17 @@ fn collect_unknown(
             continue;
         }
         if path == "audio.sources" {
-            const SOURCE_KEYS: &[&str] =
-                &["id", "label", "device", "enabled", "translate", "language"];
+            const SOURCE_KEYS: &[&str] = &[
+                "id",
+                "label",
+                "device",
+                "enabled",
+                "translate",
+                "language",
+                "desktop",
+                "osc",
+                "steamvr",
+            ];
             if let Some(items) = child.as_array() {
                 for (index, item) in items.iter().enumerate() {
                     if let Some(src_table) = item.as_table() {
@@ -467,6 +476,9 @@ fn set_sources(doc: &mut DocumentMut, sources: &[AudioSourceConfig]) {
         update_table_scalar(&mut table, "enabled", Value::from(source.enabled));
         update_table_scalar(&mut table, "translate", Value::from(source.translate));
         update_table_scalar(&mut table, "language", Value::from(source.language.clone()));
+        update_table_scalar(&mut table, "desktop", Value::from(source.desktop));
+        update_table_scalar(&mut table, "osc", Value::from(source.osc));
+        update_table_scalar(&mut table, "steamvr", Value::from(source.steamvr));
         tables.push(table);
     }
     let entry = doc
@@ -1046,6 +1058,122 @@ devce = "mic:0"
         let text_after = fs::read_to_string(&path).unwrap();
         assert!(text_after.contains("# 多输入源：每个源一条"));
 
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn set_sources_persists_routing_on_new_source_with_osc_false() {
+        let path = temp_path("sources-routing-new");
+        seed(&path);
+        let sources = vec![
+            AudioSourceConfig::new("mic", "麦克风", "mic:0"),
+            AudioSourceConfig {
+                osc: false,
+                steamvr: false,
+                ..AudioSourceConfig::new("game", "游戏", "loopback:0")
+            },
+        ];
+        let cfg = apply_changes(
+            &path,
+            &[(
+                "audio.sources".into(),
+                serde_json::to_value(&sources).unwrap(),
+            )],
+        )
+        .unwrap();
+        assert!(cfg.audio.sources[0].desktop);
+        assert!(cfg.audio.sources[0].osc);
+        assert!(!cfg.audio.sources[1].osc);
+        assert!(!cfg.audio.sources[1].steamvr);
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(text.contains("osc = false"), "{text}");
+        assert!(text.contains("steamvr = false"), "{text}");
+        let on_disk = AppConfig::from_file(&path).unwrap();
+        assert_eq!(on_disk.audio.sources, cfg.audio.sources);
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn set_sources_preserves_routing_on_inplace_edit() {
+        let path = temp_path("sources-routing-inplace");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, AppConfig::SHIPPED_DEFAULT).unwrap();
+        let mut cfg = AppConfig::from_file(&path).unwrap();
+        cfg.audio.sources[0].osc = false;
+        cfg.audio.sources[0].label = "主麦".to_string();
+        cfg.audio.sources[1].desktop = false;
+        let saved = apply_changes(
+            &path,
+            &[(
+                "audio.sources".into(),
+                serde_json::to_value(&cfg.audio.sources).unwrap(),
+            )],
+        )
+        .unwrap();
+        assert!(!saved.audio.sources[0].osc);
+        assert_eq!(saved.audio.sources[0].label, "主麦");
+        assert!(!saved.audio.sources[1].desktop);
+        let on_disk = AppConfig::from_file(&path).unwrap();
+        assert!(!on_disk.audio.sources[0].osc);
+        assert!(!on_disk.audio.sources[1].desktop);
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn set_sources_keeps_routing_after_id_change_and_reorder() {
+        let path = temp_path("sources-routing-reorder");
+        seed(&path);
+        let initial = vec![
+            AudioSourceConfig {
+                osc: false,
+                ..AudioSourceConfig::new("mic", "麦克风", "mic:0")
+            },
+            AudioSourceConfig {
+                steamvr: false,
+                ..AudioSourceConfig::new("game", "游戏", "loopback:0")
+            },
+        ];
+        apply_changes(
+            &path,
+            &[(
+                "audio.sources".into(),
+                serde_json::to_value(&initial).unwrap(),
+            )],
+        )
+        .unwrap();
+
+        // 改 id + 重排：新表不能丢路由字段
+        let reordered = vec![
+            AudioSourceConfig {
+                id: "game_out".into(),
+                steamvr: false,
+                ..AudioSourceConfig::new("game_out", "游戏", "loopback:0")
+            },
+            AudioSourceConfig {
+                id: "mic_main".into(),
+                osc: false,
+                ..AudioSourceConfig::new("mic_main", "麦克风", "mic:0")
+            },
+        ];
+        let saved = apply_changes(
+            &path,
+            &[(
+                "audio.sources".into(),
+                serde_json::to_value(&reordered).unwrap(),
+            )],
+        )
+        .unwrap();
+        assert_eq!(saved.audio.sources[0].id, "game_out");
+        assert!(!saved.audio.sources[0].steamvr);
+        assert!(saved.audio.sources[0].osc);
+        assert_eq!(saved.audio.sources[1].id, "mic_main");
+        assert!(!saved.audio.sources[1].osc);
+        let on_disk = AppConfig::from_file(&path).unwrap();
+        assert_eq!(on_disk.audio.sources, saved.audio.sources);
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(text.contains("id = \"game_out\""));
+        assert!(text.contains("steamvr = false"));
+        assert!(text.contains("osc = false"));
         let _ = fs::remove_dir_all(path.parent().unwrap());
     }
 

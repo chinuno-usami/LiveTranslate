@@ -8,7 +8,7 @@ use crate::config::AppConfig;
 use crate::error::{AppError, AppResult};
 use crate::history::OptionalHistoryWriter;
 use crate::output::OutputManager;
-use crate::subtitle::{SubtitleLine, SubtitleProcessor, SubtitleState};
+use crate::subtitle::{subtitle_views_from, SubtitleLine, SubtitleProcessor, SubtitleState};
 use crate::translate::OpenAiClient;
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{mpsc, watch};
@@ -186,11 +186,11 @@ pub async fn start_console(config: AppConfig) -> AppResult<()> {
         .iter()
         .map(|s| (s.id.clone(), s.label.clone(), true))
         .collect();
-    subtitle_state.set_active_labels(
+    subtitle_state.set_active_sources(
         active_sources
             .iter()
             .filter(|(_, _, running)| *running)
-            .map(|(_, label, _)| label.clone())
+            .map(|(id, label, _)| (id.clone(), label.clone()))
             .collect(),
     );
 
@@ -229,7 +229,7 @@ pub async fn start_console(config: AppConfig) -> AppResult<()> {
         tokio::select! {
             maybe_event = rx.recv() => {
                 match maybe_event {
-                    Some(event) => handle_console_event(&mut subtitle_state, &mut active_sources, &outputs, &history, event),
+                    Some(event) => handle_console_event(&config, &mut subtitle_state, &mut active_sources, &outputs, &history, event),
                     None => break,
                 }
             }
@@ -242,7 +242,7 @@ pub async fn start_console(config: AppConfig) -> AppResult<()> {
                 let _ = stop_tx.send(true);
                 let drain = async {
                     while let Some(event) = rx.recv().await {
-                        handle_console_event(&mut subtitle_state, &mut active_sources, &outputs, &history, event);
+                        handle_console_event(&config, &mut subtitle_state, &mut active_sources, &outputs, &history, event);
                     }
                 };
                 let _ = tokio::time::timeout(std::time::Duration::from_secs(3), drain).await;
@@ -261,23 +261,28 @@ pub async fn start_console(config: AppConfig) -> AppResult<()> {
 }
 
 fn handle_console_event(
+    config: &AppConfig,
     subtitle_state: &mut SubtitleState,
     active_sources: &mut [(String, String, bool)],
     outputs: &OutputManager,
     history: &OptionalHistoryWriter,
     event: PipelineEvent,
 ) {
+    let publish_views = |subtitle_state: &SubtitleState, outputs: &OutputManager| {
+        let views = subtitle_views_from(subtitle_state, config);
+        outputs.publish(&views.steamvr, &views.osc);
+    };
     match event {
         PipelineEvent::Subtitle(line) if line.translated.is_empty() => {
             history.offer(&line);
             subtitle_state.push(line.clone());
-            outputs.publish(&subtitle_state.display_lines());
+            publish_views(subtitle_state, outputs);
             tracing::info!("[{}] {}", line.label, line.source);
         }
         PipelineEvent::Subtitle(line) => {
             history.offer(&line);
             subtitle_state.push(line.clone());
-            outputs.publish(&subtitle_state.display_lines());
+            publish_views(subtitle_state, outputs);
             tracing::info!("[{}] {} => {}", line.label, line.source, line.translated);
         }
         PipelineEvent::Notice { source_id, message } => {
@@ -294,13 +299,13 @@ fn handle_console_event(
                 .find(|(id, _, _)| *id == source_id)
             {
                 *slot_running = running;
-                let labels = active_sources
+                let sources = active_sources
                     .iter()
                     .filter(|(_, _, active)| *active)
-                    .map(|(_, label, _)| label.clone())
+                    .map(|(id, label, _)| (id.clone(), label.clone()))
                     .collect();
-                subtitle_state.set_active_labels(labels);
-                outputs.publish(&subtitle_state.display_lines());
+                subtitle_state.set_active_sources(sources);
+                publish_views(subtitle_state, outputs);
             }
             tracing::info!(
                 "Source {} {} (audio={}): {}",

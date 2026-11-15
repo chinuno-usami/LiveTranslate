@@ -32,6 +32,82 @@ const els = {
   closeBtn: document.getElementById('close-btn'),
 };
 
+
+function formatAcceleratorDisplay(accelerator) {
+  const raw = String(accelerator || '').trim();
+  if (!raw) return '未设置';
+  return raw
+    .split('+')
+    .map((part) => part.trim())
+    .filter(Boolean)
+    .map((part) => {
+      const lower = part.toLowerCase();
+      if (lower === 'cmdorctrl' || lower === 'commandorcontrol') return 'Ctrl/Cmd';
+      if (lower === 'cmd' || lower === 'command') return 'Cmd';
+      if (lower === 'ctrl' || lower === 'control') return 'Ctrl';
+      if (lower === 'alt' || lower === 'option') return 'Alt';
+      if (lower === 'shift') return 'Shift';
+      if (lower === 'comma') return ',';
+      return part;
+    })
+    .join(' + ');
+}
+
+function renderShortcutHelp(items) {
+  const tbody = document.getElementById('shortcut-list');
+  if (!tbody) return;
+  const list = Array.isArray(items) ? items : [];
+  tbody.innerHTML = list
+    .map((item) => {
+      const acc = String(item.accelerator || '').trim();
+      const display = formatAcceleratorDisplay(acc);
+      const kbd = acc
+        ? display
+            .split(' + ')
+            .map((part) => `<kbd>${escapeHtmlApp(part)}</kbd>`)
+            .join(' + ')
+        : `<span class="shortcut-unset">未设置</span>`;
+      const warn =
+        acc && item.registered === false
+          ? ' <span class="shortcut-warn">未生效（可能被其它程序占用）</span>'
+          : '';
+      return `<tr><td>${kbd}${warn}</td><td>${escapeHtmlApp(item.label || item.action || '')}</td></tr>`;
+    })
+    .join('');
+
+  const settingsItem = list.find((item) => item.action === 'open_settings');
+  if (els.settingsBtn && settingsItem) {
+    const tip = String(settingsItem.accelerator || '').trim()
+      ? `打开设置页 (${formatAcceleratorDisplay(settingsItem.accelerator)})`
+      : '打开设置页';
+    els.settingsBtn.title = tip;
+  }
+  const historyItem = list.find((item) => item.action === 'open_history');
+  if (els.historyBtn && historyItem) {
+    const tip = String(historyItem.accelerator || '').trim()
+      ? `查看翻译历史 (${formatAcceleratorDisplay(historyItem.accelerator)})`
+      : '查看翻译历史';
+    els.historyBtn.title = tip;
+  }
+}
+
+function escapeHtmlApp(value) {
+  return String(value ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
+async function refreshShortcutHelp() {
+  try {
+    const payload = await invoke('get_hotkeys');
+    renderShortcutHelp(payload?.items || []);
+  } catch (error) {
+    console.warn('加载快捷键帮助失败', error);
+  }
+}
+
 const MIN_FONT = 12;
 const MAX_FONT = 72;
 
@@ -813,6 +889,7 @@ async function bindActions() {
     // 打开模态前收起输入源弹层，避免两个浮层同时可交互
     els.sourcesPopover.classList.add('hidden');
     els.sourcesBtn.setAttribute('aria-expanded', 'false');
+    refreshShortcutHelp().catch(() => {});
     els.helpModal.classList.remove('hidden');
   });
   els.helpClose.addEventListener('click', () => {
@@ -840,6 +917,10 @@ async function bindEvents() {
     console.warn('Tauri event.listen 不可用，跳过事件订阅');
     return;
   }
+
+  await listen('hotkey-status://update', (event) => {
+    renderShortcutHelp(event.payload?.items || []);
+  });
 
   await listen('subtitle://update', (event) => {
     renderLines(event.payload.entries || []);
@@ -978,7 +1059,7 @@ window.addEventListener('DOMContentLoaded', async () => {
     console.error('bindEvents 失败', error);
   }
 
-  for (const step of [loadInitialConfig, loadInitialStatus, loadLanguages]) {
+  for (const step of [loadInitialConfig, loadInitialStatus, loadLanguages, refreshShortcutHelp]) {
     try {
       await step();
     } catch (error) {

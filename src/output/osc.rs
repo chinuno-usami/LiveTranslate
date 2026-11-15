@@ -292,6 +292,8 @@ mod imp {
         reset_dedup: AtomicBool,
         /// 请求发送一次空文本（Chatbox 是有状态的，停止后要主动清屏）
         pending_clear: AtomicBool,
+        /// 上一次 publish 的 filtered 快照是否非空（用于路由变空时主动清屏）
+        last_snapshot_nonempty: AtomicBool,
         notify: Arc<tokio::sync::Notify>,
     }
 
@@ -341,6 +343,7 @@ mod imp {
                 activity_ms: AtomicU64::new(0),
                 reset_dedup: AtomicBool::new(false),
                 pending_clear: AtomicBool::new(false),
+                last_snapshot_nonempty: AtomicBool::new(false),
                 notify,
             });
 
@@ -390,11 +393,13 @@ mod imp {
             self.shared.notify.notify_one();
         }
 
-        /// 传入完整字幕快照；内部覆盖旧快照，限流期间只保留最新结果
+        /// 传入完整字幕快照；内部覆盖旧快照，限流期间只保留最新结果。
+        /// 当 filtered 快照从非空变为空时，主动请求发空串清屏（路由关掉 OSC 通道所有源）。
         pub fn publish(&self, snapshot: &[DisplayLine]) {
             let tail = snapshot
                 .last()
                 .map(|l| (l.source_id.clone(), l.source.clone(), l.translated.clone()));
+            let nonempty = !snapshot.is_empty();
             let is_new_activity = {
                 let mut pending = self
                     .shared
@@ -402,9 +407,17 @@ mod imp {
                     .lock()
                     .unwrap_or_else(|e| e.into_inner());
                 *pending = Some(snapshot.to_vec());
-                if !snapshot.is_empty() {
+                let was_nonempty = self
+                    .shared
+                    .last_snapshot_nonempty
+                    .swap(nonempty, Ordering::SeqCst);
+                if nonempty {
                     // 新一轮非空字幕到达后取消残留清屏标记，防止快速停启时新字幕被空串覆盖
                     self.shared.pending_clear.store(false, Ordering::SeqCst);
+                } else if was_nonempty {
+                    // 非空 → 空：与 set_active(false) 一致，主动清 Chatbox
+                    self.shared.reset_dedup.store(true, Ordering::SeqCst);
+                    self.shared.pending_clear.store(true, Ordering::SeqCst);
                 }
                 let mut last_tail = self
                     .shared
@@ -442,6 +455,9 @@ mod imp {
                     // 空快照组包后是 None（什么都不发），Chatbox 会把最后一句留在画面里，
                     // 所以额外标记一次「发空串」。与 pending 放在同一把锁内保证顺序一致。
                     self.shared.pending_clear.store(true, Ordering::SeqCst);
+                    self.shared
+                        .last_snapshot_nonempty
+                        .store(false, Ordering::SeqCst);
                 }
             }
         }
@@ -1086,6 +1102,53 @@ mod tests {
                 assert_eq!(
                     msg.args.first(),
                     Some(&rosc::OscType::String("你好".to_string()))
+                );
+            }
+            other => panic!("意外的 OSC 包: {other:?}"),
+        }
+        sink.shutdown();
+    }
+
+    #[cfg(feature = "osc")]
+    #[test]
+    fn osc_sink_clears_chatbox_when_snapshot_becomes_empty() {
+        use std::net::UdpSocket;
+        use std::sync::Arc;
+
+        let Ok(receiver) = UdpSocket::bind("127.0.0.1:0") else {
+            return;
+        };
+        receiver
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let addr = receiver.local_addr().unwrap();
+
+        let cfg = OscConfig {
+            enabled: true,
+            target: addr.to_string(),
+            send_typing: false,
+            min_interval_ms: 200,
+            ..OscConfig::default()
+        };
+        let sink = OscSink::new(&cfg, Arc::new(tokio::sync::Notify::new()));
+        sink.set_active(true);
+        sink.publish(&[line(None, "hi", "有字幕")]);
+
+        let mut buf = [0u8; 512];
+        let (len, _) = receiver.recv_from(&mut buf).expect("应收到非空字幕");
+        let (_, packet) = rosc::decoder::decode_udp(&buf[..len]).unwrap();
+        assert!(matches!(packet, rosc::OscPacket::Message(_)));
+
+        // 路由把 OSC 通道所有源关掉 → filtered 快照变空，必须主动清屏
+        sink.publish(&[]);
+        let (len, _) = receiver.recv_from(&mut buf).expect("通道变空应主动清屏");
+        let (_, packet) = rosc::decoder::decode_udp(&buf[..len]).unwrap();
+        match packet {
+            rosc::OscPacket::Message(msg) => {
+                assert_eq!(msg.addr, "/chatbox/input");
+                assert_eq!(
+                    msg.args.first(),
+                    Some(&rosc::OscType::String(String::new()))
                 );
             }
             other => panic!("意外的 OSC 包: {other:?}"),

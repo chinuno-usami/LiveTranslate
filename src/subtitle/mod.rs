@@ -1,5 +1,5 @@
-use crate::config::LabelMode;
-use std::collections::VecDeque;
+use crate::config::{AppConfig, LabelMode, OutputChannel};
+use std::collections::{HashSet, VecDeque};
 
 pub mod processor;
 
@@ -43,13 +43,74 @@ pub struct DisplayLine {
     pub text: String,
 }
 
+/// 某个通道允许出现的 source_id 集合
+#[derive(Debug, Clone)]
+pub struct ChannelFilter {
+    #[allow(dead_code)] // 诊断/日志保留通道身份；过滤只看 allowed
+    pub channel: OutputChannel,
+    pub allowed: HashSet<String>,
+}
+
+impl ChannelFilter {
+    pub fn allows(&self, source_id: &str) -> bool {
+        self.allowed.contains(source_id)
+    }
+}
+
+/// 由配置构建某通道的源过滤器（只含当前配置里路由到该通道的源）
+pub fn channel_filter(config: &AppConfig, channel: OutputChannel) -> ChannelFilter {
+    let allowed = config
+        .audio
+        .effective_sources(config.translate.enabled)
+        .into_iter()
+        .filter(|s| s.routes_to(channel))
+        .map(|s| s.id)
+        .collect();
+    ChannelFilter { channel, allowed }
+}
+
+/// 三个输出通道各自裁剪后的字幕视图
+#[derive(Debug, Clone)]
+pub struct SubtitleViews {
+    pub desktop: Vec<DisplayLine>,
+    pub osc: Vec<DisplayLine>,
+    pub steamvr: Vec<DisplayLine>,
+}
+
+/// 保留末尾至多 `limit` 条（至少 1）
+pub fn trim_last(mut entries: Vec<DisplayLine>, limit: usize) -> Vec<DisplayLine> {
+    let limit = limit.max(1);
+    if entries.len() > limit {
+        entries.drain(..entries.len() - limit);
+    }
+    entries
+}
+
+/// 按通道路由生成桌面 / OSC / SteamVR 三份视图
+pub fn subtitle_views_from(state: &SubtitleState, config: &AppConfig) -> SubtitleViews {
+    SubtitleViews {
+        desktop: trim_last(
+            state.display_lines_for(&channel_filter(config, OutputChannel::Desktop)),
+            config.subtitle.max_lines,
+        ),
+        osc: trim_last(
+            state.display_lines_for(&channel_filter(config, OutputChannel::Osc)),
+            config.output.osc.max_lines,
+        ),
+        steamvr: trim_last(
+            state.display_lines_for(&channel_filter(config, OutputChannel::SteamVr)),
+            config.output.steamvr.max_lines,
+        ),
+    }
+}
+
 pub struct SubtitleState {
     history: VecDeque<SubtitleLine>,
     max_lines: usize,
     show_source: bool,
     label_mode: LabelMode,
-    /// 当前在跑的源标签（用于 Auto 判定）
-    active_labels: Vec<String>,
+    /// 当前在跑的源 (id, label)，用于 Auto 判定
+    active_sources: Vec<(String, String)>,
 }
 
 impl SubtitleState {
@@ -59,7 +120,7 @@ impl SubtitleState {
             max_lines: max_lines.max(1),
             show_source,
             label_mode,
-            active_labels: Vec::new(),
+            active_sources: Vec::new(),
         }
     }
 
@@ -72,16 +133,31 @@ impl SubtitleState {
         tracing::debug!("Subtitle pushed. Current count: {}", self.history.len());
     }
 
-    /// 当前应显示的条目（按时间从旧到新）
+    /// 未按通道过滤的全量视图（兼容旧调用；Auto 看全部运行源）
     pub fn display_lines(&self) -> Vec<DisplayLine> {
+        let should_label = self.should_label_unfiltered();
         self.history
             .iter()
-            .map(|line| self.render_line(line))
+            .map(|line| self.render_line(line, should_label))
             .collect()
     }
 
-    fn render_line(&self, line: &SubtitleLine) -> DisplayLine {
-        let label = if self.should_label() {
+    /// 只渲染该通道允许的源，并按该通道的可见源重新判定 Auto 标签。
+    pub fn display_lines_for(&self, filter: &ChannelFilter) -> Vec<DisplayLine> {
+        let visible: Vec<&SubtitleLine> = self
+            .history
+            .iter()
+            .filter(|line| filter.allows(&line.source_id))
+            .collect();
+        let should_label = self.should_label_for(filter, &visible);
+        visible
+            .into_iter()
+            .map(|line| self.render_line(line, should_label))
+            .collect()
+    }
+
+    fn render_line(&self, line: &SubtitleLine, should_label: bool) -> DisplayLine {
+        let label = if should_label {
             Some(line.label.clone())
         } else {
             None
@@ -118,23 +194,35 @@ impl SubtitleState {
         }
     }
 
-    fn should_label(&self) -> bool {
+    fn should_label_unfiltered(&self) -> bool {
         match self.label_mode {
             LabelMode::Always => true,
             LabelMode::Never => false,
             LabelMode::Auto => {
-                if self.active_labels.len() >= 2 {
+                if self.active_sources.len() >= 2 {
                     return true;
                 }
-                let mut first_source: Option<&str> = None;
-                for item in &self.history {
-                    match first_source {
-                        None => first_source = Some(item.source_id.as_str()),
-                        Some(first) if first != item.source_id => return true,
-                        _ => {}
-                    }
+                history_has_multiple_source_ids(self.history.iter())
+            }
+        }
+    }
+
+    fn should_label_for(&self, filter: &ChannelFilter, visible: &[&SubtitleLine]) -> bool {
+        match self.label_mode {
+            LabelMode::Always => true,
+            LabelMode::Never => false,
+            LabelMode::Auto => {
+                // 仅统计「该通道可见且正在运行」的源
+                let active_in_channel = self
+                    .active_sources
+                    .iter()
+                    .filter(|(id, _)| filter.allows(id))
+                    .count();
+                if active_in_channel >= 2 {
+                    return true;
                 }
-                false
+                // 第二条件也只看通道内可见历史，不可见源不触发前缀
+                history_has_multiple_source_ids(visible.iter().copied())
             }
         }
     }
@@ -191,9 +279,9 @@ impl SubtitleState {
         self.label_mode = mode;
     }
 
-    /// 更新「正在运行的源」标签集合，影响 Auto 前缀判定
-    pub fn set_active_labels(&mut self, labels: Vec<String>) {
-        self.active_labels = labels;
+    /// 更新「正在运行的源」集合，影响 Auto 前缀判定
+    pub fn set_active_sources(&mut self, sources: Vec<(String, String)>) {
+        self.active_sources = sources;
     }
 
     fn trim(&mut self) {
@@ -203,12 +291,32 @@ impl SubtitleState {
     }
 }
 
+fn history_has_multiple_source_ids<'a>(items: impl IntoIterator<Item = &'a SubtitleLine>) -> bool {
+    let mut first_source: Option<&str> = None;
+    for item in items {
+        match first_source {
+            None => first_source = Some(item.source_id.as_str()),
+            Some(first) if first != item.source_id => return true,
+            _ => {}
+        }
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::AudioSourceConfig;
 
     fn line(id: &str, label: &str, source: &str, translated: &str) -> SubtitleLine {
         SubtitleLine::new(id, label, source.into(), translated.into())
+    }
+
+    fn filter(channel: OutputChannel, ids: &[&str]) -> ChannelFilter {
+        ChannelFilter {
+            channel,
+            allowed: ids.iter().map(|id| (*id).to_string()).collect(),
+        }
     }
 
     #[test]
@@ -216,15 +324,18 @@ mod tests {
         let mut state = SubtitleState::new(3, false, LabelMode::Auto);
         state.push(line("mic", "麦克风", "hello", "你好"));
 
-        state.set_active_labels(vec!["麦克风".into()]);
+        state.set_active_sources(vec![("mic".into(), "麦克风".into())]);
         assert_eq!(state.display_lines()[0].lines[0], "你好");
 
-        state.set_active_labels(vec!["麦克风".into(), "游戏".into()]);
+        state.set_active_sources(vec![
+            ("mic".into(), "麦克风".into()),
+            ("game".into(), "游戏".into()),
+        ]);
         assert_eq!(state.display_lines()[0].lines[0], "[麦克风] 你好");
 
         // 其中一路刚停止时，只要屏幕历史里仍混合多源字幕，就继续保留来源标识
         state.push(line("game", "游戏", "hi", "嗨"));
-        state.set_active_labels(vec!["麦克风".into()]);
+        state.set_active_sources(vec![("mic".into(), "麦克风".into())]);
         assert_eq!(state.display_lines()[0].lines[0], "[麦克风] 你好");
         assert_eq!(state.display_lines()[1].lines[0], "[游戏] 嗨");
     }
@@ -237,7 +348,7 @@ mod tests {
 
         let mut never = SubtitleState::new(3, false, LabelMode::Never);
         never.push(line("mic", "麦克风", "hello", "你好"));
-        never.set_active_labels(vec!["a".into(), "b".into()]);
+        never.set_active_sources(vec![("a".into(), "a".into()), ("b".into(), "b".into())]);
         assert_eq!(never.display_lines()[0].lines[0], "你好");
     }
 
@@ -323,5 +434,142 @@ mod tests {
         state.clear();
         assert!(state.is_empty());
         assert!(state.get_text().is_empty());
+    }
+
+    #[test]
+    fn display_lines_for_desktop_shows_both_with_auto_prefix() {
+        let mut state = SubtitleState::new(10, false, LabelMode::Auto);
+        state.set_active_sources(vec![("a".into(), "A".into()), ("b".into(), "B".into())]);
+        state.push(line("a", "A", "sa", "ta"));
+        state.push(line("b", "B", "sb", "tb"));
+        let desktop = filter(OutputChannel::Desktop, &["a", "b"]);
+        let lines = state.display_lines_for(&desktop);
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].lines[0], "[A] ta");
+        assert_eq!(lines[1].lines[0], "[B] tb");
+    }
+
+    #[test]
+    fn display_lines_for_osc_single_visible_drops_auto_prefix() {
+        let mut state = SubtitleState::new(10, false, LabelMode::Auto);
+        state.set_active_sources(vec![("a".into(), "A".into()), ("b".into(), "B".into())]);
+        state.push(line("a", "A", "sa", "ta"));
+        state.push(line("b", "B", "sb", "tb"));
+        let osc = filter(OutputChannel::Osc, &["a"]);
+        let lines = state.display_lines_for(&osc);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].source_id, "a");
+        assert_eq!(lines[0].lines[0], "ta");
+    }
+
+    #[test]
+    fn display_lines_for_hides_disallowed_sources() {
+        let mut state = SubtitleState::new(10, false, LabelMode::Never);
+        state.push(line("a", "A", "sa", "ta"));
+        state.push(line("b", "B", "sb", "tb"));
+        state.push(line("c", "C", "sc", "tc"));
+        let lines = state.display_lines_for(&filter(OutputChannel::SteamVr, &["b"]));
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].source_id, "b");
+    }
+
+    #[test]
+    fn display_lines_for_always_keeps_prefix_with_single_visible() {
+        let mut state = SubtitleState::new(10, false, LabelMode::Always);
+        state.set_active_sources(vec![("a".into(), "A".into())]);
+        state.push(line("a", "A", "sa", "ta"));
+        let lines = state.display_lines_for(&filter(OutputChannel::Desktop, &["a"]));
+        assert_eq!(lines[0].lines[0], "[A] ta");
+    }
+
+    #[test]
+    fn display_lines_for_auto_ignores_hidden_history_sources() {
+        // 历史混合 A/B，当前通道只允许 A → 不因历史里的 B 触发 Auto 前缀
+        let mut state = SubtitleState::new(10, false, LabelMode::Auto);
+        state.set_active_sources(vec![("a".into(), "A".into())]);
+        state.push(line("a", "A", "sa", "ta"));
+        state.push(line("b", "B", "sb", "tb"));
+        let lines = state.display_lines_for(&filter(OutputChannel::Osc, &["a"]));
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].lines[0], "ta");
+    }
+
+    #[test]
+    fn trim_last_and_subtitle_views_respect_per_channel_limits() {
+        let mut state = SubtitleState::new(10, false, LabelMode::Never);
+        state.set_active_sources(vec![("a".into(), "A".into())]);
+        for i in 0..5 {
+            state.push(SubtitleLine::new(
+                "a",
+                "A",
+                format!("s{i}"),
+                format!("t{i}"),
+            ));
+        }
+        let mut config = AppConfig::default();
+        config.audio.sources = vec![AudioSourceConfig::new("a", "A", "mic:0")];
+        config.subtitle.max_lines = 2;
+        config.output.osc.max_lines = 3;
+        config.output.steamvr.max_lines = 4;
+        let views = subtitle_views_from(&state, &config);
+        assert_eq!(views.desktop.len(), 2);
+        assert_eq!(views.osc.len(), 3);
+        assert_eq!(views.steamvr.len(), 4);
+        assert_eq!(views.desktop[0].translated, "t3");
+        assert_eq!(views.osc[0].translated, "t2");
+        assert_eq!(views.steamvr[0].translated, "t1");
+    }
+
+    #[test]
+    fn channel_filter_uses_routing_flags() {
+        let mut config = AppConfig::default();
+        config.audio.sources = vec![
+            AudioSourceConfig {
+                id: "mic".into(),
+                label: "麦克风".into(),
+                device: "mic".into(),
+                enabled: true,
+                translate: true,
+                language: String::new(),
+                desktop: true,
+                osc: true,
+                steamvr: false,
+            },
+            AudioSourceConfig {
+                id: "game".into(),
+                label: "游戏".into(),
+                device: "loopback".into(),
+                enabled: true,
+                translate: true,
+                language: String::new(),
+                desktop: true,
+                osc: false,
+                steamvr: true,
+            },
+        ];
+        let desktop = channel_filter(&config, OutputChannel::Desktop);
+        assert!(desktop.allows("mic") && desktop.allows("game"));
+        let osc = channel_filter(&config, OutputChannel::Osc);
+        assert!(osc.allows("mic") && !osc.allows("game"));
+        let vr = channel_filter(&config, OutputChannel::SteamVr);
+        assert!(!vr.allows("mic") && vr.allows("game"));
+    }
+
+    #[test]
+    fn routes_to_matches_channel_flags() {
+        let src = AudioSourceConfig {
+            id: "x".into(),
+            label: "X".into(),
+            device: "mic".into(),
+            enabled: true,
+            translate: true,
+            language: String::new(),
+            desktop: true,
+            osc: false,
+            steamvr: true,
+        };
+        assert!(src.routes_to(OutputChannel::Desktop));
+        assert!(!src.routes_to(OutputChannel::Osc));
+        assert!(src.routes_to(OutputChannel::SteamVr));
     }
 }

@@ -57,14 +57,14 @@ impl OutputManager {
         self.status_notify.notify_one();
     }
 
-    /// 发布一份完整字幕快照（按时间从旧到新）
-    pub fn publish(&self, snapshot: &[DisplayLine]) {
+    /// 分别发布 SteamVR / OSC 通道快照（按时间从旧到新；两通道可不同）
+    pub fn publish(&self, steamvr: &[DisplayLine], osc: &[DisplayLine]) {
         // 停止后迟到的快照不要再进入输出，否则重新开启时会立刻发出旧内容
         if !self.capture_active.load(Ordering::SeqCst) {
             return;
         }
-        self.steamvr.publish(snapshot);
-        self.osc.publish(snapshot);
+        self.steamvr.publish(steamvr);
+        self.osc.publish(osc);
     }
 
     /// 设置热更新（旧 VR 线程若有停止等待，放到 blocking 池回收以免阻塞异步锁持有者）

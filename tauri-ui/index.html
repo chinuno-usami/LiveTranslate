@@ -86,18 +86,11 @@
           <button id="help-close" class="ghost-btn">关闭</button>
         </div>
         <table class="shortcut-table">
-          <tbody>
-            <tr><td><kbd>Ctrl</kbd>/<kbd>Cmd</kbd> + <kbd>Alt</kbd> + <kbd>S</kbd></td><td>显示 / 聚焦浮窗</td></tr>
-            <tr><td><kbd>Ctrl</kbd>/<kbd>Cmd</kbd> + <kbd>Alt</kbd> + <kbd>R</kbd></td><td>开始采集</td></tr>
-            <tr><td><kbd>Ctrl</kbd>/<kbd>Cmd</kbd> + <kbd>Alt</kbd> + <kbd>E</kbd></td><td>停止采集</td></tr>
-            <tr><td><kbd>Ctrl</kbd>/<kbd>Cmd</kbd> + <kbd>Alt</kbd> + <kbd>T</kbd></td><td>切换点击穿透</td></tr>
-            <tr><td><kbd>Ctrl</kbd>/<kbd>Cmd</kbd> + <kbd>Alt</kbd> + <kbd>,</kbd></td><td>打开设置页</td></tr>
-            <tr><td><kbd>Ctrl</kbd>/<kbd>Cmd</kbd> + <kbd>Alt</kbd> + <kbd>Q</kbd></td><td>退出程序</td></tr>
-          </tbody>
+          <tbody id="shortcut-list"></tbody>
         </table>
-        <div class="modal-note">
+        <div class="modal-note" id="shortcut-note">
           托盘菜单也可完成上述操作。开启点击穿透后浮窗不再接收鼠标事件，
-          请用托盘菜单或 <kbd>Ctrl</kbd>/<kbd>Cmd</kbd> + <kbd>Alt</kbd> + <kbd>T</kbd> 关闭穿透。
+          请用托盘菜单或快捷键关闭穿透。
         </div>
       </div>
     </div>

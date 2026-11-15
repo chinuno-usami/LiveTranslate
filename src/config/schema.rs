@@ -38,6 +38,7 @@ pub enum FieldKind {
     Color,
     Device,
     Language,
+    Hotkey,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -67,7 +68,7 @@ pub fn build(config: &AppConfig) -> SettingsSchema {
         SettingsGroup {
             id: "sources".into(),
             title: "输入源".into(),
-            description: "同时采集多个麦克风 / 系统回环；每个源可单独开关翻译与识别语言。".into(),
+            description: "同时采集多个麦克风 / 系统回环；每个源可单独开关翻译、识别语言，以及桌面/OSC/VR 输出路由。".into(),
             custom: Some("sources_table".into()),
             fields: vec![
                 device(
@@ -524,6 +525,15 @@ pub fn build(config: &AppConfig) -> SettingsSchema {
                     2.0,
                     0.01,
                 ),
+                float(
+                    config,
+                    "output.steamvr.horizontal_offset_m",
+                    "水平偏移（米）",
+                    "hmd 模式；正数向右。",
+                    -2.0,
+                    2.0,
+                    0.01,
+                ),
                 int(
                     config,
                     "output.steamvr.max_lines",
@@ -620,6 +630,79 @@ pub fn build(config: &AppConfig) -> SettingsSchema {
                     0.0,
                     1.0,
                 ),
+                bool_adv(
+                    config,
+                    "output.steamvr.gesture.enabled",
+                    "启用手势移动",
+                    "默认关闭；开启后可用手柄移动字幕面板（后续版本实现）。",
+                ),
+                bool_adv(
+                    config,
+                    "output.steamvr.gesture.locked",
+                    "锁定位置",
+                    "锁定时忽略拖动手势；可用设置或全局快捷键切换。",
+                ),
+                bool_adv(
+                    config,
+                    "output.steamvr.gesture.unlock_via_vr_gesture",
+                    "允许 VR 内手势解锁",
+                    "默认关闭；关闭时只能用桌面设置或全局快捷键解锁。",
+                ),
+                {
+                    let mut field = enum_(
+                        config,
+                        "output.steamvr.gesture.grab",
+                        "拖拽激活组合",
+                        "",
+                        vec![
+                            ("both_grips", "双手 Grip"),
+                            ("right_grip", "右手 Grip"),
+                            ("right_trigger", "右手 Trigger"),
+                        ],
+                    );
+                    field.advanced = true;
+                    field
+                },
+                {
+                    let mut field = enum_(
+                        config,
+                        "output.steamvr.gesture.mode",
+                        "抓取方式",
+                        "",
+                        vec![("ray", "射线"), ("near", "近距离")],
+                    );
+                    field.advanced = true;
+                    field
+                },
+                float_adv(
+                    config,
+                    "output.steamvr.gesture.sensitivity",
+                    "位移灵敏度",
+                    "",
+                    0.2,
+                    3.0,
+                ),
+                bool_adv(config, "output.steamvr.gesture.pointer", "显示射线光标", ""),
+                bool_adv(
+                    config,
+                    "output.steamvr.gesture.haptics",
+                    "触觉反馈",
+                    "抓取/松手/锁定切换时震动。",
+                ),
+                float_adv(
+                    config,
+                    "output.steamvr.gesture.near_radius_m",
+                    "近距离抓取半径（米）",
+                    "",
+                    0.05,
+                    2.0,
+                ),
+                bool_adv(
+                    config,
+                    "output.steamvr.gesture.block_game_input",
+                    "移动时屏蔽游戏输入",
+                    "需要 SteamVR Input 2.0 与实验设置；默认关闭。",
+                ),
             ],
         },
         SettingsGroup {
@@ -712,6 +795,49 @@ pub fn build(config: &AppConfig) -> SettingsSchema {
             ],
         },
         SettingsGroup {
+            id: "hotkeys".into(),
+            title: "快捷键".into(),
+            description: "全局快捷键；留空禁用该项。保存后立即重注册，无需重启。".into(),
+            custom: Some("hotkeys_actions".into()),
+            fields: vec![
+                hotkey(config, "hotkeys.show", "显示浮窗", "默认 CmdOrCtrl+Alt+S。"),
+                hotkey(
+                    config,
+                    "hotkeys.start",
+                    "开始采集",
+                    "默认 CmdOrCtrl+Alt+R。",
+                ),
+                hotkey(config, "hotkeys.stop", "停止采集", "默认 CmdOrCtrl+Alt+E。"),
+                hotkey(
+                    config,
+                    "hotkeys.toggle_capture",
+                    "切换采集",
+                    "留空禁用；按当前运行状态开始或停止。",
+                ),
+                hotkey(
+                    config,
+                    "hotkeys.toggle_click_through",
+                    "切换点击穿透",
+                    "默认 CmdOrCtrl+Alt+T。",
+                ),
+                hotkey(
+                    config,
+                    "hotkeys.open_settings",
+                    "打开设置",
+                    "默认 CmdOrCtrl+Alt+Comma。",
+                ),
+                hotkey(config, "hotkeys.open_history", "打开历史", "留空禁用。"),
+                hotkey(config, "hotkeys.toggle_translate", "切换翻译", "留空禁用。"),
+                hotkey(
+                    config,
+                    "hotkeys.toggle_steamvr_lock",
+                    "切换 VR 位置锁定",
+                    "留空禁用；写入 output.steamvr.gesture.locked。",
+                ),
+                hotkey(config, "hotkeys.quit", "退出", "默认 CmdOrCtrl+Alt+Q。"),
+            ],
+        },
+        SettingsGroup {
             id: "advanced".into(),
             title: "高级 / 原始配置".into(),
             description: "直接编辑 TOML。保存前会完整校验，非法内容不会落盘。".into(),
@@ -734,11 +860,16 @@ pub fn build_with_warning(config: &AppConfig, warning: Option<String>) -> Settin
 
 /// 该字段是否需要重启采集才能生效
 pub fn is_restart_required(path: &str) -> bool {
-    if path.starts_with("output.") || path.starts_with("subtitle.") {
+    if path.starts_with("output.") || path.starts_with("subtitle.") || path.starts_with("hotkeys.")
+    {
         return false;
     }
     if path == "translate.enabled" || path == "asr.language" || path == "asr.edge.language" {
         return false;
+    }
+    // 输入源路由字段本身热更新；整表 audio.sources 的冷/热差量由运行期 sources_need_restart 判定
+    if path == "audio.sources" {
+        return true;
     }
     if path.starts_with("audio.") || path.starts_with("vad.") || path.starts_with("translate.") {
         return true;
@@ -974,6 +1105,12 @@ fn string_adv(config: &AppConfig, path: &str, label: &str, help: &str) -> Settin
         ..string(config, path, label, help)
     }
 }
+fn hotkey(config: &AppConfig, path: &str, label: &str, help: &str) -> SettingsField {
+    SettingsField {
+        help: help.into(),
+        ..base(config, path, label, FieldKind::Hotkey)
+    }
+}
 fn secret(config: &AppConfig, path: &str, label: &str, help: &str) -> SettingsField {
     SettingsField {
         help: help.into(),
@@ -1178,10 +1315,23 @@ mod tests {
             "subtitle",
             "steamvr",
             "osc",
+            "hotkeys",
             "advanced",
         ] {
             assert!(ids.contains(&expected), "缺少分组 {expected}");
         }
+    }
+
+    #[test]
+    fn hotkeys_and_gesture_fields_are_hot_reload() {
+        assert!(!is_restart_required("hotkeys.show"));
+        assert!(!is_restart_required("hotkeys.quit"));
+        assert!(!is_restart_required("output.steamvr.horizontal_offset_m"));
+        assert!(!is_restart_required("output.steamvr.gesture.locked"));
+        assert!(!is_restart_required("output.steamvr.gesture.enabled"));
+        // vad/asr 冷字段语义保持
+        assert!(is_restart_required("vad.enabled"));
+        assert!(is_restart_required("asr.base_url"));
     }
 
     #[test]

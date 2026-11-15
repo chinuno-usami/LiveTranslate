@@ -6,6 +6,7 @@ mod audio;
 mod config;
 mod error;
 mod history;
+mod hotkeys;
 mod output;
 mod subtitle;
 mod translate;
@@ -19,15 +20,16 @@ use serde::Deserialize;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
-use subtitle::SubtitleState;
+use subtitle::{subtitle_views_from, SubtitleState};
 use tauri::{AppHandle, LogicalPosition, LogicalSize, Manager, State, Window};
 use tokio::sync::{mpsc, watch, Mutex};
 use tracing_subscriber::EnvFilter;
 use ui::{
-    ActiveSourcePayload, CapabilitiesPayload, OverlayConfigPayload, SaveResult, SourceStatusItem,
-    SourcesPayload, StatusPayload, SubtitlePayload, CLICK_THROUGH_EVENT, CONFIG_EVENT, ERROR_EVENT,
-    HISTORY_SHOWN_EVENT, NOTICE_EVENT, OUTPUT_STATUS_EVENT, SETTINGS_HIDDEN_EVENT,
-    SETTINGS_SHOWN_EVENT, SOURCE_STATUS_EVENT, STATUS_EVENT, SUBTITLE_EVENT,
+    ActiveSourcePayload, CapabilitiesPayload, HotkeyStatusPayload, OverlayConfigPayload,
+    SaveResult, SourceStatusItem, SourcesPayload, StatusPayload, SubtitlePayload,
+    CLICK_THROUGH_EVENT, CONFIG_EVENT, ERROR_EVENT, HISTORY_SHOWN_EVENT, HOTKEY_STATUS_EVENT,
+    NOTICE_EVENT, OUTPUT_STATUS_EVENT, SETTINGS_HIDDEN_EVENT, SETTINGS_SHOWN_EVENT,
+    SOURCE_STATUS_EVENT, STATUS_EVENT, SUBTITLE_EVENT,
 };
 
 #[derive(Parser, Debug)]
@@ -265,11 +267,11 @@ impl SourceRegistry {
         }
     }
 
-    fn active_labels(&self) -> Vec<String> {
+    fn active_source_pairs(&self) -> Vec<(String, String)> {
         self.runtimes
             .iter()
             .filter(|r| r.running)
-            .map(|r| r.label.clone())
+            .map(|r| (r.id.clone(), r.label.clone()))
             .collect()
     }
 
@@ -347,6 +349,12 @@ pub(crate) struct SharedState {
     history_store: Option<history::HistoryStore>,
     /// 翻译历史有界旁路写（失败/满队列只 warn，不影响实时链路）
     history: history::OptionalHistoryWriter,
+    /// 全局快捷键注册状态（供设置页 / 浮窗帮助展示）
+    hotkey_status: std::sync::Mutex<Vec<hotkeys::HotkeyStatusItem>>,
+    /// 串行化 unregister/register，避免保存与录制暂停交错
+    hotkey_lock: std::sync::Mutex<()>,
+    /// 设置页录制期间为 true：不响应旧快捷键
+    hotkeys_paused: AtomicBool,
 }
 
 /// 字幕历史保留上限：桌面浮窗与 SteamVR 的 max_lines 独立，取较大者
@@ -359,15 +367,12 @@ fn history_limit(config: &AppConfig) -> usize {
         .max(1)
 }
 
+#[cfg(test)]
 fn desktop_entries(
-    mut entries: Vec<subtitle::DisplayLine>,
+    entries: Vec<subtitle::DisplayLine>,
     config: &AppConfig,
 ) -> Vec<subtitle::DisplayLine> {
-    let limit = config.subtitle.max_lines.max(1);
-    if entries.len() > limit {
-        entries.drain(..entries.len() - limit);
-    }
-    entries
+    subtitle::trim_last(entries, config.subtitle.max_lines)
 }
 
 fn global_language(config: &AppConfig) -> String {
@@ -437,6 +442,9 @@ impl SharedState {
             degraded_warning: std::sync::Mutex::new(degraded_warning),
             history_store,
             history,
+            hotkey_status: std::sync::Mutex::new(Vec::new()),
+            hotkey_lock: std::sync::Mutex::new(()),
+            hotkeys_paused: AtomicBool::new(false),
         }
     }
 
@@ -635,6 +643,82 @@ pub(crate) fn stop_capture_bg(app: &AppHandle) {
     });
 }
 
+pub(crate) fn toggle_capture_bg(app: &AppHandle) {
+    let app_handle = app.clone();
+    let state = app.state::<Arc<SharedState>>().inner().clone();
+    tauri::async_runtime::spawn(async move {
+        let running = state.pipeline.lock().await.is_running();
+        let result = if running {
+            stop_capture_impl(app_handle.clone(), state).await
+        } else {
+            start_capture_impl(app_handle.clone(), state).await
+        };
+        if let Err(e) = result {
+            tracing::error!("Failed to toggle capture: {e}");
+            let _ = app_handle.emit_all(ERROR_EVENT, e);
+        }
+    });
+}
+
+pub(crate) fn toggle_translate_bg(app: &AppHandle) {
+    let app_handle = app.clone();
+    let state = app.state::<Arc<SharedState>>().inner().clone();
+    tauri::async_runtime::spawn(async move {
+        if let Err(e) = state
+            .update_and_persist_config(&app_handle, |config| {
+                let enabled = !config.translate.enabled;
+                config.translate.enabled = enabled;
+                Ok(vec![("translate.enabled", enabled.into())])
+            })
+            .await
+        {
+            tracing::warn!("切换翻译失败: {e}");
+            let _ = app_handle.emit_all(ERROR_EVENT, format!("切换翻译失败: {e}"));
+            return;
+        }
+        let config = state.config();
+        let enabled = config.translate.enabled;
+        let _ = state.translate_tx.send(enabled);
+        {
+            let mut registry = state.sources.lock().await;
+            registry.set_translate_all(enabled);
+        }
+        emit_config(&app_handle, &config);
+        emit_source_status(&app_handle, &state).await;
+    });
+}
+
+pub(crate) fn toggle_steamvr_lock_bg(app: &AppHandle) {
+    let app_handle = app.clone();
+    let state = app.state::<Arc<SharedState>>().inner().clone();
+    tauri::async_runtime::spawn(async move {
+        match state
+            .update_and_persist_config(&app_handle, |config| {
+                let locked = !config.output.steamvr.gesture.locked;
+                config.output.steamvr.gesture.locked = locked;
+                Ok(vec![("output.steamvr.gesture.locked", locked.into())])
+            })
+            .await
+        {
+            Ok(config) => {
+                state.outputs.apply_config(&config.output).await;
+                emit_config(&app_handle, &config);
+                emit_output_status(&app_handle, &state);
+                let msg = if config.output.steamvr.gesture.locked {
+                    "SteamVR 字幕位置已锁定"
+                } else {
+                    "SteamVR 字幕位置已解锁"
+                };
+                let _ = app_handle.emit_all(NOTICE_EVENT, msg.to_string());
+            }
+            Err(e) => {
+                tracing::warn!("切换 VR 位置锁定失败: {e}");
+                let _ = app_handle.emit_all(ERROR_EVENT, format!("切换 VR 位置锁定失败: {e}"));
+            }
+        }
+    });
+}
+
 async fn shutdown_once(app: &AppHandle) {
     let state = app.state::<Arc<SharedState>>().inner().clone();
     state.shutting_down.store(true, Ordering::SeqCst);
@@ -780,10 +864,9 @@ async fn emit_subtitle_with_config(app: &AppHandle, state: &SharedState, config:
     let active = registry.active_sources_payload();
     drop(registry);
     let subtitle_state = state.subtitle_state.lock().await;
-    // 历史长度取各输出的最大值，但浮窗只能按 subtitle.max_lines 显示，
-    // 否则切一下「显示来源」就会把 SteamVR/OSC 的多余行泄到浮窗上。
-    let entries = desktop_entries(subtitle_state.display_lines(), config);
-    let _ = app.emit_all(SUBTITLE_EVENT, SubtitlePayload::new(&entries, active));
+    // 浮窗只发 Desktop 通道视图（按源路由过滤，并按 subtitle.max_lines 裁剪）
+    let views = subtitle_views_from(&subtitle_state, config);
+    let _ = app.emit_all(SUBTITLE_EVENT, SubtitlePayload::new(&views.desktop, active));
 }
 
 async fn emit_subtitle(app: &AppHandle, state: &SharedState) {
@@ -793,8 +876,60 @@ async fn emit_subtitle(app: &AppHandle, state: &SharedState) {
 
 /// 将重新格式化后的当前字幕快照同步给外部输出（SteamVR / OSC）
 async fn publish_subtitle_snapshot(state: &SharedState) {
-    let lines = state.subtitle_state.lock().await.display_lines();
-    state.outputs.publish(&lines);
+    let config = state.config();
+    let subtitle_state = state.subtitle_state.lock().await;
+    let views = subtitle_views_from(&subtitle_state, &config);
+    drop(subtitle_state);
+    state.outputs.publish(&views.steamvr, &views.osc);
+}
+
+fn store_and_emit_hotkey_status(
+    app: &AppHandle,
+    state: &SharedState,
+    items: Vec<hotkeys::HotkeyStatusItem>,
+    paused: bool,
+) {
+    let failures: Vec<String> = items
+        .iter()
+        .filter(|item| !item.accelerator.is_empty() && !item.registered)
+        .map(|item| {
+            format!(
+                "{} ({}){}",
+                item.label,
+                item.accelerator,
+                item.error
+                    .as_ref()
+                    .map(|e| format!(": {e}"))
+                    .unwrap_or_default()
+            )
+        })
+        .collect();
+    {
+        let mut guard = state
+            .hotkey_status
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        *guard = items.clone();
+    }
+    let payload = HotkeyStatusPayload { items, paused };
+    let _ = app.emit_all(HOTKEY_STATUS_EVENT, payload);
+    if !failures.is_empty() && !paused {
+        let msg = format!("部分快捷键未生效：{}", failures.join("；"));
+        let _ = app.emit_all(NOTICE_EVENT, msg);
+    }
+}
+
+fn reapply_hotkeys(app: &AppHandle, state: &SharedState) {
+    if state.hotkeys_paused.load(Ordering::SeqCst) {
+        // 录制暂停期间只刷新“未注册”快照，不重新挂上全局快捷键
+        let items = hotkeys::pending_status(&state.config().hotkeys);
+        store_and_emit_hotkey_status(app, state, items, true);
+        return;
+    }
+    let _guard = state.hotkey_lock.lock().unwrap_or_else(|e| e.into_inner());
+    let items = tray::apply_hotkeys(app, &state.config().hotkeys);
+    drop(_guard);
+    store_and_emit_hotkey_status(app, state, items, false);
 }
 
 /// 应用热更新字段（样式 / 输出 / 翻译开关 / 语言 / 窗口属性）
@@ -814,11 +949,7 @@ async fn apply_hot_config(app: &AppHandle, state: &SharedState, old: &AppConfig,
         .show_source
         .store(new.subtitle.show_source, Ordering::SeqCst);
 
-    // 输出
-    state.outputs.apply_config(&new.output).await;
-    publish_subtitle_snapshot(state).await;
-
-    // 翻译开关 / 语言
+    // 翻译开关 / 语言 / 源注册表（含路由热更新后的 active_sources）
     let _ = state.translate_tx.send(new.translate.enabled);
     {
         let mut registry = state.sources.lock().await;
@@ -826,6 +957,13 @@ async fn apply_hot_config(app: &AppHandle, state: &SharedState, old: &AppConfig,
         if !new.translate.enabled {
             registry.set_translate_all(false);
         }
+        let sources = registry.active_source_pairs();
+        drop(registry);
+        state
+            .subtitle_state
+            .lock()
+            .await
+            .set_active_sources(sources);
     }
     if old.asr.backend != new.asr.backend
         || old.asr.language != new.asr.language
@@ -836,6 +974,10 @@ async fn apply_hot_config(app: &AppHandle, state: &SharedState, old: &AppConfig,
         let mut registry = state.sources.lock().await;
         registry.set_language(new, &language);
     }
+
+    // 输出：按新路由重发三视图（须在 sync_config / active_sources 之后）
+    state.outputs.apply_config(&new.output).await;
+    publish_subtitle_snapshot(state).await;
 
     // 窗口属性
     if let Some(window) = app.get_window("main") {
@@ -860,6 +1002,7 @@ async fn apply_hot_config(app: &AppHandle, state: &SharedState, old: &AppConfig,
     emit_subtitle(app, state).await;
     emit_source_status(app, state).await;
     emit_output_status(app, state);
+    reapply_hotkeys(app, state);
 }
 
 // ---------------- 配置档辅助 ----------------
@@ -972,9 +1115,9 @@ async fn start_capture_locked(app: AppHandle, state: Arc<SharedState>) -> Result
             runtime.message = "启动中".to_string();
             contexts.push(runtime.context());
         }
-        let labels = registry.active_labels();
+        let sources = registry.active_source_pairs();
         let mut subtitle_state = state.subtitle_state.lock().await;
-        subtitle_state.set_active_labels(labels);
+        subtitle_state.set_active_sources(sources);
     }
 
     if contexts.is_empty() {
@@ -1064,22 +1207,26 @@ async fn start_capture_locked(app: AppHandle, state: Arc<SharedState>) -> Result
             match event {
                 app::PipelineEvent::Subtitle(line) => {
                     // 锁顺序统一为 sources -> subtitle，避免与 SourceState 分支互相等待
-                    let (labels, active) = {
+                    let (sources, active) = {
                         let registry = state_for_forwarder.sources.lock().await;
-                        (registry.active_labels(), registry.active_sources_payload())
+                        (
+                            registry.active_source_pairs(),
+                            registry.active_sources_payload(),
+                        )
                     };
                     // 旁路持久化：非阻塞 try_send，失败只 warn，不参与实时裁剪语义
                     state_for_forwarder.history.offer(&line);
-                    let display = {
-                        let mut subtitle_state = state_for_forwarder.subtitle_state.lock().await;
-                        subtitle_state.set_active_labels(labels);
-                        subtitle_state.push(line);
-                        subtitle_state.display_lines()
-                    };
                     let config = state_for_forwarder.config();
-                    let desktop = desktop_entries(display.clone(), &config);
-                    let payload = SubtitlePayload::new(&desktop, active);
-                    state_for_forwarder.outputs.publish(&display);
+                    let views = {
+                        let mut subtitle_state = state_for_forwarder.subtitle_state.lock().await;
+                        subtitle_state.set_active_sources(sources);
+                        subtitle_state.push(line);
+                        subtitle_views_from(&subtitle_state, &config)
+                    };
+                    let payload = SubtitlePayload::new(&views.desktop, active);
+                    state_for_forwarder
+                        .outputs
+                        .publish(&views.steamvr, &views.osc);
                     let _ = app_for_forwarder.emit_all(SUBTITLE_EVENT, payload);
                 }
                 app::PipelineEvent::Notice { source_id, message } => {
@@ -1105,7 +1252,7 @@ async fn start_capture_locked(app: AppHandle, state: Arc<SharedState>) -> Result
                     let (running_count, label) = {
                         let mut registry = state_for_forwarder.sources.lock().await;
                         registry.set_running(&source_id, running, audio, message.clone());
-                        let labels = registry.active_labels();
+                        let sources = registry.active_source_pairs();
                         let count = registry.running_count();
                         let label = registry
                             .runtimes
@@ -1113,7 +1260,7 @@ async fn start_capture_locked(app: AppHandle, state: Arc<SharedState>) -> Result
                             .find(|r| r.id == source_id)
                             .map(|r| r.label.clone());
                         let mut subtitle_state = state_for_forwarder.subtitle_state.lock().await;
-                        subtitle_state.set_active_labels(labels);
+                        subtitle_state.set_active_sources(sources);
                         (count, label)
                     };
                     // 采集任务异常退出（设备断开 / 打开失败）时不能只留在 tooltip 里，
@@ -1235,6 +1382,58 @@ async fn get_overlay_config(
 ) -> Result<OverlayConfigPayload, String> {
     let config = state.config();
     Ok(OverlayConfigPayload::from_config(&config))
+}
+
+#[tauri::command]
+async fn get_hotkeys(state: State<'_, Arc<SharedState>>) -> Result<HotkeyStatusPayload, String> {
+    // 读运行态，不重新读磁盘（降级态/预览态下磁盘可能不同）
+    let items = state
+        .hotkey_status
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    let items = if items.is_empty() {
+        hotkeys::pending_status(&state.config().hotkeys)
+    } else {
+        items
+    };
+    Ok(HotkeyStatusPayload {
+        items,
+        paused: state.hotkeys_paused.load(Ordering::SeqCst),
+    })
+}
+
+#[tauri::command]
+async fn pause_global_hotkeys(
+    app: AppHandle,
+    state: State<'_, Arc<SharedState>>,
+) -> Result<HotkeyStatusPayload, String> {
+    let _guard = state.hotkey_lock.lock().unwrap_or_else(|e| e.into_inner());
+    tray::pause_global_hotkeys(&app);
+    state.hotkeys_paused.store(true, Ordering::SeqCst);
+    let items = hotkeys::pending_status(&state.config().hotkeys);
+    drop(_guard);
+    store_and_emit_hotkey_status(&app, state.inner(), items.clone(), true);
+    Ok(HotkeyStatusPayload {
+        items,
+        paused: true,
+    })
+}
+
+#[tauri::command]
+async fn resume_global_hotkeys(
+    app: AppHandle,
+    state: State<'_, Arc<SharedState>>,
+) -> Result<HotkeyStatusPayload, String> {
+    state.hotkeys_paused.store(false, Ordering::SeqCst);
+    let _guard = state.hotkey_lock.lock().unwrap_or_else(|e| e.into_inner());
+    let items = tray::apply_hotkeys(&app, &state.config().hotkeys);
+    drop(_guard);
+    store_and_emit_hotkey_status(&app, state.inner(), items.clone(), false);
+    Ok(HotkeyStatusPayload {
+        items,
+        paused: false,
+    })
 }
 
 #[tauri::command]
@@ -1774,6 +1973,36 @@ struct SettingChange {
     value: serde_json::Value,
 }
 
+/// 输入源是否需要重启采集。
+/// 冷字段：id 集合、device（canonical）、enabled、label。
+/// 热字段：desktop/osc/steamvr/translate/language；顺序调整也不重启。
+fn sources_need_restart(old: &AppConfig, new: &AppConfig) -> bool {
+    let old_sources = old.audio.effective_sources(old.translate.enabled);
+    let new_sources = new.audio.effective_sources(new.translate.enabled);
+    let old_ids: std::collections::HashSet<&str> =
+        old_sources.iter().map(|s| s.id.as_str()).collect();
+    let new_ids: std::collections::HashSet<&str> =
+        new_sources.iter().map(|s| s.id.as_str()).collect();
+    if old_ids != new_ids {
+        return true;
+    }
+    let old_by_id: std::collections::HashMap<&str, &config::AudioSourceConfig> =
+        old_sources.iter().map(|s| (s.id.as_str(), s)).collect();
+    for src in &new_sources {
+        let Some(prev) = old_by_id.get(src.id.as_str()) else {
+            return true;
+        };
+        if prev.label != src.label
+            || prev.enabled != src.enabled
+            || config::canonical_device_spec(&prev.device)
+                != config::canonical_device_spec(&src.device)
+        {
+            return true;
+        }
+    }
+    false
+}
+
 fn apply_settings_changes(
     config: &mut AppConfig,
     changes: &[SettingChange],
@@ -1802,7 +2031,7 @@ fn apply_settings_changes(
         if change.path == "audio.sources" {
             config.audio.sources = serde_json::from_value(change.value.clone())
                 .map_err(|e| format!("解析输入源失败: {e}"))?;
-            restart = true;
+            // 是否重启由 sources_need_restart 按字段差量判定（路由/翻译/语言热更新）
             continue;
         }
         restart |= schema::apply_change(config, &change.path, &change.value)?;
@@ -1841,12 +2070,13 @@ async fn save_settings(
     let was_degraded = state.is_config_degraded();
     let old = state.config();
     let (mut new, _) = state.settings_base_config();
-    // 若此前因配置降级运行在内存默认值上，恢复真实磁盘配置后冷字段与运行态必然可能不同，需重启采集
-    let restart = apply_settings_changes(&mut new, &changes)? || was_degraded;
+    // schema 冷字段 + 源身份/设备/启用/标签差量；路由等热字段不重启
+    let schema_restart = apply_settings_changes(&mut new, &changes)?;
     new.validate()?;
 
     // 以落盘后重新解析的结果为准（writer 可能做过归一化）
     let saved = write_config_changes(&state, &changes).await?;
+    let restart = schema_restart || sources_need_restart(&old, &saved) || was_degraded;
     state.set_config(saved.clone());
     apply_hot_config(&app, &state, &old, &saved).await;
 
@@ -2836,12 +3066,9 @@ fn run(args: Args) -> anyhow::Result<()> {
             if let Err(e) = window.emit(CONFIG_EVENT, payload) {
                 tracing::warn!("Failed to emit config event: {e}");
             }
-            if let Err(e) = tray::register_global_shortcuts(&app.handle()) {
-                tracing::warn!("Failed to register global shortcuts (可能被其他程序占用): {e}");
-            }
-
             let handle = app.handle();
             let state = handle.state::<Arc<SharedState>>();
+            reapply_hotkeys(&handle, state.inner());
             if let Some(window) = app.get_window("main") {
                 if let Ok(registry) = state.sources.try_lock() {
                     let _ = window.emit(
@@ -2880,6 +3107,9 @@ fn run(args: Args) -> anyhow::Result<()> {
             list_languages,
             set_language,
             get_status,
+            get_hotkeys,
+            pause_global_hotkeys,
+            resume_global_hotkeys,
             list_devices_command,
             set_device,
             list_sources,
@@ -2971,12 +3201,59 @@ mod tests {
                 }]),
             },
         ];
-        let restart = apply_settings_changes(&mut config, &changes).unwrap();
-        assert!(restart, "输入源变更需要重启采集");
+        let old = config.clone();
+        let schema_restart = apply_settings_changes(&mut config, &changes).unwrap();
+        assert!(
+            !schema_restart,
+            "font_size/translate/sources 路径本身不应由 schema 强制重启"
+        );
+        assert!(
+            sources_need_restart(&old, &config),
+            "新增/替换输入源身份应触发重启"
+        );
         assert_eq!(config.subtitle.font_size, 40);
         assert!(!config.translate.enabled);
         assert_eq!(config.audio.sources.len(), 1);
         assert_eq!(config.audio.sources[0].device, "mic:0");
+    }
+
+    #[test]
+    fn sources_routing_only_change_does_not_need_restart() {
+        let mut old = AppConfig::default();
+        old.audio.sources = vec![AudioSourceConfig::new("mic", "麦克风", "mic:0")];
+        let mut new = old.clone();
+        new.audio.sources[0].osc = false;
+        new.audio.sources[0].desktop = false;
+        new.audio.sources[0].steamvr = false;
+        new.audio.sources[0].translate = false;
+        new.audio.sources[0].language = "ja".into();
+        assert!(!sources_need_restart(&old, &new));
+
+        // 仅顺序调整不重启
+        new.audio
+            .sources
+            .push(AudioSourceConfig::new("game", "游戏", "loopback:0"));
+        old.audio.sources = new.audio.sources.clone();
+        new.audio.sources.reverse();
+        assert!(!sources_need_restart(&old, &new));
+
+        // 按 id 找回 mic 做冷字段变更
+        let mic_index = new
+            .audio
+            .sources
+            .iter()
+            .position(|s| s.id == "mic")
+            .unwrap();
+        new.audio.sources[mic_index].label = "改名".into();
+        assert!(sources_need_restart(&old, &new));
+        new.audio.sources[mic_index].label = "麦克风".into();
+        new.audio.sources[mic_index].enabled = false;
+        assert!(sources_need_restart(&old, &new));
+        new.audio.sources[mic_index].enabled = true;
+        new.audio.sources[mic_index].device = "mic".into(); // canonical 等价 mic:0
+        assert!(!sources_need_restart(&old, &new));
+        new.audio.sources[mic_index].device = "mic:1".into();
+        assert!(sources_need_restart(&old, &new));
     }
 
     #[test]

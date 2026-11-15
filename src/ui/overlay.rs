@@ -17,6 +17,8 @@ pub const SETTINGS_SHOWN_EVENT: &str = "settings://shown";
 pub const SETTINGS_HIDDEN_EVENT: &str = "settings://hidden";
 /// 历史窗口被显示（前端重新拉取时间线）
 pub const HISTORY_SHOWN_EVENT: &str = "history://shown";
+/// 全局快捷键注册状态更新
+pub const HOTKEY_STATUS_EVENT: &str = "hotkey-status://update";
 
 #[derive(Debug, Clone, Serialize)]
 pub struct SubtitleEntryPayload {
@@ -76,6 +78,13 @@ impl SubtitlePayload {
 pub struct StatusPayload {
     pub running: bool,
     pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct HotkeyStatusPayload {
+    pub items: Vec<crate::hotkeys::HotkeyStatusItem>,
+    /// 录制期间为 true：全部全局快捷键已 unregister
+    pub paused: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]

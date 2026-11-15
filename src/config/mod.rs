@@ -49,10 +49,27 @@ pub struct AudioSourceConfig {
     /// 可选：覆盖全局识别语言；空 = 跟随全局
     #[serde(default)]
     pub language: String,
+    /// 是否输出到桌面浮窗（默认 true；旧配置缺省等价 true）
+    #[serde(default = "default_true")]
+    pub desktop: bool,
+    /// 是否输出到 OSC / VRChat Chatbox
+    #[serde(default = "default_true")]
+    pub osc: bool,
+    /// 是否输出到 SteamVR Overlay
+    #[serde(default = "default_true")]
+    pub steamvr: bool,
+}
+
+/// 字幕输出通道（桌面浮窗 / OSC / SteamVR）
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum OutputChannel {
+    Desktop,
+    Osc,
+    SteamVr,
 }
 
 impl AudioSourceConfig {
-    #[allow(dead_code)]
+    #[allow(dead_code)] // 测试与后续 UI/合成路径构造用
     pub fn new(id: impl Into<String>, label: impl Into<String>, device: impl Into<String>) -> Self {
         Self {
             id: id.into(),
@@ -61,6 +78,18 @@ impl AudioSourceConfig {
             enabled: true,
             translate: true,
             language: String::new(),
+            desktop: true,
+            osc: true,
+            steamvr: true,
+        }
+    }
+
+    /// 该源是否路由到指定输出通道
+    pub fn routes_to(&self, channel: OutputChannel) -> bool {
+        match channel {
+            OutputChannel::Desktop => self.desktop,
+            OutputChannel::Osc => self.osc,
+            OutputChannel::SteamVr => self.steamvr,
         }
     }
 }
@@ -118,6 +147,9 @@ impl AudioConfig {
                 enabled: true,
                 translate: translate_enabled,
                 language: String::new(),
+                desktop: true,
+                osc: true,
+                steamvr: true,
             }]
         } else {
             self.sources.clone()
@@ -293,6 +325,58 @@ impl Default for VadConfig {
     }
 }
 
+/// SteamVR 手势移动配置（本批仅数据模型；行为在后续里程碑实现）
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GestureConfig {
+    /// 启用手势移动。默认关闭，避免启动即轮询手柄
+    #[serde(default)]
+    pub enabled: bool,
+    /// 默认锁定，避免误触发；状态会写回本字段
+    #[serde(default = "default_true")]
+    pub locked: bool,
+    /// VR 内手势解锁（可选，默认关闭）
+    #[serde(default)]
+    pub unlock_via_vr_gesture: bool,
+    /// 拖拽激活组合：both_grips | right_grip | right_trigger
+    #[serde(default = "default_gesture_grab")]
+    pub grab: String,
+    /// 抓取方式：ray | near
+    #[serde(default = "default_gesture_mode")]
+    pub mode: String,
+    /// 位移灵敏度
+    #[serde(default = "default_gesture_sensitivity")]
+    pub sensitivity: f32,
+    /// 显示射线命中光标
+    #[serde(default = "default_true")]
+    pub pointer: bool,
+    /// 抓取/松手/锁定切换时震动
+    #[serde(default = "default_true")]
+    pub haptics: bool,
+    /// near 模式的抓取半径（米）
+    #[serde(default = "default_near_radius_m")]
+    pub near_radius_m: f32,
+    /// 移动模式下是否尝试屏蔽游戏输入（3A；默认关闭）
+    #[serde(default)]
+    pub block_game_input: bool,
+}
+
+impl Default for GestureConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            locked: true,
+            unlock_via_vr_gesture: false,
+            grab: default_gesture_grab(),
+            mode: default_gesture_mode(),
+            sensitivity: default_gesture_sensitivity(),
+            pointer: true,
+            haptics: true,
+            near_radius_m: default_near_radius_m(),
+            block_game_input: false,
+        }
+    }
+}
+
 /// SteamVR Overlay 输出配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SteamVrConfig {
@@ -307,6 +391,9 @@ pub struct SteamVrConfig {
     pub distance_m: f32,
     #[serde(default = "default_height_offset_m")]
     pub height_offset_m: f32,
+    /// hmd 模式水平偏移（米）；正数向右。旧配置缺省 0.0
+    #[serde(default)]
+    pub horizontal_offset_m: f32,
     #[serde(default = "default_world_position")]
     pub world_position: [f32; 3],
     #[serde(default)]
@@ -339,6 +426,9 @@ pub struct SteamVrConfig {
     pub swap_red_blue: bool,
     #[serde(default = "default_reconnect_interval_secs")]
     pub reconnect_interval_secs: u64,
+    /// 手势移动（本批仅字段；行为后续实现）
+    #[serde(default)]
+    pub gesture: GestureConfig,
 }
 
 /// OSC（VRChat Chatbox）输出配置
@@ -380,6 +470,7 @@ impl Default for SteamVrConfig {
             width_m: default_width_m(),
             distance_m: default_distance_m(),
             height_offset_m: default_height_offset_m(),
+            horizontal_offset_m: 0.0,
             world_position: default_world_position(),
             world_rotation_deg: [0.0, 0.0, 0.0],
             curvature: 0.0,
@@ -396,6 +487,7 @@ impl Default for SteamVrConfig {
             hide_on_silence_secs: 0,
             swap_red_blue: false,
             reconnect_interval_secs: default_reconnect_interval_secs(),
+            gesture: GestureConfig::default(),
         }
     }
 }
@@ -429,6 +521,36 @@ pub struct OutputConfig {
 
 fn default_true() -> bool {
     true
+}
+fn default_gesture_grab() -> String {
+    "both_grips".to_string()
+}
+fn default_gesture_mode() -> String {
+    "ray".to_string()
+}
+fn default_gesture_sensitivity() -> f32 {
+    1.0
+}
+fn default_near_radius_m() -> f32 {
+    0.35
+}
+fn default_hotkey_show() -> String {
+    "CmdOrCtrl+Alt+S".to_string()
+}
+fn default_hotkey_start() -> String {
+    "CmdOrCtrl+Alt+R".to_string()
+}
+fn default_hotkey_stop() -> String {
+    "CmdOrCtrl+Alt+E".to_string()
+}
+fn default_hotkey_click_through() -> String {
+    "CmdOrCtrl+Alt+T".to_string()
+}
+fn default_hotkey_settings() -> String {
+    "CmdOrCtrl+Alt+Comma".to_string()
+}
+fn default_hotkey_quit() -> String {
+    "CmdOrCtrl+Alt+Q".to_string()
 }
 fn default_device_name() -> String {
     "default".to_string()
@@ -554,6 +676,74 @@ fn default_osc_max_per_window() -> usize {
     4
 }
 
+/// 全局快捷键配置。空字符串表示禁用该快捷键。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HotkeyConfig {
+    #[serde(default = "default_hotkey_show")]
+    pub show: String,
+    #[serde(default = "default_hotkey_start")]
+    pub start: String,
+    #[serde(default = "default_hotkey_stop")]
+    pub stop: String,
+    #[serde(default)]
+    pub toggle_capture: String,
+    #[serde(default = "default_hotkey_click_through")]
+    pub toggle_click_through: String,
+    #[serde(default = "default_hotkey_settings")]
+    pub open_settings: String,
+    #[serde(default)]
+    pub open_history: String,
+    #[serde(default)]
+    pub toggle_translate: String,
+    #[serde(default)]
+    pub toggle_steamvr_lock: String,
+    #[serde(default = "default_hotkey_quit")]
+    pub quit: String,
+}
+
+impl Default for HotkeyConfig {
+    fn default() -> Self {
+        Self {
+            show: default_hotkey_show(),
+            start: default_hotkey_start(),
+            stop: default_hotkey_stop(),
+            toggle_capture: String::new(),
+            toggle_click_through: default_hotkey_click_through(),
+            open_settings: default_hotkey_settings(),
+            open_history: String::new(),
+            toggle_translate: String::new(),
+            toggle_steamvr_lock: String::new(),
+            quit: default_hotkey_quit(),
+        }
+    }
+}
+
+impl HotkeyConfig {
+    /// `(action, label, accelerator)` 列表，顺序与设置页一致
+    pub fn entries(&self) -> [(&'static str, &'static str, &str); 10] {
+        [
+            ("show", "显示浮窗", &self.show),
+            ("start", "开始采集", &self.start),
+            ("stop", "停止采集", &self.stop),
+            ("toggle_capture", "切换采集", &self.toggle_capture),
+            (
+                "toggle_click_through",
+                "切换点击穿透",
+                &self.toggle_click_through,
+            ),
+            ("open_settings", "打开设置", &self.open_settings),
+            ("open_history", "打开历史", &self.open_history),
+            ("toggle_translate", "切换翻译", &self.toggle_translate),
+            (
+                "toggle_steamvr_lock",
+                "切换 VR 位置锁定",
+                &self.toggle_steamvr_lock,
+            ),
+            ("quit", "退出", &self.quit),
+        ]
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
     pub audio: AudioConfig,
@@ -566,6 +756,9 @@ pub struct AppConfig {
     /// 额外输出通道（旧配置文件没有该段时全部关闭）
     #[serde(default)]
     pub output: OutputConfig,
+    /// 全局快捷键（旧配置没有该段时使用默认值）
+    #[serde(default)]
+    pub hotkeys: HotkeyConfig,
 }
 
 /// 配置解析结果（附带可恢复的告警信息，供 GUI 在启动后提示用户）
@@ -1208,6 +1401,40 @@ impl AppConfig {
             -2.0,
             2.0,
         );
+        check_range(
+            &mut errors,
+            "output.steamvr.horizontal_offset_m",
+            vr.horizontal_offset_m,
+            -2.0,
+            2.0,
+        );
+        let gesture = &vr.gesture;
+        if !matches!(
+            gesture.grab.as_str(),
+            "both_grips" | "right_grip" | "right_trigger"
+        ) {
+            errors.push(
+                "output.steamvr.gesture.grab 只能是 both_grips / right_grip / right_trigger"
+                    .to_string(),
+            );
+        }
+        if !matches!(gesture.mode.as_str(), "ray" | "near") {
+            errors.push("output.steamvr.gesture.mode 只能是 ray 或 near".to_string());
+        }
+        check_range(
+            &mut errors,
+            "output.steamvr.gesture.sensitivity",
+            gesture.sensitivity,
+            0.2,
+            3.0,
+        );
+        check_range(
+            &mut errors,
+            "output.steamvr.gesture.near_radius_m",
+            gesture.near_radius_m,
+            0.05,
+            2.0,
+        );
         if !(1..=8).contains(&vr.max_lines) {
             errors.push("output.steamvr.max_lines 必须在 1–8 之间".to_string());
         }
@@ -1290,6 +1517,8 @@ impl AppConfig {
             errors.push("output.osc.custom_address 留空或填合法的 host:port".to_string());
         }
 
+        validate_hotkeys(&self.hotkeys, &mut errors);
+
         if errors.is_empty() {
             Ok(())
         } else {
@@ -1355,6 +1584,7 @@ impl Default for AppConfig {
             },
             vad: VadConfig::default(),
             output: OutputConfig::default(),
+            hotkeys: HotkeyConfig::default(),
         }
     }
 }
@@ -1388,6 +1618,134 @@ fn write_private_if_absent(path: &Path, content: &str) -> std::io::Result<bool> 
 /// 设置页的错误条和 IPC 返回值）。这里只保留错误消息本身。
 pub fn toml_error_text(e: &toml::de::Error) -> String {
     e.message().to_string()
+}
+
+fn validate_hotkeys(hotkeys: &HotkeyConfig, errors: &mut Vec<String>) {
+    let mut seen: Vec<(String, String)> = Vec::new(); // (normalized, action)
+    for (action, _label, accelerator) in hotkeys.entries() {
+        let trimmed = accelerator.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if let Err(msg) = validate_accelerator_format(trimmed) {
+            errors.push(format!("hotkeys.{action}: {msg}"));
+            continue;
+        }
+        let normalized = normalize_accelerator(trimmed);
+        if let Some((_, other)) = seen.iter().find(|(n, _)| n == &normalized) {
+            errors.push(format!(
+                "hotkeys.{action} 与 hotkeys.{other} 冲突（归一化后均为 {normalized}）"
+            ));
+        } else {
+            seen.push((normalized, action.to_string()));
+        }
+    }
+}
+
+/// 保守格式检查：必须含修饰键（或功能键 F1–F24），不能只有修饰键。
+fn validate_accelerator_format(acc: &str) -> Result<(), String> {
+    let parts: Vec<&str> = acc
+        .split('+')
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .collect();
+    if parts.is_empty() {
+        return Err("快捷键不能为空".to_string());
+    }
+    let modifiers = [
+        "ctrl",
+        "control",
+        "cmd",
+        "command",
+        "cmdorctrl",
+        "commandorcontrol",
+        "alt",
+        "option",
+        "shift",
+        "super",
+        "meta",
+    ];
+    let is_mod = |p: &str| modifiers.iter().any(|m| p.eq_ignore_ascii_case(m));
+    let is_fn_key = |p: &str| {
+        let lower = p.to_ascii_lowercase();
+        lower
+            .strip_prefix('f')
+            .and_then(|n| n.parse::<u8>().ok())
+            .map(|n| (1..=24).contains(&n))
+            .unwrap_or(false)
+    };
+    let key_parts: Vec<&str> = parts.iter().copied().filter(|p| !is_mod(p)).collect();
+    if key_parts.is_empty() {
+        return Err("不能只有修饰键".to_string());
+    }
+    if key_parts.len() != 1 {
+        return Err("只能有一个主键".to_string());
+    }
+    let key = key_parts[0];
+    let has_modifier = parts.iter().any(|p| is_mod(p));
+    if !has_modifier && !is_fn_key(key) {
+        return Err("必须包含至少一个修饰键，或使用功能键 F1–F24".to_string());
+    }
+    Ok(())
+}
+
+/// 归一化 accelerator，便于判重；当前平台把 CmdOrCtrl 视为 Ctrl（非 mac）或 Cmd（mac）。
+fn normalize_accelerator(acc: &str) -> String {
+    let platform_ctrl = if cfg!(target_os = "macos") {
+        "cmd"
+    } else {
+        "ctrl"
+    };
+    let mut mods: Vec<&str> = Vec::new();
+    let mut key = String::new();
+    for part in acc.split('+').map(str::trim).filter(|p| !p.is_empty()) {
+        let lower = part.to_ascii_lowercase();
+        match lower.as_str() {
+            "ctrl" | "control" => {
+                if !mods.contains(&"ctrl") {
+                    mods.push("ctrl");
+                }
+            }
+            "cmd" | "command" => {
+                if !mods.contains(&"cmd") {
+                    mods.push("cmd");
+                }
+            }
+            "cmdorctrl" | "commandorcontrol" => {
+                if !mods.contains(&platform_ctrl) {
+                    mods.push(platform_ctrl);
+                }
+            }
+            "alt" | "option" => {
+                if !mods.contains(&"alt") {
+                    mods.push("alt");
+                }
+            }
+            "shift" => {
+                if !mods.contains(&"shift") {
+                    mods.push("shift");
+                }
+            }
+            "super" | "meta" => {
+                if !mods.contains(&"super") {
+                    mods.push("super");
+                }
+            }
+            _ => {
+                key = lower;
+            }
+        }
+    }
+    let order = ["ctrl", "cmd", "alt", "shift", "super"];
+    mods.sort_by_key(|m| order.iter().position(|o| o == m).unwrap_or(99));
+    let mut out = mods.join("+");
+    if !key.is_empty() {
+        if !out.is_empty() {
+            out.push('+');
+        }
+        out.push_str(&key);
+    }
+    out
 }
 
 fn check_range(errors: &mut Vec<String>, name: &str, value: f32, min: f32, max: f32) {
@@ -1510,6 +1868,7 @@ mod tests {
             toml::Value::String("mic:1".to_string()),
         );
         value.as_table_mut().unwrap().remove("output");
+        value.as_table_mut().unwrap().remove("hotkeys");
         let subtitle = value.get_mut("subtitle").unwrap().as_table_mut().unwrap();
         subtitle.remove("label_sources");
 
@@ -1519,9 +1878,17 @@ mod tests {
         assert_eq!(sources[0].id, "default");
         assert_eq!(sources[0].device, "mic:1");
         assert!(sources[0].translate);
+        // 旧配置缺路由字段：三通道默认 true，行为等价 v0.2
+        assert!(sources[0].desktop);
+        assert!(sources[0].osc);
+        assert!(sources[0].steamvr);
         assert!(!cfg.output.osc.enabled);
         assert!(!cfg.output.steamvr.enabled);
+        assert_eq!(cfg.output.steamvr.horizontal_offset_m, 0.0);
+        assert_eq!(cfg.output.steamvr.gesture, GestureConfig::default());
+        assert_eq!(cfg.hotkeys, HotkeyConfig::default());
         assert_eq!(cfg.subtitle.label_sources, LabelMode::Auto);
+        cfg.validate().unwrap();
     }
 
     #[test]
@@ -1736,5 +2103,65 @@ mod tests {
         assert!(err.contains("position_x"), "{err}");
         assert!(err.contains("asr.edge.language"), "{err}");
         assert!(err.contains("reconnect_interval_secs"), "{err}");
+    }
+
+    #[test]
+    fn source_without_routing_fields_defaults_all_true() {
+        let audio: AudioConfig = toml::from_str(
+            r#"
+device_name = "default"
+chunk_seconds = 2.0
+sample_rate = 16000
+channels = 1
+silence_threshold = 0.01
+max_active_sources = 4
+
+[[sources]]
+id = "mic"
+label = "麦克风"
+device = "mic:0"
+enabled = true
+"#,
+        )
+        .unwrap();
+        assert_eq!(audio.sources.len(), 1);
+        assert!(audio.sources[0].desktop);
+        assert!(audio.sources[0].osc);
+        assert!(audio.sources[0].steamvr);
+    }
+
+    #[test]
+    fn validation_rejects_bad_gesture_and_hotkey_conflicts() {
+        let mut cfg = AppConfig::default();
+        cfg.output.steamvr.horizontal_offset_m = 3.0;
+        cfg.output.steamvr.gesture.grab = "left_grip".into();
+        cfg.output.steamvr.gesture.mode = "teleport".into();
+        cfg.output.steamvr.gesture.sensitivity = 9.0;
+        cfg.hotkeys.start = "CmdOrCtrl+Alt+S".into(); // 与 show 冲突
+        cfg.hotkeys.toggle_capture = "A".into(); // 裸键
+        let err = cfg.validate().unwrap_err();
+        assert!(err.contains("horizontal_offset_m"), "{err}");
+        assert!(err.contains("gesture.grab"), "{err}");
+        assert!(err.contains("gesture.mode"), "{err}");
+        assert!(err.contains("gesture.sensitivity"), "{err}");
+        assert!(
+            err.contains("冲突") || err.contains("hotkeys.start"),
+            "{err}"
+        );
+        assert!(err.contains("hotkeys.toggle_capture"), "{err}");
+    }
+
+    #[test]
+    fn shipped_default_includes_routing_hotkeys_and_gesture() {
+        let cfg: AppConfig = toml::from_str(AppConfig::SHIPPED_DEFAULT).unwrap();
+        cfg.validate().unwrap();
+        assert!(cfg.audio.sources[0].desktop);
+        assert!(cfg.audio.sources[0].osc);
+        assert!(cfg.audio.sources[0].steamvr);
+        assert_eq!(cfg.output.steamvr.horizontal_offset_m, 0.0);
+        assert!(!cfg.output.steamvr.gesture.enabled);
+        assert!(cfg.output.steamvr.gesture.locked);
+        assert_eq!(cfg.hotkeys.show, "CmdOrCtrl+Alt+S");
+        assert_eq!(cfg.hotkeys.quit, "CmdOrCtrl+Alt+Q");
     }
 }

@@ -30,6 +30,7 @@ max_active_sources = 4
 # enabled: 是否参与采集（改动需重启该源）
 # translate: 该源是否翻译（可热切换）
 # language: 覆盖全局识别语言；留空 = 跟随全局
+# desktop / osc / steamvr: 是否输出到对应通道（默认 true；旧配置不写等价 true）
 [[audio.sources]]
 id = "default"
 label = "输入源"
@@ -37,6 +38,9 @@ device = "default"
 enabled = true
 translate = true
 language = ""
+desktop = true
+osc = true
+steamvr = true
 
 # 回环采集仅 Windows 支持；其它平台这一项无法启用
 [[audio.sources]]
@@ -46,6 +50,9 @@ device = "loopback:0"
 enabled = false
 translate = true
 language = ""
+desktop = true
+osc = true
+steamvr = true
 
 [vad]
 # 是否启用 VAD 分段（推荐开启）
@@ -193,6 +200,8 @@ width_m = 1.6
 distance_m = 1.6
 # hmd 模式：相对视线的高度偏移（负数 = 偏下）
 height_offset_m = -0.28
+# hmd 模式：水平偏移（米）；正数向右
+horizontal_offset_m = 0.0
 # world 模式下的坐标（OpenVR 站立坐标系，单位米）
 world_position = [0.0, 1.3, -1.6]
 # world 模式下的旋转（角度，目前应用绕 Y 轴的偏航）
@@ -223,6 +232,28 @@ swap_red_blue = false
 # SteamVR 未启动时的重连间隔（秒）
 reconnect_interval_secs = 5
 
+[output.steamvr.gesture]
+# 启用手势移动。默认关闭：避免启动即轮询手柄
+enabled = false
+# 默认锁定，避免误触发；可用设置页 / 全局快捷键切换
+locked = true
+# VR 内手势解锁（可选，默认关闭）
+unlock_via_vr_gesture = false
+# 拖拽激活组合：both_grips | right_grip | right_trigger
+grab = "both_grips"
+# 抓取方式：ray | near
+mode = "ray"
+# 位移灵敏度
+sensitivity = 1.0
+# 显示射线命中光标
+pointer = true
+# 抓取/松手/锁定切换时震动
+haptics = true
+# near 模式的抓取半径（米）
+near_radius_m = 0.35
+# 移动模式下是否尝试屏蔽游戏输入（需 SteamVR Input 2.0；默认关闭）
+block_game_input = false
+
 [output.osc]
 # 通过 OSC 把字幕发送到 VRChat Chatbox（仅 Full 版）
 enabled = false
@@ -250,3 +281,18 @@ send_typing = true
 custom_address = ""
 # 把组包结果写日志（调试用）
 debug_log = false
+
+# ============ 全局快捷键 ============
+# 留空 = 禁用该快捷键；支持 CmdOrCtrl / Ctrl / Cmd / Alt / Shift / Super + 键名
+[hotkeys]
+show = "CmdOrCtrl+Alt+S"
+start = "CmdOrCtrl+Alt+R"
+stop = "CmdOrCtrl+Alt+E"
+toggle_capture = ""
+toggle_click_through = "CmdOrCtrl+Alt+T"
+open_settings = "CmdOrCtrl+Alt+Comma"
+open_history = ""
+toggle_translate = ""
+# 切换 SteamVR 字幕面板手势锁定（写入 output.steamvr.gesture.locked）
+toggle_steamvr_lock = ""
+quit = "CmdOrCtrl+Alt+Q"

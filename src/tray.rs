@@ -1,3 +1,5 @@
+use crate::config::HotkeyConfig;
+use crate::hotkeys::{HotkeyAction, HotkeyStatusItem};
 use tauri::{
     AppHandle, CustomMenuItem, GlobalShortcutManager, Manager, SystemTray, SystemTrayEvent,
     SystemTrayMenu, SystemTrayMenuItem,
@@ -85,54 +87,75 @@ fn show_main_window(app: &AppHandle) {
     }
 }
 
-pub fn register_global_shortcuts(app: &AppHandle) -> tauri::Result<()> {
+/// 暂停全部全局快捷键（录制前调用，含 quit）。
+/// `unregister_all` 失败只 warn，不中断。
+pub fn pause_global_hotkeys(app: &AppHandle) {
     let mut manager = app.global_shortcut_manager();
+    if let Err(e) = manager.unregister_all() {
+        tracing::warn!("unregister_all 失败（继续暂停）: {e}");
+    }
+    tracing::info!("Global shortcuts paused for hotkey recording");
+}
 
-    // 逐个注册并各自记日志：一个组合被其它程序占用时，
-    // 不能让排在它后面的快捷键（尤其是退出）一起失效。
-    let mut register = |accelerator: &str, handler: Box<dyn Fn() + Send + Sync>| {
-        if let Err(e) = manager.register(accelerator, handler) {
-            tracing::warn!("快捷键 {accelerator} 注册失败（可能被其它程序占用）: {e}");
+/// 按配置注册全局快捷键。单项失败不阻断其余项。
+pub fn apply_hotkeys(app: &AppHandle, config: &HotkeyConfig) -> Vec<HotkeyStatusItem> {
+    let mut manager = app.global_shortcut_manager();
+    if let Err(e) = manager.unregister_all() {
+        tracing::warn!("unregister_all 失败（继续重注册）: {e}");
+    }
+
+    let mut status = Vec::with_capacity(HotkeyAction::ALL.len());
+    for action in HotkeyAction::ALL {
+        let accelerator = action.accelerator(config).trim().to_string();
+        if accelerator.is_empty() {
+            status.push(HotkeyStatusItem::skipped_empty(action));
+            continue;
         }
-    };
 
-    let app_handle = app.clone();
-    register(
-        "CmdOrCtrl+Alt+S",
-        Box::new(move || show_main_window(&app_handle)),
-    );
+        let app_handle = app.clone();
+        let handler: Box<dyn Fn() + Send + Sync> = match action {
+            HotkeyAction::Show => Box::new(move || show_main_window(&app_handle)),
+            HotkeyAction::Start => Box::new(move || crate::start_capture_bg(&app_handle)),
+            HotkeyAction::Stop => Box::new(move || crate::stop_capture_bg(&app_handle)),
+            HotkeyAction::ToggleCapture => Box::new(move || crate::toggle_capture_bg(&app_handle)),
+            HotkeyAction::ToggleClickThrough => {
+                Box::new(move || crate::toggle_click_through(&app_handle))
+            }
+            HotkeyAction::OpenSettings => {
+                Box::new(move || crate::open_settings_window(&app_handle, None))
+            }
+            HotkeyAction::OpenHistory => Box::new(move || crate::open_history_window(&app_handle)),
+            HotkeyAction::ToggleTranslate => {
+                Box::new(move || crate::toggle_translate_bg(&app_handle))
+            }
+            HotkeyAction::ToggleSteamvrLock => {
+                Box::new(move || crate::toggle_steamvr_lock_bg(&app_handle))
+            }
+            HotkeyAction::Quit => Box::new(move || crate::quit_app(&app_handle)),
+        };
 
-    let app_handle = app.clone();
-    register(
-        "CmdOrCtrl+Alt+R",
-        Box::new(move || crate::start_capture_bg(&app_handle)),
-    );
-
-    let app_handle = app.clone();
-    register(
-        "CmdOrCtrl+Alt+E",
-        Box::new(move || crate::stop_capture_bg(&app_handle)),
-    );
-
-    // 切换点击穿透（穿透开启后这是关闭它的快捷键）
-    let app_handle = app.clone();
-    register(
-        "CmdOrCtrl+Alt+T",
-        Box::new(move || crate::toggle_click_through(&app_handle)),
-    );
-
-    let app_handle = app.clone();
-    register(
-        "CmdOrCtrl+Alt+Comma",
-        Box::new(move || crate::open_settings_window(&app_handle, None)),
-    );
-
-    let app_handle = app.clone();
-    register(
-        "CmdOrCtrl+Alt+Q",
-        Box::new(move || crate::quit_app(&app_handle)),
-    );
+        match manager.register(&accelerator, handler) {
+            Ok(()) => status.push(HotkeyStatusItem {
+                action: action.id().to_string(),
+                label: action.label().to_string(),
+                accelerator,
+                registered: true,
+                error: None,
+            }),
+            Err(e) => {
+                let msg = e.to_string();
+                tracing::warn!("快捷键 {accelerator} ({}) 注册失败: {msg}", action.id());
+                status.push(HotkeyStatusItem {
+                    action: action.id().to_string(),
+                    label: action.label().to_string(),
+                    accelerator,
+                    registered: false,
+                    error: Some(msg),
+                });
+            }
+        }
+    }
 
     tracing::info!("Global shortcuts registration finished");
-    Ok(())
+    status
 }

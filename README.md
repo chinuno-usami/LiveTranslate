@@ -197,6 +197,9 @@ device = "default"
 enabled = true
 translate = true
 language = ""                   # 空 = 跟随全局识别语言
+desktop = true                  # 输出到桌面浮窗（默认 true）
+osc = true                      # 输出到 OSC / VRChat
+steamvr = true                  # 输出到 SteamVR Overlay
 
 [subtitle]
 label_sources = "auto"          # auto / always / never
@@ -207,8 +210,17 @@ anchor = "hmd"
 width_m = 1.6
 distance_m = 1.6
 height_offset_m = -0.28
+horizontal_offset_m = 0.0       # hmd 水平偏移（正数向右）
 font_size_px = 34
 line_alphas = [1.0, 0.72, 0.48]
+
+[output.steamvr.gesture]        # 手势移动（后续版本实现行为）
+enabled = false
+locked = true
+
+[hotkeys]                       # 全局快捷键；留空 = 禁用
+show = "CmdOrCtrl+Alt+S"
+quit = "CmdOrCtrl+Alt+Q"
 
 [output.osc]                    # 仅 Windows Full 版预编译包（源码可单独启用 osc feature）
 enabled = false
@@ -649,15 +661,17 @@ INFO livetranslate: Config file: config/default.toml
 > ⚠️ 开启点击穿透后，浮窗本身不再接收鼠标事件，面板上的按钮会失效。
 > 此时请通过**托盘菜单 → 切换点击穿透**，或快捷键 `Ctrl/⌘+Alt+T` 关闭穿透。
 
-全局快捷键（任何窗口下都有效）：
+全局快捷键（任何窗口下都有效；可在设置页 `[hotkeys]` /「快捷键」分组自定义，留空即禁用）：
 
-| 快捷键 | 功能 |
+| 默认快捷键 | 功能 |
 |--------|------|
 | `Ctrl/⌘+Alt+S` | 显示/聚焦浮窗 |
 | `Ctrl/⌘+Alt+R` | 开始采集 |
 | `Ctrl/⌘+Alt+E` | 停止采集 |
+| （默认关闭） | 切换采集 |
 | `Ctrl/⌘+Alt+T` | 切换点击穿透 |
 | `Ctrl/⌘+Alt+,` | 打开设置页 |
+| （默认关闭） | 打开历史 / 切换翻译 / 切换 VR 位置锁定 |
 | `Ctrl/⌘+Alt+Q` | 退出程序 |
 
 > 单击托盘图标可显示/隐藏浮窗；双击托盘图标可唤出浮窗。

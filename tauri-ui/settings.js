@@ -33,6 +33,9 @@ const els = {
 const state = {
   schema: null,
   capabilities: { steamvr: false, osc: false },
+  hotkeyStatus: { items: [], paused: false },
+  hotkeyRecordingPath: null,
+  hotkeyRecordingHandler: null,
   profiles: null,
   rawPath: null,
   rawText: '',
@@ -293,7 +296,7 @@ async function loadAll() {
     // 输入源表：本地有未保存的改动时以本地为准，否则会被这份快照覆盖
     const keepLocalSources = state.dirty.has('audio.sources');
     const freshSources = deepClone(sources.sources || []);
-    if (!keepLocalSources) state.sources = freshSources;
+    if (!keepLocalSources) state.sources = normalizeSources(freshSources);
     state.originalSourcesJson = JSON.stringify(freshSources);
     state.devices = devices.devices || [];
     state.languages = languages.options || [];
@@ -363,7 +366,7 @@ async function refreshSchemaOnly(preferredProfile) {
   } else {
     showError('');
   }
-  state.sources = deepClone(sources.sources || []);
+  state.sources = normalizeSources(deepClone(sources.sources || []));
   state.originalSourcesJson = JSON.stringify(state.sources);
   state.devices = devices.devices || [];
   state.languages = languages.options || [];
@@ -373,6 +376,7 @@ async function refreshSchemaOnly(preferredProfile) {
   state.invalidInputs.clear();
   state.rawInputs.clear();
   pruneDirty();
+  await refreshHotkeyStatus();
   renderContent();
 }
 
@@ -576,6 +580,9 @@ async function deleteProfile() {
 // ---------------- 导航 / 搜索 ----------------
 
 function switchToGroup(groupId) {
+  if (state.hotkeyRecordingPath) {
+    cancelHotkeyRecording().catch((error) => console.warn(error));
+  }
   const groups = state.schema?.groups || [];
   if (!groups.some((group) => group.id === groupId)) return;
   state.currentGroup = groupId;
@@ -639,6 +646,9 @@ function renderGroup(group) {
   if (group.custom === 'raw_toml') {
     body += renderRawGroup();
   }
+  if (group.custom === 'hotkeys_actions') {
+    body += renderHotkeysActions();
+  }
 
   const normalFields = (group.fields || []).filter((field) => !field.advanced);
   const advancedFields = (group.fields || []).filter((field) => field.advanced);
@@ -657,7 +667,11 @@ function renderGroup(group) {
   if (group.custom === 'raw_toml') {
     bindRawGroup();
   }
+  if (group.custom === 'hotkeys_actions') {
+    bindHotkeysActions();
+  }
   bindFieldEvents();
+  bindHotkeyControls();
   if (disabled) {
     els.content
       .querySelectorAll('input, select, textarea, button')
@@ -696,6 +710,7 @@ function renderSearch(query) {
       )
       .join('')}`;
   bindFieldEvents();
+  bindHotkeyControls();
   els.content
     .querySelectorAll(
       '.section-disabled input, .section-disabled select, .section-disabled textarea, .section-disabled button',
@@ -802,6 +817,36 @@ function renderControl(field, value) {
       return `<select data-path="${path}">${renderDeviceOptions(value)}</select>`;
     case 'language':
       return `<select data-path="${path}">${renderLanguageOptions(value, field.options)}</select>`;
+    case 'hotkey': {
+      const recording = state.hotkeyRecordingPath === field.path;
+      const status = (state.hotkeyStatus.items || []).find(
+        (item) => `hotkeys.${item.action}` === field.path,
+      );
+      let badge = '';
+      if (status) {
+        if (!String(status.accelerator || '').trim()) {
+          badge = '<span class="hotkey-badge muted">未设置</span>';
+        } else if (state.hotkeyStatus.paused) {
+          badge = '<span class="hotkey-badge warn">已暂停</span>';
+        } else if (status.registered) {
+          badge = '<span class="hotkey-badge ok">已注册</span>';
+        } else {
+          badge = '<span class="hotkey-badge warn" title="' +
+            escapeHtml(status.error || '可能被其它程序占用') +
+            '">未生效</span>';
+        }
+      }
+      return `<div class="hotkey-control${recording ? ' recording' : ''}">
+        <input type="text" data-path="${path}" data-hotkey="1" value="${escapeHtml(
+          value || '',
+        )}" placeholder="留空禁用" spellcheck="false" ${recording ? 'readonly' : ''} />
+        <button type="button" class="btn small" data-hotkey-record="${path}">${
+          recording ? '录制中…' : '录制'
+        }</button>
+        <button type="button" class="btn small" data-hotkey-clear="${path}">清除</button>
+        ${badge}
+      </div>`;
+    }
     default: {
       const displayValue =
         field.path === 'output.osc.separator' ? escapeControlChars(value) : value;
@@ -929,6 +974,21 @@ function effectiveSourceLanguageOptions() {
   return state.languages;
 }
 
+
+/** 旧配置可能缺路由字段；UI 与落盘一律按默认 true 补齐。 */
+function normalizeSourceRoutes(source) {
+  return {
+    ...source,
+    desktop: source.desktop !== false,
+    osc: source.osc !== false,
+    steamvr: source.steamvr !== false,
+  };
+}
+
+function normalizeSources(sources) {
+  return (Array.isArray(sources) ? sources : []).map(normalizeSourceRoutes);
+}
+
 function renderSourcesBlock(disabled) {
   const block = document.getElementById('sources-block');
   if (!block) return;
@@ -955,6 +1015,9 @@ function renderSourcesBlock(disabled) {
         `<option value=""${!source.language ? ' selected' : ''}>跟随全局</option>`,
         ...languageOptions,
       ].join('');
+      const desktop = source.desktop !== false;
+      const osc = source.osc !== false;
+      const steamvr = source.steamvr !== false;
       return `<tr data-index="${index}">
         <td><input type="text" data-source-field="id" value="${escapeHtml(source.id)}" /></td>
         <td><input type="text" data-source-field="label" value="${escapeHtml(source.label)}" /></td>
@@ -966,6 +1029,17 @@ function renderSourcesBlock(disabled) {
         <td class="col-small"><input type="checkbox" data-source-field="enabled" ${
           source.enabled ? 'checked' : ''
         } /></td>
+        <td class="col-output">
+          <label class="route-check"><input type="checkbox" data-source-field="desktop" ${
+            desktop ? 'checked' : ''
+          } />桌面</label>
+          <label class="route-check"><input type="checkbox" data-source-field="osc" ${
+            osc ? 'checked' : ''
+          } />OSC</label>
+          <label class="route-check"><input type="checkbox" data-source-field="steamvr" ${
+            steamvr ? 'checked' : ''
+          } />VR</label>
+        </td>
         <td class="col-small">
           <button class="btn icon-btn" data-source-move="up" ${index === 0 ? 'disabled' : ''}>↑</button>
           <button class="btn icon-btn" data-source-move="down" ${
@@ -979,16 +1053,19 @@ function renderSourcesBlock(disabled) {
 
   block.innerHTML = `
     <div class="sources-error" id="sources-error"></div>
+    <div class="sources-warning" id="sources-warning"></div>
     <table class="sources-table">
       <thead><tr>
         <th>ID</th><th>展示名</th><th>设备</th><th>语言覆盖</th>
-        <th class="col-small">翻译</th><th class="col-small">启用</th><th class="col-small">操作</th>
+        <th class="col-small">翻译</th><th class="col-small">启用</th>
+        <th class="col-output">输出</th><th class="col-small">操作</th>
       </tr></thead>
       <tbody>${rows || ''}</tbody>
     </table>
     <div class="sources-actions">
       <button class="btn small" id="add-source-row">＋ 添加输入源</button>
-      <span class="hint">修改后点右下角「保存」写入配置；设备 / 启用变更会重启采集；
+      <span class="hint">修改后点右下角「保存」写入配置；设备 / 启用 / ID / 展示名变更会重启采集；
+        输出路由（桌面/OSC/VR）与翻译开关热更新，不重启；
         同一设备只能被一个启用中的源采集（loopback 与 loopback:0 是同一个设备）。</span>
     </div>`;
 
@@ -1063,6 +1140,9 @@ function renderSourcesBlock(disabled) {
       enabled: Boolean(freeDevice),
       translate: true,
       language: '',
+      desktop: true,
+      osc: true,
+      steamvr: true,
     });
     markSourcesDirty();
     renderSourcesBlock(disabled);
@@ -1133,10 +1213,295 @@ function canonicalDeviceSpec(spec) {
   return value;
 }
 
+
+const DEFAULT_HOTKEYS = {
+  'hotkeys.show': 'CmdOrCtrl+Alt+S',
+  'hotkeys.start': 'CmdOrCtrl+Alt+R',
+  'hotkeys.stop': 'CmdOrCtrl+Alt+E',
+  'hotkeys.toggle_capture': '',
+  'hotkeys.toggle_click_through': 'CmdOrCtrl+Alt+T',
+  'hotkeys.open_settings': 'CmdOrCtrl+Alt+Comma',
+  'hotkeys.open_history': '',
+  'hotkeys.toggle_translate': '',
+  'hotkeys.toggle_steamvr_lock': '',
+  'hotkeys.quit': 'CmdOrCtrl+Alt+Q',
+};
+
+function renderHotkeysActions() {
+  const paused = state.hotkeyStatus.paused || state.hotkeyRecordingPath;
+  const pauseNote = paused
+    ? '<div class="hotkey-pause-note">快捷键已暂停：录制期间全局快捷键（含退出）不会触发。</div>'
+    : '';
+  return `${pauseNote}
+    <div class="hotkeys-actions-bar">
+      <button type="button" class="btn small" id="hotkeys-restore-defaults">恢复默认快捷键</button>
+      <span class="hint">恢复只写入表单，需再点右下角「保存」才会重注册。</span>
+    </div>`;
+}
+
+function bindHotkeysActions() {
+  const btn = document.getElementById('hotkeys-restore-defaults');
+  if (!btn) return;
+  btn.addEventListener('click', () => {
+    for (const [path, value] of Object.entries(DEFAULT_HOTKEYS)) {
+      setFieldDirty(path, value);
+      const input = els.content.querySelector(`[data-path="${CSS.escape(path)}"]`);
+      if (input) input.value = value;
+    }
+    updateDirtyIndicator();
+    setStatus('已恢复默认快捷键（未保存）');
+  });
+}
+
+function codeToHotkeyKey(code, key) {
+  if (/^Key[A-Z]$/.test(code)) return code.slice(3);
+  if (/^Digit[0-9]$/.test(code)) return code.slice(5);
+  if (/^F([1-9]|1[0-9]|2[0-4])$/.test(code)) return code;
+  const map = {
+    Comma: 'Comma',
+    Period: 'Period',
+    Slash: 'Slash',
+    Backslash: 'Backslash',
+    BracketLeft: 'LeftBracket',
+    BracketRight: 'RightBracket',
+    Semicolon: 'Semicolon',
+    Quote: 'Quote',
+    Backquote: 'Backquote',
+    Minus: 'Minus',
+    Equal: 'Equal',
+    Enter: 'Enter',
+    Space: 'Space',
+    Tab: 'Tab',
+    Backspace: 'Backspace',
+    Delete: 'Delete',
+    Home: 'Home',
+    End: 'End',
+    PageUp: 'PageUp',
+    PageDown: 'PageDown',
+    Insert: 'Insert',
+    ArrowUp: 'Up',
+    ArrowDown: 'Down',
+    ArrowLeft: 'Left',
+    ArrowRight: 'Right',
+    Numpad0: 'Numpad0',
+    Numpad1: 'Numpad1',
+    Numpad2: 'Numpad2',
+    Numpad3: 'Numpad3',
+    Numpad4: 'Numpad4',
+    Numpad5: 'Numpad5',
+    Numpad6: 'Numpad6',
+    Numpad7: 'Numpad7',
+    Numpad8: 'Numpad8',
+    Numpad9: 'Numpad9',
+    NumpadAdd: 'NumpadAdd',
+    NumpadSubtract: 'NumpadSubtract',
+    NumpadMultiply: 'NumpadMultiply',
+    NumpadDivide: 'NumpadDivide',
+    NumpadDecimal: 'NumpadDecimal',
+    NumpadEnter: 'Enter',
+  };
+  if (map[code]) return map[code];
+  if (key && key.length === 1) return key.toUpperCase();
+  return '';
+}
+
+function eventToAccelerator(event) {
+  const key = codeToHotkeyKey(event.code, event.key);
+  if (!key) return '';
+  const parts = [];
+  if (event.metaKey) parts.push('Cmd');
+  if (event.ctrlKey) parts.push('Ctrl');
+  if (event.altKey) parts.push('Alt');
+  if (event.shiftKey) parts.push('Shift');
+  parts.push(key);
+  return parts.join('+');
+}
+
+function isModifierOnlyEvent(event) {
+  return ['Control', 'Alt', 'Shift', 'Meta'].includes(event.key);
+}
+
+function currentHotkeyFormValues() {
+  const values = {};
+  for (const path of Object.keys(DEFAULT_HOTKEYS)) {
+    if (state.dirty.has(path)) {
+      values[path] = String(state.dirty.get(path) ?? '');
+      continue;
+    }
+    const field = (state.schema?.groups || [])
+      .flatMap((g) => g.fields || [])
+      .find((f) => f.path === path);
+    values[path] = field ? String(field.value ?? '') : DEFAULT_HOTKEYS[path];
+  }
+  return values;
+}
+
+function findHotkeyDuplicate(path, accelerator) {
+  const normalized = String(accelerator || '')
+    .trim()
+    .toLowerCase()
+    .replace(/commandorcontrol/g, 'cmdorctrl')
+    .replace(/control/g, 'ctrl')
+    .replace(/command/g, 'cmd');
+  if (!normalized) return null;
+  const values = currentHotkeyFormValues();
+  for (const [otherPath, value] of Object.entries(values)) {
+    if (otherPath === path) continue;
+    const other = String(value || '')
+      .trim()
+      .toLowerCase()
+      .replace(/commandorcontrol/g, 'cmdorctrl')
+      .replace(/control/g, 'ctrl')
+      .replace(/command/g, 'cmd');
+    if (other && other === normalized) return otherPath;
+  }
+  return null;
+}
+
+async function pauseHotkeysForRecording() {
+  try {
+    const status = await invoke('pause_global_hotkeys');
+    state.hotkeyStatus = status || { items: [], paused: true };
+  } catch (error) {
+    console.warn('暂停全局快捷键失败', error);
+    showError(`暂停快捷键失败: ${error}`);
+  }
+}
+
+async function resumeHotkeysAfterRecording() {
+  try {
+    const status = await invoke('resume_global_hotkeys');
+    state.hotkeyStatus = status || { items: [], paused: false };
+  } catch (error) {
+    console.warn('恢复全局快捷键失败', error);
+    showError(`恢复快捷键失败: ${error}`);
+  }
+}
+
+async function cancelHotkeyRecording() {
+  if (!state.hotkeyRecordingPath && !state.hotkeyRecordingHandler) return;
+  const path = state.hotkeyRecordingPath;
+  if (state.hotkeyRecordingHandler) {
+    window.removeEventListener('keydown', state.hotkeyRecordingHandler, true);
+  }
+  state.hotkeyRecordingHandler = null;
+  state.hotkeyRecordingPath = null;
+  await resumeHotkeysAfterRecording();
+  if (state.currentGroup === 'hotkeys' && !els.search.value) {
+    renderContent();
+  } else if (path) {
+    // 搜索视图：局部刷新该字段太复杂，整页重绘当前内容
+    renderContent();
+  }
+}
+
+async function startHotkeyRecording(path) {
+  if (state.hotkeyRecordingPath === path) {
+    await cancelHotkeyRecording();
+    return;
+  }
+  if (state.hotkeyRecordingPath) {
+    await cancelHotkeyRecording();
+  }
+  await pauseHotkeysForRecording();
+  state.hotkeyRecordingPath = path;
+  const handler = async (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    if (event.key === 'Escape') {
+      await cancelHotkeyRecording();
+      return;
+    }
+    if (isModifierOnlyEvent(event)) return;
+    // 阻止 Space/Enter 激活按钮
+    if (event.key === ' ' || event.key === 'Enter') {
+      // still allow composing accelerator with Enter as key when modifiers present
+    }
+    const accelerator = eventToAccelerator(event);
+    if (!accelerator) return;
+    const parts = accelerator.split('+');
+    const key = parts[parts.length - 1];
+    const hasMod = parts.length > 1;
+    const isFn = /^F([1-9]|1[0-9]|2[0-4])$/.test(key);
+    if (!hasMod && !isFn) {
+      setStatus('请带修饰键录制，或使用 F1–F24', 'err');
+      return;
+    }
+    const dup = findHotkeyDuplicate(path, accelerator);
+    if (dup) {
+      setStatus(`与 ${dup} 冲突，未写入`, 'err');
+      return;
+    }
+    if (state.hotkeyRecordingHandler) {
+      window.removeEventListener('keydown', state.hotkeyRecordingHandler, true);
+    }
+    state.hotkeyRecordingHandler = null;
+    state.hotkeyRecordingPath = null;
+    setFieldDirty(path, accelerator);
+    await resumeHotkeysAfterRecording();
+    updateDirtyIndicator();
+    renderContent();
+    setStatus(`已录制 ${accelerator}（未保存）`);
+  };
+  state.hotkeyRecordingHandler = handler;
+  window.addEventListener('keydown', handler, true);
+  renderContent();
+}
+
+function bindHotkeyControls() {
+  els.content.querySelectorAll('[data-hotkey-record]').forEach((btn) => {
+    btn.addEventListener('click', (event) => {
+      event.preventDefault();
+      const path = btn.getAttribute('data-hotkey-record');
+      startHotkeyRecording(path).catch((error) => console.error(error));
+    });
+  });
+  els.content.querySelectorAll('[data-hotkey-clear]').forEach((btn) => {
+    btn.addEventListener('click', (event) => {
+      event.preventDefault();
+      const path = btn.getAttribute('data-hotkey-clear');
+      setFieldDirty(path, '');
+      const input = els.content.querySelector(`[data-path="${CSS.escape(path)}"]`);
+      if (input) input.value = '';
+      updateDirtyIndicator();
+      setStatus('已清除（未保存）');
+    });
+  });
+}
+
+async function refreshHotkeyStatus() {
+  try {
+    const status = await invoke('get_hotkeys');
+    state.hotkeyStatus = status || { items: [], paused: false };
+  } catch (error) {
+    console.warn('获取快捷键状态失败', error);
+  }
+}
+
+function collectSourceWarnings(sources) {
+  const warnings = [];
+  if (!Array.isArray(sources)) return warnings;
+  sources.forEach((source, index) => {
+    if (!source.enabled) return;
+    const desktop = source.desktop !== false;
+    const osc = source.osc !== false;
+    const steamvr = source.steamvr !== false;
+    if (!desktop && !osc && !steamvr) {
+      warnings.push(
+        `输入源 #${index + 1}: 该源只写入历史，不会出现在任何输出`,
+      );
+    }
+  });
+  return warnings;
+}
+
 function validateSources() {
   const errors = collectSourceErrors(state.sources);
-  const box = document.getElementById('sources-error');
-  if (box) box.textContent = errors.join('；');
+  const warnings = collectSourceWarnings(state.sources);
+  const errBox = document.getElementById('sources-error');
+  if (errBox) errBox.textContent = errors.join('；');
+  const warnBox = document.getElementById('sources-warning');
+  if (warnBox) warnBox.textContent = warnings.join('；');
   return errors;
 }
 
@@ -1552,7 +1917,7 @@ async function cancel() {
   setBusy(true);
   try {
     clearLocalEdits();
-    state.sources = JSON.parse(state.originalSourcesJson);
+    state.sources = normalizeSources(JSON.parse(state.originalSourcesJson));
     try {
       await invoke('cancel_preview');
     } catch (error) {
@@ -1702,6 +2067,13 @@ window.addEventListener('DOMContentLoaded', async () => {
     await window.__TAURI__.event.listen('settings://hidden', () => {
       clearPreviewTimer();
       closeActiveDialog();
+      cancelHotkeyRecording().catch((error) => console.warn(error));
+    });
+    await window.__TAURI__.event.listen('hotkey-status://update', (event) => {
+      state.hotkeyStatus = event.payload || { items: [], paused: false };
+      if (state.currentGroup === 'hotkeys' && !els.search.value && !state.hotkeyRecordingPath) {
+        renderContent();
+      }
     });
     await window.__TAURI__.event.listen('source-status://update', async () => {
       if (!state.hasLoaded || state.dirty.has('audio.sources')) return;
@@ -1712,7 +2084,7 @@ window.addEventListener('DOMContentLoaded', async () => {
         const fresh = deepClone(sources.sources || []);
         const nextJson = JSON.stringify(fresh);
         if (nextJson !== state.originalSourcesJson) {
-          state.sources = fresh;
+          state.sources = normalizeSources(fresh);
           state.originalSourcesJson = nextJson;
           if (state.currentGroup === 'sources' && !els.search.value) {
             renderContent();

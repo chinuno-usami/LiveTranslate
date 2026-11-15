@@ -360,6 +360,26 @@ details.advanced > summary {
   text-align: center;
 }
 
+.sources-table .col-output {
+  min-width: 148px;
+  white-space: nowrap;
+}
+
+.sources-table .route-check {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  margin-right: 8px;
+  font-size: 12px;
+  color: var(--text);
+  cursor: pointer;
+  user-select: none;
+}
+
+.sources-table .route-check input {
+  margin: 0;
+}
+
 .icon-btn {
   padding: 2px 6px;
   font-size: 12px;
@@ -373,6 +393,13 @@ details.advanced > summary {
 
 .sources-error {
   color: var(--danger);
+  font-size: 12px;
+  min-height: 18px;
+  margin-bottom: 4px;
+}
+
+.sources-warning {
+  color: #e6b84d;
   font-size: 12px;
   min-height: 18px;
   margin-bottom: 8px;
@@ -467,4 +494,61 @@ details.advanced > summary {
 
 .btn.danger-fill:hover {
   background: #b91c1c;
+}
+
+
+/* 快捷键录制 */
+.hotkey-control {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+
+.hotkey-control input[type="text"] {
+  min-width: 180px;
+  flex: 1;
+}
+
+.hotkey-control.recording input[type="text"] {
+  border-color: #e6b84d;
+  box-shadow: 0 0 0 1px rgba(230, 184, 77, 0.35);
+}
+
+.hotkey-badge {
+  font-size: 11px;
+  padding: 1px 6px;
+  border-radius: 4px;
+}
+
+.hotkey-badge.ok {
+  color: #8fd18f;
+  background: rgba(80, 140, 80, 0.2);
+}
+
+.hotkey-badge.warn {
+  color: #e6b84d;
+  background: rgba(120, 90, 20, 0.25);
+}
+
+.hotkey-badge.muted {
+  color: var(--muted);
+  background: rgba(127, 127, 127, 0.15);
+}
+
+.hotkey-pause-note {
+  margin-bottom: 10px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  border: 1px solid #5a4a24;
+  background: #241f15;
+  color: #ffd28a;
+  font-size: 12px;
+}
+
+.hotkeys-actions-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 14px;
 }

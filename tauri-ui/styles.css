@@ -626,3 +626,14 @@ kbd {
 .source-toggle input {
   accent-color: #38bdf8;
 }
+
+
+.shortcut-unset {
+  color: var(--muted, #9aa3b2);
+}
+
+.shortcut-warn {
+  color: #e6b84d;
+  font-size: 11px;
+  margin-left: 6px;
+}
