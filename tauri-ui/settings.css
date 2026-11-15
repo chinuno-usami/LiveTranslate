@@ -552,3 +552,55 @@ details.advanced > summary {
   gap: 8px;
   margin-bottom: 14px;
 }
+
+
+/* 输入屏蔽只读状态（3A） */
+.input-block-status {
+  margin-top: 18px;
+  padding: 12px 14px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--panel-2);
+}
+.input-block-status .ib-title {
+  font-weight: 600;
+  margin-bottom: 4px;
+}
+.input-block-status .ib-blocked {
+  margin: 8px 0;
+}
+.input-block-status .ib-blocked.muted {
+  color: var(--muted);
+}
+.input-block-status .ib-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.input-block-status .ib-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+.ib-badge {
+  flex-shrink: 0;
+  font-size: 11px;
+  padding: 1px 8px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+}
+.ib-badge.ib-ok {
+  color: var(--ok);
+  border-color: color-mix(in srgb, var(--ok) 50%, var(--border));
+}
+.ib-badge.ib-bad {
+  color: var(--danger);
+  border-color: color-mix(in srgb, var(--danger) 50%, var(--border));
+}
+.ib-badge.ib-unknown {
+  color: var(--muted);
+}

@@ -111,14 +111,14 @@ jobs:
           cargo clippy --locked --all-targets --no-default-features --features custom-protocol -- -D warnings
           cargo test --locked --all-targets --no-default-features --features custom-protocol
 
-      # 标准包不能链接可选依赖（rosc / openvr / cosmic-text）
+      # 标准包不能链接可选依赖（rosc / openvr / openvr_sys / cosmic-text）
       - name: standard build excludes optional deps
         shell: bash
         run: |
           set -euo pipefail
           # 先独立落盘：cargo tree 失败时 set -e 直接终止，避免 grep 拿到空输入误判通过
           cargo tree --locked --prefix none --features custom-protocol > /tmp/standard-tree.txt
-          if grep -E '^(rosc|openvr|cosmic-text)( |$)' /tmp/standard-tree.txt; then
+          if grep -E '^(rosc|openvr|openvr_sys|cosmic-text)( |$)' /tmp/standard-tree.txt; then
             echo "::error::standard build must not link optional output dependencies"
             exit 1
           fi

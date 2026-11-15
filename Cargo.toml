@@ -20,7 +20,8 @@ silero-vad = ["dep:ort", "dep:libloading"]
 # VRChat OSC Chatbox 输出（跨平台）
 osc = ["dep:rosc"]
 # SteamVR Overlay 输出（仅 Windows 有真实实现，其它平台为 stub）
-steamvr = ["dep:openvr", "dep:cosmic-text"]
+# openvr / openvr_sys 仅在 Windows target 依赖中；非 Windows 启用 steamvr 时只拉 cosmic-text（stub/gesture/assets）。
+steamvr = ["dep:openvr", "dep:openvr_sys", "dep:cosmic-text"]
 # Windows Full 包：一次开启 OSC + SteamVR
 extras = ["osc", "steamvr"]
 
@@ -76,6 +77,8 @@ libloading = { version = "0.8", optional = true }
 # Windows-specific
 [target.'cfg(windows)'.dependencies]
 openvr = { version = "0.9", optional = true }
+# 3A：构造带 nPriority 的 VRActiveActionSet（openvr 0.9 封装不足时直调）；仅随 steamvr feature。
+openvr_sys = { version = "2.1.4", optional = true }
 windows = { version = "0.52", features = [
     "Win32_Media_Audio",
     "Win32_System_Com",

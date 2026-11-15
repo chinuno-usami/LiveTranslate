@@ -276,17 +276,20 @@ async function loadAll() {
   setStatus('加载中…');
   showError('');
   try {
-    const [schema, capabilities, profiles, raw, sources, devices, languages] = await Promise.all([
-      invoke('get_settings_schema'),
-      invoke('get_capabilities'),
-      invoke('get_profiles'),
-      invoke('get_config_raw'),
-      invoke('get_sources_config'),
-      invoke('list_devices_command'),
-      invoke('list_languages'),
-    ]);
+    const [schema, capabilities, profiles, raw, sources, devices, languages, outputStatus] =
+      await Promise.all([
+        invoke('get_settings_schema'),
+        invoke('get_capabilities'),
+        invoke('get_profiles'),
+        invoke('get_config_raw'),
+        invoke('get_sources_config'),
+        invoke('list_devices_command'),
+        invoke('list_languages'),
+        invoke('get_output_status').catch(() => null),
+      ]);
     state.schema = schema;
     state.capabilities = capabilities;
+    state.steamvrStatus = outputStatus?.steamvr || null;
     state.profiles = profiles;
     state.rawPath = raw.path;
     if (!state.rawDirty) {
@@ -658,6 +661,9 @@ function renderGroup(group) {
       .map(renderField)
       .join('')}</details>`;
   }
+  if (group.id === 'steamvr') {
+    body += renderInputBlockStatus();
+  }
 
   els.content.innerHTML = `<div class="${disabled ? 'section-disabled' : ''}">${header}${note}${body}</div>`;
 
@@ -718,6 +724,89 @@ function renderSearch(query) {
     .forEach((element) => {
       element.disabled = true;
     });
+}
+
+// ---------------- 输入屏蔽状态（只读提示） ----------------
+
+function inputBlockDetail(sv) {
+  const block = sv?.input_block || {};
+  return {
+    experimental_enabled: block.experimental_enabled,
+    experimental_message: block.experimental_message || '',
+    manifest_ok: Boolean(block.manifest_ok),
+    manifest_message: block.manifest_message || '',
+    app_registered: Boolean(block.app_registered),
+    app_register_message: block.app_register_message || '',
+    bindings_ok: Boolean(block.bindings_ok),
+    bindings_message: block.bindings_message || '',
+    input_blocked: Boolean(sv?.input_blocked),
+    input_block_message: sv?.input_block_message || '',
+  };
+}
+
+function statusBadge(ok, unknown) {
+  if (unknown) return '<span class="ib-badge ib-unknown">未检测</span>';
+  return ok
+    ? '<span class="ib-badge ib-ok">正常</span>'
+    : '<span class="ib-badge ib-bad">异常</span>';
+}
+
+function renderInputBlockStatus() {
+  const sv = state.steamvrStatus;
+  const d = inputBlockDetail(sv);
+  const expUnknown = d.experimental_enabled == null;
+  const expOk = d.experimental_enabled === true;
+  const rows = [
+    {
+      label: 'SteamVR 实验设置 globalActionSetPriority',
+      badge: statusBadge(expOk, expUnknown),
+      message:
+        d.experimental_message ||
+        '未开启时请到 SteamVR → 设置 → 开发者 → Enable global input from overlays (experimental)。本应用只提示，不会修改该全局设置。',
+    },
+    {
+      label: 'action manifest',
+      badge: statusBadge(d.manifest_ok, !d.manifest_message || d.manifest_message.includes('尚未检测')),
+      message: d.manifest_message || '尚未检测',
+    },
+    {
+      label: 'steamvr.vrmanifest 注册',
+      badge: statusBadge(
+        d.app_registered,
+        !d.app_register_message || d.app_register_message.includes('尚未检测'),
+      ),
+      message: d.app_register_message || '尚未检测',
+    },
+    {
+      label: '默认 binding',
+      badge: statusBadge(
+        d.bindings_ok,
+        !d.bindings_message || d.bindings_message.includes('尚未检测'),
+      ),
+      message: d.bindings_message || '尚未检测',
+    },
+  ];
+  const blockedLine = d.input_blocked
+    ? '<div class="ib-blocked">当前：游戏 grip/trigger 已屏蔽</div>'
+    : `<div class="ib-blocked muted">当前：未屏蔽${
+        d.input_block_message ? `（${escapeHtml(d.input_block_message)}）` : ''
+      }</div>`;
+  return `
+    <div class="input-block-status" id="input-block-status">
+      <div class="ib-title">输入屏蔽状态（只读）</div>
+      <p class="help">仅屏蔽 grip/trigger；摇杆/菜单仍会传给游戏。失败时自动降级为手势移动，不修改 SteamVR 全局设置。</p>
+      ${blockedLine}
+      <ul class="ib-list">
+        ${rows
+          .map(
+            (row) =>
+              `<li><div class="ib-row"><span>${escapeHtml(row.label)}</span>${row.badge}</div><div class="help">${escapeHtml(
+                row.message,
+              )}</div></li>`,
+          )
+          .join('')}
+      </ul>
+    </div>`;
 }
 
 // ---------------- 字段渲染 ----------------
@@ -2073,6 +2162,16 @@ window.addEventListener('DOMContentLoaded', async () => {
       state.hotkeyStatus = event.payload || { items: [], paused: false };
       if (state.currentGroup === 'hotkeys' && !els.search.value && !state.hotkeyRecordingPath) {
         renderContent();
+      }
+    });
+    await window.__TAURI__.event.listen('output-status://update', (event) => {
+      const payload = event?.payload || null;
+      state.steamvrStatus = payload?.steamvr || null;
+      if (state.currentGroup === 'steamvr' && !els.search.value) {
+        const host = document.getElementById('input-block-status');
+        if (host) {
+          host.outerHTML = renderInputBlockStatus();
+        }
       }
     });
     await window.__TAURI__.event.listen('source-status://update', async () => {

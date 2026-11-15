@@ -42,6 +42,51 @@ pub struct SteamVrPoseUpdate {
     pub world_position: [f32; 3],
 }
 
+/// 3A 输入屏蔽诊断（只读提示；绝不写入 SteamVR 全局设置）。
+#[derive(Debug, Clone, Serialize, PartialEq, Eq, Default)]
+pub struct InputBlockStatus {
+    /// `Some(true/false)` 表示已读到实验开关；`None` = 尚未检测或读取失败
+    pub experimental_enabled: Option<bool>,
+    pub experimental_message: String,
+    pub manifest_ok: bool,
+    pub manifest_message: String,
+    pub app_registered: bool,
+    pub app_register_message: String,
+    pub bindings_ok: bool,
+    pub bindings_message: String,
+}
+
+impl InputBlockStatus {
+    /// 标准版 / 非 Windows：保留配置字段，运行时不可用。
+    pub fn unsupported_build() -> Self {
+        const MSG: &str = "当前构建不支持，仅保留配置字段";
+        Self {
+            experimental_enabled: None,
+            experimental_message: "当前构建不支持输入屏蔽（仅 Windows Full 版）".into(),
+            manifest_ok: false,
+            manifest_message: MSG.into(),
+            app_registered: false,
+            app_register_message: MSG.into(),
+            bindings_ok: false,
+            bindings_message: MSG.into(),
+        }
+    }
+
+    /// 尚未尝试初始化（例如未开启 block_game_input，或尚未进入移动模式）。
+    pub fn not_probed() -> Self {
+        Self {
+            experimental_enabled: None,
+            experimental_message: "尚未检测：开启「移动时屏蔽游戏输入」并进入拖动后才会探测".into(),
+            manifest_ok: false,
+            manifest_message: "尚未检测 action manifest".into(),
+            app_registered: false,
+            app_register_message: "尚未检测 steamvr.vrmanifest 注册".into(),
+            bindings_ok: false,
+            bindings_message: "尚未检测默认 binding".into(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct SteamVrStatus {
     pub available: bool,
@@ -52,17 +97,20 @@ pub struct SteamVrStatus {
     pub gesture_locked: bool,
     /// 是否正在拖动
     pub dragging: bool,
-    /// 移动模式下是否真的成功屏蔽了游戏输入（3C 恒 false）
+    /// 移动模式下是否真的成功屏蔽了游戏输入（仅屏蔽成功时为 true）
     pub input_blocked: bool,
-    /// 屏蔽能力/配置状态说明（3C 下为空；3A 未实现时不声称已屏蔽）
+    /// 屏蔽能力/配置状态汇总说明
     pub input_block_message: String,
+    /// 实验设置 / manifest / 注册 / binding 可读明细（设置页展示）
+    pub input_block: InputBlockStatus,
 }
 
 #[allow(clippy::derivable_impls)]
 impl Default for SteamVrStatus {
     fn default() -> Self {
+        let available = cfg!(all(feature = "steamvr", target_os = "windows"));
         Self {
-            available: cfg!(all(feature = "steamvr", target_os = "windows")),
+            available,
             enabled: false,
             connected: false,
             message: String::new(),
@@ -71,6 +119,11 @@ impl Default for SteamVrStatus {
             dragging: false,
             input_blocked: false,
             input_block_message: String::new(),
+            input_block: if available {
+                InputBlockStatus::not_probed()
+            } else {
+                InputBlockStatus::unsupported_build()
+            },
         }
     }
 }
@@ -132,6 +185,14 @@ impl SteamVrSink {
             .set_gesture_locked(locked);
     }
 
+    /// 同步活动配置路径，供 3A 资源解压到配置旁 `steamvr/<version>/`。
+    pub fn set_active_config_path(&self, path: Option<std::path::PathBuf>) {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .set_active_config_path(path);
+    }
+
     pub fn shutdown(&self) {
         let _lifecycle = self.lifecycle.lock().unwrap_or_else(|e| e.into_inner());
         let handle = {
@@ -148,6 +209,14 @@ impl SteamVrSink {
 /// imp（Windows）接入前，非 Windows 构建仅单测引用，故允许 dead_code。
 #[allow(dead_code)]
 pub mod gesture;
+
+/// SteamVR Input 2.0 内嵌资源解压（跨平台可测；Windows `input.rs` 取绝对路径）。
+#[cfg(feature = "steamvr")]
+pub mod assets;
+
+/// SteamVR Input 2.0 输入屏蔽（3A）：仅 Windows 真实 OpenVR；由 imp 在 `block_game_input` 时懒初始化。
+#[cfg(all(feature = "steamvr", target_os = "windows"))]
+pub mod input;
 
 /// HMD 局部坐标系下的面板 3×4 变换（行主序，与 OpenVR Matrix3x4 一致）。
 ///
@@ -235,6 +304,14 @@ mod status_api_tests {
         assert!(!status.dragging);
         assert!(!status.input_blocked);
         assert!(status.input_block_message.is_empty());
+        // stub/非 Windows：unsupported；Windows Full 真实 sink 初始为 not_probed
+        assert!(
+            status
+                .input_block
+                .experimental_message
+                .contains("当前构建不支持")
+                || status.input_block.experimental_message.contains("尚未检测")
+        );
         assert!(sink.take_pose_update().is_none());
         // 保证类型可构造（主线程 clamp 后写回同结构）
         let pose = SteamVrPoseUpdate {
@@ -247,6 +324,21 @@ mod status_api_tests {
         let defaults = SteamVrStatus::default();
         assert!(defaults.gesture_locked);
         assert!(!defaults.input_blocked);
+        assert!(!defaults.input_block.manifest_ok);
+    }
+
+    #[test]
+    fn input_block_status_unsupported_and_not_probed() {
+        let unsupported = super::InputBlockStatus::unsupported_build();
+        assert!(unsupported.experimental_message.contains("当前构建不支持"));
+        assert!(!unsupported.manifest_ok);
+        assert!(!unsupported.app_registered);
+        assert!(!unsupported.bindings_ok);
+
+        let probed = super::InputBlockStatus::not_probed();
+        assert!(probed.experimental_message.contains("尚未检测"));
+        assert!(probed.manifest_message.contains("尚未检测"));
+        assert_ne!(unsupported, probed);
     }
 
     #[test]

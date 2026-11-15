@@ -706,7 +706,7 @@ pub fn build(config: &AppConfig) -> SettingsSchema {
                     config,
                     "output.steamvr.gesture.block_game_input",
                     "移动时屏蔽游戏输入",
-                    "本期（3C）不生效；需后续 Input 2.0（3A）与 SteamVR 实验设置。即便开启也只屏蔽 grip/trigger，摇杆/菜单仍传给游戏。",
+                    "开启后仅在拖动时尝试屏蔽游戏 grip/trigger（摇杆/菜单仍传给游戏）。需要 SteamVR → 设置 → 开发者 → Enable global input from overlays (experimental)；本应用只检测并提示该开关，不会一键修改 SteamVR 全局设置。初始化失败时自动降级为仅手势移动。",
                 ),
             ],
         },

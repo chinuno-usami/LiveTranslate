@@ -1,0 +1,54 @@
+{
+  "actions": [
+    {
+      "name": "/actions/move/in/grip_left",
+      "type": "boolean"
+    },
+    {
+      "name": "/actions/move/in/grip_right",
+      "type": "boolean"
+    },
+    {
+      "name": "/actions/move/in/trigger_left",
+      "type": "boolean"
+    },
+    {
+      "name": "/actions/move/in/trigger_right",
+      "type": "boolean"
+    }
+  ],
+  "action_sets": [
+    {
+      "name": "/actions/move",
+      "usage": "leftright"
+    }
+  ],
+  "default_bindings": [
+    {
+      "controller_type": "knuckles",
+      "binding_url": "bindings/knuckles.json"
+    },
+    {
+      "controller_type": "vive_controller",
+      "binding_url": "bindings/vive_controller.json"
+    },
+    {
+      "controller_type": "oculus_touch",
+      "binding_url": "bindings/oculus_touch.json"
+    },
+    {
+      "controller_type": "holographic_controller",
+      "binding_url": "bindings/holographic_controller.json"
+    }
+  ],
+  "localization": [
+    {
+      "language_tag": "en_US",
+      "/actions/move": "LiveTranslate Move",
+      "/actions/move/in/grip_left": "Left Grip",
+      "/actions/move/in/grip_right": "Right Grip",
+      "/actions/move/in/trigger_left": "Left Trigger",
+      "/actions/move/in/trigger_right": "Right Trigger"
+    }
+  ]
+}

@@ -403,6 +403,7 @@ impl SharedState {
         let (language_tx, language_rx) = watch::channel(language);
         let (translate_tx, translate_rx) = watch::channel(config.translate.enabled);
         let outputs = OutputManager::new(&config.output);
+        outputs.set_steamvr_active_config_path(config_path.clone());
         let sources = SourceRegistry::from_config(&config);
         let degraded_warning = if config_degraded {
             startup_warning.clone()
@@ -523,7 +524,8 @@ impl SharedState {
     }
 
     fn set_config_path(&self, path: Option<PathBuf>) {
-        *self.config_path.write().unwrap_or_else(|e| e.into_inner()) = path;
+        *self.config_path.write().unwrap_or_else(|e| e.into_inner()) = path.clone();
+        self.outputs.set_steamvr_active_config_path(path);
     }
 
     /// 原子地读改写配置并同步落盘（全程持有 `config_update` 锁，防止并发浮窗命令乱序覆盖磁盘）

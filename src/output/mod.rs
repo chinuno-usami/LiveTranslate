@@ -6,6 +6,7 @@
 use crate::config::OutputConfig;
 use crate::subtitle::DisplayLine;
 use serde::Serialize;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -100,6 +101,11 @@ impl OutputManager {
     /// 立即同步手势锁定到 VR sink（配置落盘由调用方负责）。
     pub fn set_steamvr_gesture_locked(&self, locked: bool) {
         self.steamvr.set_gesture_locked(locked);
+    }
+
+    /// 同步活动配置路径到 SteamVR sink（3A 资源解压：便携/默认/回退）。
+    pub fn set_steamvr_active_config_path(&self, path: Option<PathBuf>) {
+        self.steamvr.set_active_config_path(path);
     }
 
     pub fn shutdown(&self) {

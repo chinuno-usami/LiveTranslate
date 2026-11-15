@@ -5,6 +5,10 @@
 //!
 //! 3C 手势：legacy `GetControllerStateWithPose` + `gesture::GestureState`；
 //! `config_epoch` 与内容 `revision` 分离；松手经 `pending_pose` 通知主线程持久化。
+//!
+//! 3A 输入屏蔽：仅当 `gesture.block_game_input` 且进入拖动时懒初始化
+//! [`super::input::InputBlocker`]，以 overlay-global `nPriority` 提交；
+//! 松手 / cancel / Dashboard / 断开 / 异常路径显式归零；失败降级 3C。
 
 use super::gesture::{
     self, apply_hmd_delta, apply_world_delta, clamp_hmd_offsets, clamp_world_position,
@@ -12,8 +16,9 @@ use super::gesture::{
     ray_plane_intersection, GestureFrameInput, GestureState, GestureTransition, GrabChord,
     HmdOffsets, Mat3x4, MAX_FRAME_DELTA_M, PANEL_HIT_MARGIN_FRAC,
 };
+use super::input::InputBlocker;
 use super::render;
-use super::{SteamVrPoseUpdate, SteamVrStatus};
+use super::{InputBlockStatus, SteamVrPoseUpdate, SteamVrStatus};
 use crate::config::SteamVrConfig;
 use crate::subtitle::DisplayLine;
 use openvr::overlay::{OverlayHandle, VROverlayError};
@@ -21,10 +26,11 @@ use openvr::pose::Matrix3x4;
 use openvr::system::Event;
 use openvr::tracked_device_index;
 use openvr::{
-    button_id, ApplicationType, ControllerState, InitError, TrackedControllerRole,
+    button_id, ApplicationType, Context, ControllerState, InitError, TrackedControllerRole,
     TrackingUniverseOrigin,
 };
 use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -48,6 +54,8 @@ struct Shared {
     lines: Mutex<Vec<DisplayLine>>,
     config: Mutex<SteamVrConfig>,
     status: Mutex<SteamVrStatus>,
+    /// 活动配置文件路径（便携=exe 旁 config；默认=OS 用户配置）；3A 资源解压用
+    active_config_path: Mutex<Option<PathBuf>>,
     /// 内容/显示属性 revision：`publish` 与非手势 `apply_config` 递增；拖动不靠它驱动 transform
     revision: AtomicU64,
     /// 配置世代：仅 `apply_config` 递增；拖动中途变化则取消且不写回
@@ -86,10 +94,12 @@ impl SteamVrSink {
                 },
                 gesture_locked: config.gesture.locked,
                 dragging: false,
-                // 3C：不依赖 Input 2.0，恒不屏蔽
+                // 默认不屏蔽；仅 block_game_input + 拖动中成功提交高优时置 true
                 input_blocked: false,
                 input_block_message: String::new(),
+                input_block: InputBlockStatus::not_probed(),
             }),
+            active_config_path: Mutex::new(None),
             revision: AtomicU64::new(1),
             config_epoch: AtomicU64::new(1),
             pending_pose: Mutex::new(None),
@@ -149,12 +159,18 @@ impl SteamVrSink {
             let mut status = lock(&self.shared.status);
             status.enabled = config.enabled;
             status.gesture_locked = config.gesture.locked;
-            // 3C：input_blocked 恒 false（3A 未接入）
-            status.input_blocked = false;
-            status.input_block_message.clear();
+            // 关闭 3A 时清屏蔽声明；开启时由 VR 线程在拖动中更新
+            if !config.gesture.block_game_input {
+                status.input_blocked = false;
+                status.input_block_message.clear();
+                status.input_block = InputBlockStatus::not_probed();
+            }
             if !config.enabled {
                 status.connected = false;
                 status.dragging = false;
+                status.input_blocked = false;
+                status.input_block_message.clear();
+                status.input_block = InputBlockStatus::not_probed();
                 status.message = "未启用".to_string();
             } else if !status.connected && status.message == "未启用" {
                 status.message = "正在连接 SteamVR".to_string();
@@ -215,6 +231,11 @@ impl SteamVrSink {
         }
     }
 
+    /// 同步活动配置路径，供 3A 资源解压（便携 zip = exe 旁 config）。
+    pub fn set_active_config_path(&self, path: Option<PathBuf>) {
+        *lock(&self.shared.active_config_path) = path;
+    }
+
     pub fn shutdown(&mut self) -> Option<JoinHandle<()>> {
         self.take_thread()
     }
@@ -263,6 +284,209 @@ fn set_dragging(shared: &Shared, dragging: bool) {
     };
     if changed {
         shared.notify.notify_one();
+    }
+}
+
+fn set_input_block_status(
+    shared: &Shared,
+    blocked: bool,
+    message: impl Into<String>,
+    detail: Option<&InputBlockStatus>,
+) {
+    let changed = {
+        let mut status = lock(&shared.status);
+        let message = message.into();
+        let mut changed = status.input_blocked != blocked || status.input_block_message != message;
+        status.input_blocked = blocked;
+        status.input_block_message = message;
+        if let Some(detail) = detail {
+            if status.input_block != *detail {
+                status.input_block = detail.clone();
+                changed = true;
+            }
+        }
+        changed
+    };
+    if changed {
+        shared.notify.notify_one();
+    }
+}
+
+fn diagnostics_to_status(diag: &super::input::InputBlockDiagnostics) -> InputBlockStatus {
+    InputBlockStatus {
+        experimental_enabled: diag.experimental_enabled,
+        experimental_message: diag.experimental_message.clone(),
+        manifest_ok: diag.manifest_ok,
+        manifest_message: diag.manifest_message.clone(),
+        app_registered: diag.app_registered,
+        app_register_message: diag.app_register_message.clone(),
+        bindings_ok: diag.bindings_ok,
+        bindings_message: diag.bindings_message.clone(),
+    }
+}
+
+/// 会话内 3A 屏蔽控制器：懒初始化、拖动高优、退出归零（Drop 保底）。
+struct InputBlockController<'a> {
+    ctx: &'a Context,
+    shared: &'a Shared,
+    blocker: Option<InputBlocker>,
+    init_error: Option<String>,
+    last_epoch: u64,
+    currently_blocked: bool,
+}
+
+impl<'a> InputBlockController<'a> {
+    fn new(ctx: &'a Context, shared: &'a Shared) -> Self {
+        Self {
+            ctx,
+            shared,
+            blocker: None,
+            init_error: None,
+            last_epoch: 0,
+            currently_blocked: false,
+        }
+    }
+
+    fn note_epoch(&mut self, epoch: u64) {
+        if self.last_epoch != epoch {
+            self.last_epoch = epoch;
+            // 配置变更后允许重新 try_init（路径 / 实验设置可能已变）
+            if self.blocker.is_none() {
+                self.init_error = None;
+            }
+        }
+    }
+
+    fn ensure_blocker(&mut self) -> Result<&mut InputBlocker, String> {
+        if self.blocker.is_none() {
+            if let Some(err) = &self.init_error {
+                return Err(err.clone());
+            }
+            let path = lock(&self.shared.active_config_path).clone();
+            match InputBlocker::try_init(self.ctx, path.as_deref()) {
+                Ok(blocker) => self.blocker = Some(blocker),
+                Err(err) => {
+                    self.init_error = Some(err.clone());
+                    return Err(err);
+                }
+            }
+        }
+        self.blocker
+            .as_mut()
+            .ok_or_else(|| "InputBlocker 未初始化".to_string())
+    }
+
+    /// 拖动中：提交 overlay-global priority；失败则 `input_blocked=false` 并写可读原因。
+    fn apply_blocking(&mut self) {
+        if let Err(err) = self.ensure_blocker().map(|_| ()) {
+            self.currently_blocked = false;
+            let detail = failure_detail(&err);
+            set_input_block_status(self.shared, false, err, Some(&detail));
+            return;
+        }
+        // 未屏蔽成功时刷新实验开关（用户可能中途打开）；成功后不再反复读 IVRSettings
+        if !self.currently_blocked {
+            if let Some(blocker) = self.blocker.as_mut() {
+                let _ = blocker.refresh_settings(self.ctx);
+            }
+        }
+        let mut input = match self.ctx.input() {
+            Ok(input) => input,
+            Err(e) => {
+                self.currently_blocked = false;
+                let msg = format!("获取 IVRInput 失败: {e:?}");
+                let detail = failure_detail(&msg);
+                set_input_block_status(self.shared, false, msg, Some(&detail));
+                return;
+            }
+        };
+        let Some(blocker) = self.blocker.as_mut() else {
+            return;
+        };
+        match blocker.update_blocking(&mut input) {
+            Ok(()) => {
+                let detail = diagnostics_to_status(blocker.diagnostics());
+                let summary = blocker.diagnostics().summary();
+                let msg = if summary.is_empty() {
+                    "移动中已屏蔽游戏 grip/trigger".to_string()
+                } else {
+                    format!("移动中已屏蔽游戏 grip/trigger；{summary}")
+                };
+                self.currently_blocked = true;
+                set_input_block_status(self.shared, true, msg, Some(&detail));
+            }
+            Err(err) => {
+                self.currently_blocked = false;
+                let detail = if let Some(blocker) = self.blocker.as_ref() {
+                    diagnostics_to_status(blocker.diagnostics())
+                } else {
+                    failure_detail(&err)
+                };
+                set_input_block_status(self.shared, false, err, Some(&detail));
+            }
+        }
+    }
+
+    /// 退出移动：显式 nPriority 归零；不再声称已屏蔽。
+    fn clear_blocking(&mut self) {
+        let needs_clear = self
+            .blocker
+            .as_ref()
+            .map(|b| b.priority_active())
+            .unwrap_or(false)
+            || self.currently_blocked
+            || lock(&self.shared.status).input_blocked;
+        if !needs_clear {
+            return;
+        }
+        if let Some(blocker) = self.blocker.as_mut() {
+            match self.ctx.input() {
+                Ok(mut input) => {
+                    if let Err(e) = blocker.clear_priority(&mut input) {
+                        tracing::warn!("SteamVR clear_priority 失败: {e}");
+                    }
+                }
+                Err(e) => tracing::warn!("SteamVR clear_priority 时获取 IVRInput 失败: {e:?}"),
+            }
+        }
+        let detail = self
+            .blocker
+            .as_ref()
+            .map(|b| diagnostics_to_status(b.diagnostics()))
+            .or_else(|| self.init_error.as_ref().map(|e| failure_detail(e)))
+            .unwrap_or_else(InputBlockStatus::not_probed);
+        let msg = self
+            .init_error
+            .clone()
+            .or_else(|| {
+                self.blocker
+                    .as_ref()
+                    .map(|b| b.diagnostics().summary())
+                    .filter(|s| !s.is_empty())
+            })
+            .unwrap_or_default();
+        self.currently_blocked = false;
+        set_input_block_status(self.shared, false, msg, Some(&detail));
+    }
+}
+
+/// 初始化失败时把可读错误填进明细字段，便于设置页展示。
+fn failure_detail(err: &str) -> InputBlockStatus {
+    let mut detail = InputBlockStatus::not_probed();
+    detail.manifest_ok = false;
+    detail.manifest_message = err.to_string();
+    detail.app_registered = false;
+    detail.app_register_message = err.to_string();
+    detail.bindings_ok = false;
+    detail.bindings_message = err.to_string();
+    detail.experimental_enabled = None;
+    detail.experimental_message = err.to_string();
+    detail
+}
+
+impl Drop for InputBlockController<'_> {
+    fn drop(&mut self) {
+        self.clear_blocking();
     }
 }
 
@@ -631,6 +855,8 @@ fn session(
     let mut last_tex_h: usize = 512;
     let mut pointer_dragging_tex = false;
     let mut panel_visible = false;
+    // 3A：Drop 时归零 priority，覆盖异常 / 提前 return
+    let mut input_block = InputBlockController::new(&context, shared);
 
     loop {
         if stop.load(Ordering::SeqCst) {
@@ -638,11 +864,12 @@ fn session(
             if let Some(ph) = pointer_handle {
                 let _ = overlay.set_visibility(ph, false);
             }
-            // 断开：取消拖动，不写回
+            // 断开：取消拖动并归零 3A priority，不写回
             if gesture.is_dragging() {
                 let _ = gesture.cancel();
                 set_dragging(shared, false);
             }
+            input_block.clear_blocking();
             return Ok(());
         }
 
@@ -656,6 +883,7 @@ fn session(
                     let _ = gesture.cancel();
                     set_dragging(shared, false);
                 }
+                input_block.clear_blocking();
                 return Ok(());
             }
         }
@@ -665,10 +893,15 @@ fn session(
         let revision = shared.revision.load(Ordering::SeqCst);
         let config_epoch = shared.config_epoch.load(Ordering::SeqCst);
         let shared_config = lock(&shared.config).clone();
+        input_block.note_epoch(config_epoch);
 
         // 非拖动时同步主线程配置；拖动中保留 live，仅靠 epoch 取消
         if !gesture.is_dragging() {
             live_config = shared_config.clone();
+            // 关闭 3A 时确保不残留高优（例如设置页关掉 block_game_input）
+            if !live_config.gesture.block_game_input {
+                input_block.clear_blocking();
+            }
         }
 
         let dashboard_open = overlay.is_dashboard_visible();
@@ -714,8 +947,9 @@ fn session(
             if tr == GestureTransition::DragCancelled {
                 set_dragging(shared, false);
             }
-            // 取消不写回：丢弃拖动中的 live 偏移
+            // 取消不写回：丢弃拖动中的 live 偏移；3A 归零
             live_config = shared_config.clone();
+            input_block.clear_blocking();
         }
 
         let grab = GrabChord::parse(&live_config.gesture.grab).unwrap_or(GrabChord::BothGrips);
@@ -744,6 +978,9 @@ fn session(
         match transition {
             GestureTransition::DragStarted => {
                 set_dragging(shared, true);
+                if live_config.gesture.block_game_input {
+                    input_block.apply_blocking();
+                }
                 haptic(
                     &system,
                     controllers.right_index.or(controllers.left_index),
@@ -756,6 +993,7 @@ fn session(
                 *lock(&shared.pending_pose) = Some(pose);
                 let _ = gesture.take_drag_origins();
                 set_dragging(shared, false);
+                input_block.clear_blocking();
                 haptic(
                     &system,
                     controllers.right_index.or(controllers.left_index),
@@ -766,9 +1004,15 @@ fn session(
             }
             GestureTransition::DragCancelled => {
                 set_dragging(shared, false);
+                input_block.clear_blocking();
                 live_config = shared_config.clone();
             }
             GestureTransition::None => {}
+        }
+
+        // 拖动中每帧刷新高优 action set（OpenVR 需持续 UpdateActionState）
+        if gesture.is_dragging() && live_config.gesture.block_game_input {
+            input_block.apply_blocking();
         }
 
         // 拖动中：每帧用命中增量更新 live_config（不写 Shared.config）

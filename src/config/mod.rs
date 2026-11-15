@@ -426,7 +426,7 @@ pub struct SteamVrConfig {
     pub swap_red_blue: bool,
     #[serde(default = "default_reconnect_interval_secs")]
     pub reconnect_interval_secs: u64,
-    /// 手势移动（3C 运行时；`block_game_input` 本期不生效）
+    /// 手势移动（3C 运行时；`block_game_input` 开启时尝试 3A 输入屏蔽）
     #[serde(default)]
     pub gesture: GestureConfig,
 }

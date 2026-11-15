@@ -1,6 +1,7 @@
-use super::{SteamVrPoseUpdate, SteamVrStatus};
+use super::{InputBlockStatus, SteamVrPoseUpdate, SteamVrStatus};
 use crate::config::SteamVrConfig;
 use crate::subtitle::DisplayLine;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::thread::JoinHandle;
 
@@ -16,6 +17,12 @@ impl SteamVrSink {
         } else {
             "SteamVR 仅支持 Windows".to_string()
         };
+        let input_block = InputBlockStatus::unsupported_build();
+        let input_block_message = if config.gesture.block_game_input {
+            input_block.experimental_message.clone()
+        } else {
+            String::new()
+        };
         Self {
             status: SteamVrStatus {
                 available: false,
@@ -24,9 +31,10 @@ impl SteamVrSink {
                 message,
                 gesture_locked: config.gesture.locked,
                 dragging: false,
-                // 3C：不屏蔽游戏输入；非 Windows / 标准版无运行时
+                // 非 Windows / 标准版：永不声称已屏蔽
                 input_blocked: false,
-                input_block_message: String::new(),
+                input_block_message,
+                input_block,
             },
             notify,
         }
@@ -42,9 +50,18 @@ impl SteamVrSink {
             self.status.gesture_locked = config.gesture.locked;
             changed = true;
         }
-        // 3C：input_blocked 恒 false
+        // 非 Windows / 标准版：input_blocked 恒 false；状态只提示不支持
         if self.status.input_blocked {
             self.status.input_blocked = false;
+            changed = true;
+        }
+        let expected_msg = if config.gesture.block_game_input {
+            self.status.input_block.experimental_message.clone()
+        } else {
+            String::new()
+        };
+        if self.status.input_block_message != expected_msg {
+            self.status.input_block_message = expected_msg;
             changed = true;
         }
         if changed {
@@ -70,6 +87,8 @@ impl SteamVrSink {
             self.notify.notify_one();
         }
     }
+
+    pub fn set_active_config_path(&self, _path: Option<PathBuf>) {}
 
     pub fn shutdown(&mut self) -> Option<JoinHandle<()>> {
         None

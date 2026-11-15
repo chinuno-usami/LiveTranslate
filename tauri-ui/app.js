@@ -265,11 +265,20 @@ function formatSteamVrStatus(sv) {
   } else {
     parts.push('位置可移动');
   }
-  // 3C 下 input_blocked 恒 false；仅在真屏蔽时才声称，避免误导
+  // 仅在真屏蔽时才声称，避免 3C/失败路径误导
   if (sv.input_blocked) {
     parts.push('游戏输入已屏蔽');
   }
   return `SteamVR: ${parts.join(' · ')}`;
+}
+
+function steamVrStatusTitle(sv) {
+  if (!sv) return '';
+  const msg = String(sv.input_block_message || '').trim();
+  if (sv.input_blocked) {
+    return msg || '移动中已屏蔽游戏 grip/trigger';
+  }
+  return msg;
 }
 
 function updateVrLockButton(sv) {
@@ -355,7 +364,8 @@ function applyOutputStatus(payload) {
   }
   lastOutputSummary = messages.join(' / ');
   if (lastOutputSummary) {
-    els.statusText.title = lastOutputSummary;
+    const detail = steamVrStatusTitle(payload.steamvr);
+    els.statusText.title = detail ? `${lastOutputSummary}\n${detail}` : lastOutputSummary;
   } else if (
     els.statusText.title === '' ||
     els.statusText.title.startsWith('SteamVR:') ||
@@ -901,6 +911,7 @@ async function bindActions() {
           ...(lastSteamVrStatus || { enabled: true, connected: false, message: '' }),
           gesture_locked: next,
           dragging: false,
+          // 锁定切换不声称屏蔽；真实状态由 output-status 校正
           input_blocked: false,
         };
         updateVrLockButton(lastSteamVrStatus);
