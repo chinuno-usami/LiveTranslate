@@ -305,6 +305,12 @@ jobs:
             echo
             echo '---'
             echo
+            if [ -f docs/UPGRADING.md ]; then
+              cat docs/UPGRADING.md
+              echo
+              echo '---'
+              echo
+            fi
             cat "${CHANGELOG_PATH}"
           } > RELEASE_BODY.md
 

@@ -30,7 +30,8 @@ git push origin v0.1.0
    - macOS → **`LiveTranslate.app`**（ad-hoc 签名）+ `zip`
    - 各包内均附 `BUILD_FLAVORS.md`
 3. 用 [git-cliff](https://git-cliff.org) 按提交信息生成本版本的 Release 说明
-4. Release 说明开头拼接 `docs/BUILD_FLAVORS.md`，明确标准版 / Full 版差异
+4. Release 说明开头拼接 `docs/BUILD_FLAVORS.md`（标准版 / Full 版差异），
+   随后拼接 `docs/UPGRADING.md`（本版本的升级步骤与行为变化），最后是 git-cliff 生成的更新日志
 5. 创建 GitHub Release 并上传全部产物
 
 ## Release 说明（更新日志）
@@ -48,6 +49,8 @@ Release 页面上的说明由 `cliff.toml` 根据 Conventional Commits 自动生
 
 不符合 `type: 描述` 格式的提交不会出现在说明里，提交时请保持这个格式。
 `feat(ui): ...` 这样的 scope 会以粗体前缀显示。
+
+打 tag 前记得更新 `docs/UPGRADING.md`（升级步骤 / 行为变化 / 已知限制），否则 Release 说明里只有自动生成的条目。
 
 打 tag 前可以在本地预览下一版的说明：
 
