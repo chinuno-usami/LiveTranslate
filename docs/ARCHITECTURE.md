@@ -27,7 +27,8 @@ livetranslate/
 ├── src/
 │   ├── main.rs                    # 程序入口 / Tauri 命令 / SharedState / SourceRegistry
 │   ├── app.rs                     # 单源流水线 run_source / 控制台与设备枚举辅助
-│   ├── tray.rs                    # 系统托盘菜单与全局快捷键
+│   ├── tray.rs                    # 系统托盘菜单与全局快捷键注册（配置驱动、可热重注册）
+│   ├── hotkeys.rs                 # 快捷键动作表 / 状态项 / 与配置字段映射
 │   ├── config/                    # 配置管理（结构体 / 写入 / schema / 配置档）
 │   │   ├── mod.rs
 │   │   ├── writer.rs              # toml_edit 定点写入 + 先校验后落盘 + 写入串行化
@@ -35,8 +36,14 @@ livetranslate/
 │   │   └── profiles.rs            # 多配置档
 │   ├── output/                    # 统一输出层
 │   │   ├── mod.rs                 # OutputManager + 状态通知
-│   │   ├── osc.rs                 # VRChat Chatbox（组包/限流/typing）
+│   │   ├── osc.rs                 # VRChat Chatbox（组包/限流/typing/通道变空清屏）
 │   │   └── steamvr/               # Overlay 线程 + cosmic-text 渲染 + stub
+│   │       ├── imp.rs             # Windows 真实实现（渲染/上传/手柄轮询/拖动状态机）
+│   │       ├── gesture.rs         # 手势纯函数：矩阵/射线/增量/状态机/VR 内解锁（跨平台可测）
+│   │       ├── input.rs           # 3A：SteamVR Input 2.0 overlay-global priority 屏蔽 grip/trigger
+│   │       ├── assets.rs          # actions.json / vrmanifest / 默认 bindings 内嵌 + 版本化解压
+│   │       ├── render.rs          # cosmic-text 文本渲染
+│   │       └── stub.rs            # 非 Windows / 未启用 feature 的空实现
 │   ├── error.rs                   # 错误类型定义
 │   │
 │   ├── audio/                     # 音频采集与分段模块

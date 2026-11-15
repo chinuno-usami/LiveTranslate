@@ -211,16 +211,17 @@ width_m = 1.6
 distance_m = 1.6
 height_offset_m = -0.28
 horizontal_offset_m = 0.0       # hmd 水平偏移（正数向右）
+application_type = "background"  # background / overlay（后者才能设 overlay-global priority）
 font_size_px = 34
 line_alphas = [1.0, 0.72, 0.48]
 
-[output.steamvr.gesture]        # 手柄移动字幕面板（3C：legacy 轮询，不依赖 Input 2.0）
+[output.steamvr.gesture]        # 手柄移动字幕面板（3C 拖动 + 可选 3A 输入屏蔽）
 enabled = false                 # 默认关；开启后轮询手柄做射线抓取
 locked = true                   # 默认锁定，避免误触；设置页 / 浮窗 / 快捷键解锁
-unlock_via_vr_gesture = false   # VR 内双手解锁可选，默认关
+unlock_via_vr_gesture = false   # VR 内解锁：指向面板 + 双手 trigger 按住 1.5s，默认关
 grab = "both_grips"             # both_grips 须 pointer 命中面板才进入 arming
-pointer = true                  # 首版纳入射线命中光标
-block_game_input = false        # 本期（3C）不屏蔽游戏输入
+pointer = true                  # 射线命中光标
+block_game_input = false        # 拖动期屏蔽游戏 grip/trigger（需 SteamVR 实验设置）
 
 [hotkeys]                       # 全局快捷键；留空 = 禁用
 show = "CmdOrCtrl+Alt+S"
@@ -315,13 +316,15 @@ send_typing = true
 
 #### 手柄移动字幕面板（手势 3C）
 
-- 开启 `output.steamvr.gesture.enabled` 后，用 **legacy 手柄轮询**（`GetControllerStateWithPose`）射线抓取移动面板；**不依赖** `actions.json` / SteamVR Input 2.0，`block_game_input=false` 时也可完整拖动。
+- 开启 `output.steamvr.gesture.enabled` 后，用 **legacy 手柄轮询**（`GetControllerStateWithPose`）射线抓取移动面板；拖动本身**不依赖** `actions.json` / SteamVR Input 2.0。
 - **默认锁定**（`locked = true`）：抓取无效。解锁方式（均写回配置）：
   1. 设置页 → SteamVR → gesture → 取消锁定
   2. 浮窗工具栏 **VR 位置:锁定/可移动**（Full + 已启用 Overlay）
   3. 全局快捷键 `toggle_steamvr_lock`（默认未绑定，需在设置页自行填写）
-  - VR 内双手解锁（`unlock_via_vr_gesture`）为可选，**默认关闭**
+  4. 可选 VR 内解锁：`unlock_via_vr_gesture = true` 后，用右手射线指向**已显示**的面板并同时按住双手 trigger 1.5 秒（触发后 1 秒冷却、带一次震动）
 - 默认 `grab = "both_grips"`：**双手 grip 且射线 pointer 命中面板** 才进入 arming；松手后位置 clamp 并写回配置。
+- `grab = "right_grip"` / `"right_trigger"` 为单手模式，不要求左手柄参与（左手柄充电/待机时仍可用）。
+- `mode = "near"` 时按「手柄到面板平面的投影点」判半径，适合面板在手臂范围内。
 - `horizontal_offset_m`（hmd 水平偏移，右正）旧配置缺省 `0`，与 v0.2 行为一致。
 
 **限制与排错（手势）：**
@@ -331,8 +334,27 @@ send_typing = true
 | SteamVR Dashboard 打开时拖不动 | 预期行为：Dashboard 接管输入，此时取消拖动且不写回 |
 | 面板已淡出/隐藏抓不到 | 先产生一条字幕让面板重新显示，再抓取（本期无 VR 内召唤） |
 | 空手 / 无手柄追踪 | 不支持；需要手柄姿态，不做手部追踪 |
-| 拖动时游戏仍收到 grip | 预期：本期 3C **不屏蔽**游戏输入；`block_game_input` 需后续 Input 2.0（3A）才生效 |
-| 解锁后仍拖不动 | 确认 `enabled=true`、已解锁、pointer 命中面板、双手 grip；检查输出状态是否「位置可移动」 |
+| 拖动时游戏仍收到 grip | 未开启 `block_game_input` 时的预期行为；开启后见下方「拖动期屏蔽游戏输入（3A）」 |
+| 解锁后仍拖不动 | 确认 `enabled=true`、已解锁、pointer 命中面板、grab 组合对应的键按下；检查输出状态是否「位置可移动」 |
+
+#### 拖动期屏蔽游戏输入（3A，可选）
+
+`block_game_input = true` 时，**仅在拖动期间**用 SteamVR Input 2.0 的 overlay-global action set priority
+压制游戏侧的 grip/trigger（摇杆、菜单等未绑定的输入照常传给游戏）。前置条件与限制：
+
+1. SteamVR → **设置 → 开发者 → Enable global input from overlays (experimental)** 需要打开
+   （`steamvr/globalActionSetPriority`）。本程序只**读取并提示**，不会修改这个全局设置。
+2. 首次进入拖动时才懒初始化：解压内嵌 `actions.json` / `steamvr.vrmanifest` / 默认 bindings 到
+   `<配置目录>/steamvr/<版本>/`，注册应用清单（临时注册，退出后不残留），再提交高优 action set。
+3. 任一步失败都**自动降级为仅手势移动**（3C），`设置页 → SteamVR Overlay` 底部的「输入屏蔽状态（只读）」
+   会显示实验设置 / action manifest / 应用注册 / 默认 binding 四项的结果和原因；失败后每 5 秒自动重试一次。
+4. 松手、取消、断开、Dashboard、线程退出都会显式把 priority 归零，不残留卡键。
+5. 若状态里提示拿不到 overlay-global priority（或 `UpdateActionState` 报优先级错误），
+   把 `output.steamvr.application_type` 改成 `"overlay"` 再**重启应用**复测
+   （OpenVR 每进程只能初始化一次；注意 Overlay 类型会让 SteamVR 认为本程序是覆盖层应用）。
+
+> 已知限制：本特性基于 overlay-global priority，需要真机验证具体手柄的 binding 加载情况；
+> 若某项显示异常，先确认 SteamVR 实验开关与手柄绑定页（SteamVR → 设置 → 控制器 → 管理控制器绑定）。
 
 ### VRChat OSC Chatbox（Windows Full 版 / 源码启用 osc）
 
@@ -823,7 +845,7 @@ OPTIONS:
   并在状态栏 / 日志里带上具体原因。
 - 🟡 **能量 VAD 与背景音乐**：默认的 `energy` VAD 无法区分高能量背景音乐与人声；游戏/视频回环场景建议切换 `vad.backend = "silero"`（需 ONNX Runtime 动态库，Release 包已内置）
 - 🟡 **SteamVR Overlay 平台限制**：`output.steamvr` 依赖 OpenVR 运行时，仅在 Windows Full 版可用
-- 🟡 **SteamVR 手势移动（3C）**：不支持无手柄手追；Dashboard 打开或面板隐藏时不可拖；本期不屏蔽游戏输入（见上文排错表）
+- 🟡 **SteamVR 手势移动（3C/3A）**：不支持无手柄手追；Dashboard 打开或面板隐藏时不可拖；`block_game_input` 需 SteamVR 开发者实验开关，失败会自动降级并给出只读状态提示
 - 🟡 **点击穿透状态下的交互**：开启点击穿透后，浮窗按钮不能再点击，需用托盘菜单或快捷键 `Ctrl/⌘+Alt+T` 操作
 
 ## 下一步计划
@@ -874,7 +896,7 @@ WARN: No input devices found
 - **面板隐藏**：`hide_on_silence_secs` 淡出后无法命中——先说话/出字幕让面板显示。
 - **both_grips**：双手 grip **且**射线命中面板（pointer）才开始拖；只按一边或未瞄准面板无效。
 - **无手追**：需要手柄；Quest 空手追踪等不支持。
-- **游戏仍收到按键**：3C 不屏蔽游戏输入属预期；勿把 `block_game_input` 当成已生效。
+- **游戏仍收到按键**：确认已开 `block_game_input`、SteamVR 实验开关已打开，并看设置页「输入屏蔽状态（只读）」里四项是否都为「正常」；失败会自动降级为仅手势移动。
 
 ## 贡献
 

@@ -54,7 +54,20 @@ LiveTranslate 从 v0.2 开始提供两种构建风味。两者**版本号一致�
   ```powershell
   cargo build --release --features custom-protocol,extras
   ```
-  Full 版需要 CMake + MSVC（`openvr-sys` 静态链接 OpenVR），因此**只能在本机 Windows 或 CI 的 Windows runner 上构建**；macOS 上的交叉编译脚本只产出标准版。
+  Full 版需要 CMake + MSVC（`openvr-sys` 静态链接 OpenVR），因此**只能在 Windows 或 CI 的 Windows runner 上构建/链接**；
+  macOS 上的交叉编译脚本只产出标准版。
+
+### 在 macOS/Linux 上类型检查 Windows 专属代码
+
+`src/output/steamvr/{imp,input}.rs` 只在 `cfg(windows)` + `steamvr` 下编译，普通 `cargo check` 覆盖不到。
+改这两个文件后建议跑一次交叉 clippy（需要 `cargo install cargo-xwin`）：
+
+```bash
+cargo xwin clippy --all-targets --target x86_64-pc-windows-msvc \
+  --no-default-features --features custom-protocol,extras -- -D warnings
+```
+
+只能做类型检查/静态分析，不能产出可运行产物，也不能替代 Windows 真机上的 SteamVR 验证。
 
 ## 已知限制
 

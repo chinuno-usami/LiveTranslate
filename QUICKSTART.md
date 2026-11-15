@@ -212,9 +212,13 @@ curl http://127.0.0.1:8765/v1/models
 **手柄移动面板（手势 3C，可选）：**
 
 1. 设置页开启 `gesture.enabled`；默认 `locked=true`，需先解锁再拖。
-2. 解锁：设置页 / 浮窗「VR 位置:锁定/可移动」/ 快捷键 `toggle_steamvr_lock`（默认桌面侧解锁；VR 内解锁默认关）。
-3. 默认双手 grip + 射线命中面板才拖动；松手后位置写入配置。
-4. **排错**：Dashboard 打开不可拖；面板隐藏时先出字幕再抓；不支持空手追踪；本期 **不** 屏蔽游戏输入。
+2. 解锁：设置页 / 浮窗「VR 位置:锁定/可移动」/ 快捷键 `toggle_steamvr_lock`；
+   可选 VR 内解锁 `unlock_via_vr_gesture = true`（指向已显示的面板 + 双手 trigger 按住 1.5s，默认关）。
+3. 默认双手 grip + 射线命中面板才拖动；松手后位置 clamp 并写入配置。
+4. **游戏内输入屏蔽（3A，可选）**：`block_game_input = true` 时仅在拖动期压制游戏 grip/trigger，
+   需要 SteamVR → 设置 → 开发者 → *Enable global input from overlays (experimental)*；
+   失败会自动降级为仅手势移动，设置页「输入屏蔽状态（只读）」会列出原因。
+5. **排错**：Dashboard 打开不可拖；面板隐藏时先出字幕再抓；不支持空手追踪。
 
 ### 标准版 vs Full 版
 
