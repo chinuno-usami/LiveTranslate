@@ -1342,6 +1342,13 @@ function bindHotkeysActions() {
   });
 }
 
+/**
+ * 浏览器 KeyboardEvent.code → Tauri(tao) accelerator 能解析的键名。
+ *
+ * tao 的 `KeyCode::from_str` 只认下面这些名字（`MINUS` / `EQUAL` / `NUMPADMULTIPLY`
+ * / `NUMPADDECIMAL` 都不在表里，写进去注册必然失败），所以这里只用它支持的拼写：
+ * 减号/等号用 `-` `=`，乘号/小数点/减号小键盘直接不提供（录制时会被拒绝）。
+ */
 function codeToHotkeyKey(code, key) {
   if (/^Key[A-Z]$/.test(code)) return code.slice(3);
   if (/^Digit[0-9]$/.test(code)) return code.slice(5);
@@ -1356,8 +1363,8 @@ function codeToHotkeyKey(code, key) {
     Semicolon: 'Semicolon',
     Quote: 'Quote',
     Backquote: 'Backquote',
-    Minus: 'Minus',
-    Equal: 'Equal',
+    Minus: '-',
+    Equal: '=',
     Enter: 'Enter',
     Space: 'Space',
     Tab: 'Tab',
@@ -1383,11 +1390,8 @@ function codeToHotkeyKey(code, key) {
     Numpad8: 'Numpad8',
     Numpad9: 'Numpad9',
     NumpadAdd: 'NumpadAdd',
-    NumpadSubtract: 'NumpadSubtract',
-    NumpadMultiply: 'NumpadMultiply',
     NumpadDivide: 'NumpadDivide',
-    NumpadDecimal: 'NumpadDecimal',
-    NumpadEnter: 'Enter',
+    NumpadEnter: 'NumpadEnter',
   };
   if (map[code]) return map[code];
   if (key && key.length === 1) return key.toUpperCase();
@@ -1502,12 +1506,12 @@ async function startHotkeyRecording(path) {
       return;
     }
     if (isModifierOnlyEvent(event)) return;
-    // 阻止 Space/Enter 激活按钮
-    if (event.key === ' ' || event.key === 'Enter') {
-      // still allow composing accelerator with Enter as key when modifiers present
-    }
     const accelerator = eventToAccelerator(event);
-    if (!accelerator) return;
+    if (!accelerator) {
+      // 例如小键盘乘号/小数点：tao 的 accelerator 解析器不认，直接拒绝而不是存进配置
+      setStatus('该键不支持作为全局快捷键，请换一个组合或 F1–F24', 'err');
+      return;
+    }
     const parts = accelerator.split('+');
     const key = parts[parts.length - 1];
     const hasMod = parts.length > 1;

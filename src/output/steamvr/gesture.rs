@@ -7,6 +7,12 @@ use std::time::Duration;
 /// 双手 grip 进入拖动前的按住时长。
 pub const ARMING_HOLD: Duration = Duration::from_millis(250);
 
+/// VR 内解锁组合（双手 trigger 同时按住）的时长。
+pub const UNLOCK_HOLD: Duration = Duration::from_millis(1500);
+
+/// VR 内解锁触发后的冷却，避免一次长按被判定成多次。
+pub const UNLOCK_COOLDOWN: Duration = Duration::from_millis(1000);
+
 /// 单帧世界位移上限（米），防止追踪丢失/近平行射线瞬移。
 pub const MAX_FRAME_DELTA_M: f32 = 0.25;
 
@@ -263,6 +269,11 @@ impl GrabChord {
         }
     }
 
+    /// 该组合是否需要左手柄参与（决定左手 tracking 失效时是否取消手势）。
+    pub fn needs_left_hand(self) -> bool {
+        matches!(self, Self::BothGrips)
+    }
+
     /// `both_grips` 必须 pointer 命中才算激活；单手模式只需对应键。
     pub fn is_active(
         self,
@@ -276,6 +287,59 @@ impl GrabChord {
             Self::RightGrip => right_grip,
             Self::RightTrigger => right_trigger,
         }
+    }
+}
+
+/// VR 内解锁组合状态机：双手 trigger 同时按住 1.5s，且 pointer 命中面板。
+///
+/// 独立于拖拽状态机：锁定时拖拽完全不被响应，但仍然可以只读轮询手柄来识别解锁。
+/// 触发后进入冷却，避免一次长按反复解锁。
+#[derive(Debug, Clone, Default)]
+pub struct UnlockGestureState {
+    hold_since: Option<Duration>,
+    last_fire: Option<Duration>,
+}
+
+impl UnlockGestureState {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// 组合中断时清理持续计时（冷却保留）。
+    pub fn reset(&mut self) {
+        self.hold_since = None;
+    }
+
+    /// 推进状态机；恰好完成一次长按时返回 `true`。
+    pub fn update(
+        &mut self,
+        left_trigger: bool,
+        right_trigger: bool,
+        pointer_on_panel: bool,
+        now: Duration,
+    ) -> bool {
+        if self
+            .last_fire
+            .map(|fired| now.saturating_sub(fired) < UNLOCK_COOLDOWN)
+            .unwrap_or(false)
+        {
+            self.hold_since = None;
+            return false;
+        }
+        if !(left_trigger && right_trigger && pointer_on_panel) {
+            self.hold_since = None;
+            return false;
+        }
+        let Some(since) = self.hold_since else {
+            self.hold_since = Some(now);
+            return false;
+        };
+        if now.saturating_sub(since) < UNLOCK_HOLD {
+            return false;
+        }
+        self.hold_since = None;
+        self.last_fire = Some(now);
+        true
     }
 }
 
@@ -476,10 +540,7 @@ impl GestureState {
                     self.prev_hit = None;
                     return GestureTransition::DragReleased;
                 }
-                if input.config_epoch != self.drag_epoch {
-                    self.clear_drag();
-                    return GestureTransition::DragCancelled;
-                }
+                // epoch 变化已在函数入口统一取消，这里无需重复判断
                 GestureTransition::None
             }
         }
@@ -826,5 +887,44 @@ mod tests {
     fn nearly_parallel_helper() {
         assert!(ray_nearly_parallel([1.0, 0.0, 0.0], [0.0, 0.0, 1.0]));
         assert!(!ray_nearly_parallel([0.0, 0.0, -1.0], [0.0, 0.0, 1.0]));
+    }
+
+    #[test]
+    fn unlock_requires_both_triggers_on_panel_for_full_hold() {
+        let mut s = UnlockGestureState::new();
+        let ms = Duration::from_millis;
+        // 没命中面板不算
+        assert!(!s.update(true, true, false, ms(0)));
+        assert!(!s.update(true, true, false, ms(2000)));
+        // 只按一边不算
+        assert!(!s.update(true, false, true, ms(2100)));
+        // 双方按下但未满 1.5s
+        assert!(!s.update(true, true, true, ms(2200)));
+        assert!(!s.update(true, true, true, ms(3600)));
+        // 满 1.5s 触发一次
+        assert!(s.update(true, true, true, ms(3800)));
+        // 冷却期内不重复触发
+        assert!(!s.update(true, true, true, ms(3900)));
+        assert!(!s.update(true, true, true, ms(4700)));
+        // 冷却结束后重新计时
+        assert!(!s.update(true, true, true, ms(4900)));
+        assert!(s.update(true, true, true, ms(6500)));
+    }
+
+    #[test]
+    fn unlock_reset_clears_partial_hold() {
+        let mut s = UnlockGestureState::new();
+        let ms = Duration::from_millis;
+        assert!(!s.update(true, true, true, ms(0)));
+        s.reset();
+        // 重新计时后不足 1.5s 不应触发
+        assert!(!s.update(true, true, true, ms(1600)));
+    }
+
+    #[test]
+    fn only_both_grips_needs_left_hand() {
+        assert!(GrabChord::BothGrips.needs_left_hand());
+        assert!(!GrabChord::RightGrip.needs_left_hand());
+        assert!(!GrabChord::RightTrigger.needs_left_hand());
     }
 }

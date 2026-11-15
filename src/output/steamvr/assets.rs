@@ -11,11 +11,13 @@
 #![allow(dead_code)]
 
 use directories::ProjectDirs;
+use std::borrow::Cow;
 use std::fs;
 use std::path::{Path, PathBuf};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const STAMP_NAME: &str = ".livetranslate-steamvr-version";
+const VRMANIFEST_RELATIVE: &str = "steamvr.vrmanifest";
 
 struct EmbeddedFile {
     relative: &'static str,
@@ -78,22 +80,76 @@ impl SteamVrAssetPaths {
 /// 用户 `config.toml`）。`None` 时回落到 OS 用户配置目录作为父目录。
 pub fn ensure_extracted(active_config_path: Option<&Path>) -> Result<SteamVrAssetPaths, String> {
     let primary = primary_steamvr_dir(active_config_path)?;
+    extract_with_fallback(primary, fallback_steamvr_dir)
+}
+
+/// 先试主目录，失败才回退；回退目录与主目录相同时不再重复尝试。
+fn extract_with_fallback(
+    primary: PathBuf,
+    fallback: impl FnOnce() -> Result<PathBuf, String>,
+) -> Result<SteamVrAssetPaths, String> {
     match extract_into(&primary) {
         Ok(paths) => Ok(paths),
         Err(primary_err) => {
-            let fallback = fallback_steamvr_dir()?;
-            if fallback == primary {
+            let fallback_dir = fallback()?;
+            if fallback_dir == primary {
                 return Err(primary_err);
             }
-            extract_into(&fallback).map_err(|fallback_err| {
+            extract_into(&fallback_dir).map_err(|fallback_err| {
                 format!(
                     "SteamVR 资源解压失败（主目录 {}: {primary_err}；回退 {}: {fallback_err}）",
                     primary.display(),
-                    fallback.display()
+                    fallback_dir.display()
                 )
             })
         }
     }
+}
+
+fn vrmanifest_template() -> &'static [u8] {
+    EMBEDDED
+        .iter()
+        .find(|file| file.relative == VRMANIFEST_RELATIVE)
+        .map(|file| file.bytes)
+        .unwrap_or(&[])
+}
+
+/// 写入前改写 `steamvr.vrmanifest`。
+///
+/// SteamVR 是靠 manifest 里的可执行文件路径把运行中的进程关联到 `app_key` 的：
+/// 资源解压在 `<配置目录>/steamvr/<version>/`，与 exe 不同目录，内嵌模板里的
+/// 相对路径 `livetranslate.exe` 指向不存在的文件 → 默认 bindings 不会加载 →
+/// overlay-global action set 压不到任何输入源。因此这里必须写绝对路径。
+///
+/// 同时去掉 `is_dashboard_overlay`：本应用不注册 Dashboard 面板。
+fn render_vrmanifest(exe: Option<&Path>) -> Cow<'static, [u8]> {
+    let template = vrmanifest_template();
+    let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(template) else {
+        // 模板损坏时保持原样，交给 SteamVR 报错而不是静默写空文件
+        return Cow::Borrowed(template);
+    };
+    let Some(app) = value
+        .get_mut("applications")
+        .and_then(|apps| apps.get_mut(0))
+        .and_then(|app| app.as_object_mut())
+    else {
+        return Cow::Borrowed(template);
+    };
+    app.remove("is_dashboard_overlay");
+    if let Some(exe) = exe {
+        app.insert(
+            "binary_path_windows".to_string(),
+            serde_json::Value::String(exe.display().to_string()),
+        );
+    }
+    match serde_json::to_vec_pretty(&value) {
+        Ok(bytes) => Cow::Owned(bytes),
+        Err(_) => Cow::Borrowed(template),
+    }
+}
+
+fn current_exe_path() -> Option<PathBuf> {
+    std::env::current_exe().ok()
 }
 
 fn primary_steamvr_dir(active_config_path: Option<&Path>) -> Result<PathBuf, String> {
@@ -136,9 +192,14 @@ fn extract_into(target_dir: &Path) -> Result<SteamVrAssetPaths, String> {
             fs::create_dir_all(parent)
                 .map_err(|e| format!("创建 {} 失败: {e}", parent.display()))?;
         }
+        let bytes = if file.relative == VRMANIFEST_RELATIVE {
+            render_vrmanifest(current_exe_path().as_deref())
+        } else {
+            Cow::Borrowed(file.bytes)
+        };
         // 先写临时文件再 rename，降低半写入被 SteamVR 读到的窗口
         let tmp = dest.with_extension("tmp");
-        fs::write(&tmp, file.bytes).map_err(|e| format!("写入 {} 失败: {e}", tmp.display()))?;
+        fs::write(&tmp, &bytes).map_err(|e| format!("写入 {} 失败: {e}", tmp.display()))?;
         fs::rename(&tmp, &dest).map_err(|e| {
             let _ = fs::remove_file(&tmp);
             format!("落盘 {} 失败: {e}", dest.display())
@@ -147,7 +208,7 @@ fn extract_into(target_dir: &Path) -> Result<SteamVrAssetPaths, String> {
 
     let stamp_path = absolute_root.join(STAMP_NAME);
     let stamp_tmp = absolute_root.join(format!("{STAMP_NAME}.tmp"));
-    fs::write(&stamp_tmp, VERSION).map_err(|e| format!("写入版本戳临时文件失败: {e}"))?;
+    fs::write(&stamp_tmp, stamp_value()).map_err(|e| format!("写入版本戳临时文件失败: {e}"))?;
     fs::rename(&stamp_tmp, &stamp_path).map_err(|e| {
         let _ = fs::remove_file(&stamp_tmp);
         format!("写入版本戳失败: {e}")
@@ -163,11 +224,34 @@ fn extract_into(target_dir: &Path) -> Result<SteamVrAssetPaths, String> {
     Ok(SteamVrAssetPaths::from_root(absolute_root))
 }
 
+/// 版本戳内容：`<crate 版本>-<内嵌资源 + exe 路径指纹>`。
+///
+/// 只写版本号不够：开发期沿用同一版本号时，改了 actions.json / bindings 也不会重新解压，
+/// 会读到旧资源。exe 路径必须参与指纹，因为 `steamvr.vrmanifest` 里写的是
+/// `current_exe()` 的绝对路径——程序换了目录就必须重新生成，否则 SteamVR 关联不到 app_key。
+fn stamp_value() -> String {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325; // FNV-1a 64
+    let mut feed = |bytes: &[u8]| {
+        for byte in bytes {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    };
+    for file in EMBEDDED {
+        feed(file.relative.as_bytes());
+        feed(file.bytes);
+    }
+    if let Some(exe) = current_exe_path() {
+        feed(exe.to_string_lossy().as_bytes());
+    }
+    format!("{VERSION}-{hash:016x}")
+}
+
 fn is_current(dir: &Path) -> bool {
     let Ok(stamp) = fs::read_to_string(dir.join(STAMP_NAME)) else {
         return false;
     };
-    if stamp.trim() != VERSION {
+    if stamp.trim() != stamp_value() {
         return false;
     }
     EMBEDDED
@@ -276,11 +360,11 @@ mod tests {
         assert_eq!(paths.root, to_absolute(&base.join("steamvr").join(VERSION)));
         assert_eq!(paths.actions_manifest, paths.root.join("actions.json"));
         assert_eq!(paths.vrmanifest, paths.root.join("steamvr.vrmanifest"));
-        assert_eq!(
-            fs::read_to_string(paths.root.join(STAMP_NAME))
-                .unwrap()
-                .trim(),
-            VERSION
+        let stamp = fs::read_to_string(paths.root.join(STAMP_NAME)).unwrap();
+        assert_eq!(stamp.trim(), stamp_value());
+        assert!(
+            stamp.starts_with(VERSION),
+            "版本戳应以 crate 版本开头: {stamp}"
         );
 
         let actions = parse_json_file(&paths.actions_manifest);
@@ -320,6 +404,30 @@ mod tests {
             manifest["applications"][0]["action_manifest_path"],
             "actions.json"
         );
+        // 必须写绝对 exe 路径，否则 SteamVR 关联不到 app_key、默认 bindings 不加载
+        let binary = manifest["applications"][0]["binary_path_windows"]
+            .as_str()
+            .expect("binary_path_windows");
+        assert!(
+            Path::new(binary).is_absolute(),
+            "binary_path_windows 必须是绝对路径: {binary}"
+        );
+        let exe = std::env::current_exe().expect("current_exe");
+        assert_eq!(Path::new(binary), exe.as_path());
+        // 不注册 Dashboard 面板
+        assert!(manifest["applications"][0]
+            .get("is_dashboard_overlay")
+            .is_none());
+    }
+
+    #[test]
+    fn render_vrmanifest_keeps_relative_path_without_exe() {
+        let bytes = render_vrmanifest(None);
+        let value: Value = serde_json::from_slice(&bytes).expect("json");
+        assert_eq!(
+            value["applications"][0]["binary_path_windows"],
+            "livetranslate.exe"
+        );
     }
 
     #[test]
@@ -357,7 +465,12 @@ mod tests {
 
         let actions_path = paths.actions_manifest.clone();
         fs::write(&actions_path, b"{\"actions\":[]}").unwrap();
-        fs::write(paths.root.join(STAMP_NAME), "0.0.0-old").unwrap();
+        // 版本号相同但内容指纹不同（例如改了 bindings）也必须覆盖
+        fs::write(
+            paths.root.join(STAMP_NAME),
+            format!("{VERSION}-0000000000000000"),
+        )
+        .unwrap();
 
         let refreshed = ensure_extracted(Some(&config_path)).unwrap();
         assert_eq!(refreshed.root, paths.root);
@@ -373,36 +486,30 @@ mod tests {
             fs::read_to_string(refreshed.root.join(STAMP_NAME))
                 .unwrap()
                 .trim(),
-            VERSION
+            stamp_value()
         );
     }
 
-    #[cfg(unix)]
     #[test]
     fn falls_back_when_primary_directory_not_writable() {
         let primary_base = test_dir("readonly-primary");
         let fallback_base = test_dir("fallback-data-local");
-        let config_path = primary_base.join("default.toml");
-        fs::write(&config_path, "").unwrap();
-
-        // 锁住父目录，使 steamvr/<version> 无法创建
-        let mut perms = fs::metadata(&primary_base).unwrap().permissions();
-        perms.set_readonly(true);
-        fs::set_permissions(&primary_base, perms).unwrap();
-
+        // 在“主目录”位置放一个普通文件，create_dir_all 必然失败（跨平台、不依赖权限）
         let primary = primary_base.join("steamvr").join(VERSION);
+        fs::create_dir_all(primary.parent().unwrap()).unwrap();
+        fs::write(&primary, b"occupied").unwrap();
         let fallback = fallback_base.join("steamvr").join(VERSION);
-        let result = extract_into(&primary).or_else(|_| extract_into(&fallback));
 
-        // 恢复权限以便清理
-        let mut perms = fs::metadata(&primary_base).unwrap().permissions();
-        #[allow(clippy::permissions_set_readonly_false)]
-        perms.set_readonly(false);
-        fs::set_permissions(&primary_base, perms).unwrap();
-
-        let paths = result.expect("fallback extract");
+        let paths = extract_with_fallback(primary.clone(), || Ok(fallback.clone()))
+            .expect("应回退到 fallback 目录");
         assert_eq!(paths.root, to_absolute(&fallback));
         assert!(paths.actions_manifest.is_file());
+        assert!(paths.vrmanifest.is_file());
+
+        // 回退目录与主目录相同时不再重复尝试，直接透出主目录错误
+        let err = extract_with_fallback(primary.clone(), || Ok(primary.clone()))
+            .expect_err("主目录与回退目录相同应报错");
+        assert!(!err.is_empty());
     }
 
     #[test]

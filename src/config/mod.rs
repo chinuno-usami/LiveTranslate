@@ -394,6 +394,12 @@ pub struct SteamVrConfig {
     /// hmd 模式水平偏移（米）；正数向右。旧配置缺省 0.0
     #[serde(default)]
     pub horizontal_offset_m: f32,
+    /// OpenVR 应用类型：`background`（默认）或 `overlay`。
+    ///
+    /// overlay-global action set priority（3A 输入屏蔽）按 Valve 注释只对 Overlay 应用生效，
+    /// 但 Background 模式不会主动拉起 vrserver。openvr 每进程只能初始化一次，改动后需重启应用。
+    #[serde(default = "default_application_type")]
+    pub application_type: String,
     #[serde(default = "default_world_position")]
     pub world_position: [f32; 3],
     #[serde(default)]
@@ -471,6 +477,7 @@ impl Default for SteamVrConfig {
             distance_m: default_distance_m(),
             height_offset_m: default_height_offset_m(),
             horizontal_offset_m: 0.0,
+            application_type: default_application_type(),
             world_position: default_world_position(),
             world_rotation_deg: [0.0, 0.0, 0.0],
             curvature: 0.0,
@@ -521,6 +528,9 @@ pub struct OutputConfig {
 
 fn default_true() -> bool {
     true
+}
+fn default_application_type() -> String {
+    "background".to_string()
 }
 fn default_gesture_grab() -> String {
     "both_grips".to_string()
@@ -1408,6 +1418,9 @@ impl AppConfig {
             -2.0,
             2.0,
         );
+        if !matches!(vr.application_type.as_str(), "background" | "overlay") {
+            errors.push("output.steamvr.application_type 只能是 background 或 overlay".to_string());
+        }
         let gesture = &vr.gesture;
         if !matches!(
             gesture.grab.as_str(),
@@ -2134,6 +2147,7 @@ enabled = true
     fn validation_rejects_bad_gesture_and_hotkey_conflicts() {
         let mut cfg = AppConfig::default();
         cfg.output.steamvr.horizontal_offset_m = 3.0;
+        cfg.output.steamvr.application_type = "scene".into();
         cfg.output.steamvr.gesture.grab = "left_grip".into();
         cfg.output.steamvr.gesture.mode = "teleport".into();
         cfg.output.steamvr.gesture.sensitivity = 9.0;
@@ -2141,6 +2155,7 @@ enabled = true
         cfg.hotkeys.toggle_capture = "A".into(); // 裸键
         let err = cfg.validate().unwrap_err();
         assert!(err.contains("horizontal_offset_m"), "{err}");
+        assert!(err.contains("application_type"), "{err}");
         assert!(err.contains("gesture.grab"), "{err}");
         assert!(err.contains("gesture.mode"), "{err}");
         assert!(err.contains("gesture.sensitivity"), "{err}");
@@ -2159,6 +2174,7 @@ enabled = true
         assert!(cfg.audio.sources[0].osc);
         assert!(cfg.audio.sources[0].steamvr);
         assert_eq!(cfg.output.steamvr.horizontal_offset_m, 0.0);
+        assert_eq!(cfg.output.steamvr.application_type, "background");
         assert!(!cfg.output.steamvr.gesture.enabled);
         assert!(cfg.output.steamvr.gesture.locked);
         assert_eq!(cfg.hotkeys.show, "CmdOrCtrl+Alt+S");

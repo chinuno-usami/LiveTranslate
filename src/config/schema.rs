@@ -525,6 +525,17 @@ pub fn build(config: &AppConfig) -> SettingsSchema {
                     2.0,
                     0.01,
                 ),
+                {
+                    let mut field = enum_(
+                        config,
+                        "output.steamvr.application_type",
+                        "OpenVR 应用类型",
+                        "默认 background（不会主动拉起 SteamVR 服务）。只有 overlay 才能设置 overlay-global action set priority（拖动期屏蔽游戏输入）；openvr 每进程只能初始化一次，改动后需重启应用。",
+                        vec![("background", "Background（默认）"), ("overlay", "Overlay")],
+                    );
+                    field.advanced = true;
+                    field
+                },
                 float(
                     config,
                     "output.steamvr.horizontal_offset_m",
@@ -646,7 +657,7 @@ pub fn build(config: &AppConfig) -> SettingsSchema {
                     config,
                     "output.steamvr.gesture.unlock_via_vr_gesture",
                     "允许 VR 内手势解锁",
-                    "默认关闭；关闭时只能用桌面设置、浮窗按钮或全局快捷键解锁。",
+                    "默认关闭；开启后需先出字幕让面板可见，用右手射线指向面板并同时按住双手 trigger 1.5 秒解锁（1 秒冷却）。关闭时只能用桌面设置、浮窗按钮或全局快捷键解锁。",
                 ),
                 {
                     let mut field = enum_(
@@ -872,10 +883,8 @@ pub fn is_restart_required(path: &str) -> bool {
     if path == "translate.enabled" || path == "asr.language" || path == "asr.edge.language" {
         return false;
     }
-    // 输入源路由字段本身热更新；整表 audio.sources 的冷/热差量由运行期 sources_need_restart 判定
-    if path == "audio.sources" {
-        return true;
-    }
+    // 注意：整表 audio.sources 的冷/热差量由 main::sources_need_restart 判定
+    // （路由/翻译/语言热更新，id/设备/启用/展示名才重启），这里不参与。
     if path.starts_with("audio.") || path.starts_with("vad.") || path.starts_with("translate.") {
         return true;
     }

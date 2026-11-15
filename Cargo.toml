@@ -78,7 +78,8 @@ libloading = { version = "0.8", optional = true }
 [target.'cfg(windows)'.dependencies]
 openvr = { version = "0.9", optional = true }
 # 3A：构造带 nPriority 的 VRActiveActionSet（openvr 0.9 封装不足时直调）；仅随 steamvr feature。
-openvr_sys = { version = "2.1.4", optional = true }
+# 与 openvr 0.9 内部的 openvr_sys 严格锁步：两条不同版本会让 VRActiveActionSet_t 类型不匹配
+openvr_sys = { version = "=2.1.4", optional = true }
 windows = { version = "0.52", features = [
     "Win32_Media_Audio",
     "Win32_System_Com",

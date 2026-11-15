@@ -98,6 +98,11 @@ impl OutputManager {
         self.steamvr.take_pose_update()
     }
 
+    /// 取走 VR 内解锁手势的一次性请求（`gesture.unlock_via_vr_gesture`）。
+    pub fn take_steamvr_unlock_request(&self) -> bool {
+        self.steamvr.take_unlock_request()
+    }
+
     /// 立即同步手势锁定到 VR sink（配置落盘由调用方负责）。
     pub fn set_steamvr_gesture_locked(&self, locked: bool) {
         self.steamvr.set_gesture_locked(locked);

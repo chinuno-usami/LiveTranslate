@@ -7,7 +7,7 @@
 //!
 //! 失败一律返回可读 `String`，不 panic。由 `imp` 在 `block_game_input` 拖动时懒初始化。
 
-use super::assets::{ensure_extracted, SteamVrAssetPaths};
+use super::assets::ensure_extracted;
 use openvr::errors::{VRApplicationError, VRInputError};
 use openvr::input::{VRActionHandle, VRActionSetHandle, VRActiveActionSet};
 use openvr::{Context, Input, Settings};
@@ -62,22 +62,14 @@ impl InputBlockDiagnostics {
         }
         parts.join("；")
     }
-
-    /// 是否具备尝试高优先级屏蔽的前置条件（manifest+注册；实验开关另计）。
-    #[allow(dead_code)] // t6 状态页会用
-    pub fn ready_for_blocking(&self) -> bool {
-        self.manifest_ok && self.app_registered
-    }
 }
 
 /// 已初始化的 Input 2.0 屏蔽句柄集合。
+///
+/// 只需 action set 句柄：屏蔽靠 `UpdateActionState(nPriority)`，单个 action 句柄只在初始化时
+/// 用来探测 binding，不参与运行期。
 pub struct InputBlocker {
-    paths: SteamVrAssetPaths,
     action_set: VRActionSetHandle,
-    grip_left: VRActionHandle,
-    grip_right: VRActionHandle,
-    trigger_left: VRActionHandle,
-    trigger_right: VRActionHandle,
     /// 当前是否以 overlay-global priority 提交着 action set。
     priority_active: bool,
     diagnostics: InputBlockDiagnostics,
@@ -167,20 +159,10 @@ impl InputBlocker {
         );
 
         Ok(Self {
-            paths,
             action_set,
-            grip_left,
-            grip_right,
-            trigger_left,
-            trigger_right,
             priority_active: false,
             diagnostics,
         })
-    }
-
-    #[allow(dead_code)] // 调试 / t6 状态扩展
-    pub fn paths(&self) -> &SteamVrAssetPaths {
-        &self.paths
     }
 
     pub fn diagnostics(&self) -> &InputBlockDiagnostics {
@@ -191,16 +173,6 @@ impl InputBlocker {
         self.priority_active
     }
 
-    #[allow(dead_code)] // binding 探测已内化；保留查询入口
-    pub fn action_handles(&self) -> [VRActionHandle; 4] {
-        [
-            self.grip_left,
-            self.grip_right,
-            self.trigger_left,
-            self.trigger_right,
-        ]
-    }
-
     /// 刷新只读实验设置（例如用户中途在 SteamVR 里打开开关）。
     pub fn refresh_settings(&mut self, ctx: &Context) -> Result<(), String> {
         let mut settings = ctx
@@ -208,12 +180,6 @@ impl InputBlocker {
             .map_err(|e| format!("获取 IVRSettings 失败: {e:?}"))?;
         refresh_experimental_setting(&mut settings, &mut self.diagnostics);
         Ok(())
-    }
-
-    /// 普通优先级提交（nPriority=0）：不压制 scene app。
-    #[allow(dead_code)] // 对称 API；imp 退出路径走 clear_priority
-    pub fn update_normal(&mut self, input: &mut Input) -> Result<(), String> {
-        self.submit(input, 0)
     }
 
     /// 移动模式：overlay-global 高优先级，压制已绑定的 grip/trigger。
@@ -367,9 +333,8 @@ mod tests {
     }
 
     #[test]
-    fn diagnostics_summary_and_ready() {
+    fn diagnostics_summary() {
         let mut d = InputBlockDiagnostics::default();
-        assert!(!d.ready_for_blocking());
         assert!(d.summary().is_empty());
 
         d.manifest_ok = true;
@@ -377,7 +342,6 @@ mod tests {
         d.app_registered = true;
         d.app_register_message = "registered".into();
         d.experimental_message = "exp off".into();
-        assert!(d.ready_for_blocking());
         let s = d.summary();
         assert!(s.contains("exp off"));
         assert!(s.contains("manifest ok"));

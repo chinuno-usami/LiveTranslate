@@ -694,34 +694,53 @@ pub(crate) fn toggle_steamvr_lock_bg(app: &AppHandle) {
     let app_handle = app.clone();
     let state = app.state::<Arc<SharedState>>().inner().clone();
     tauri::async_runtime::spawn(async move {
-        match state
-            .update_and_persist_config(&app_handle, |config| {
-                let locked = !config.output.steamvr.gesture.locked;
-                config.output.steamvr.gesture.locked = locked;
-                Ok(vec![("output.steamvr.gesture.locked", locked.into())])
-            })
-            .await
-        {
-            Ok(config) => {
-                let locked = config.output.steamvr.gesture.locked;
-                // 立即同步 VR 线程锁定态（取消拖动），再 apply_config 对齐 Shared.config
-                state.outputs.set_steamvr_gesture_locked(locked);
-                state.outputs.apply_config(&config.output).await;
-                emit_config(&app_handle, &config);
-                emit_output_status(&app_handle, &state);
-                let msg = if locked {
-                    "SteamVR 字幕位置已锁定"
-                } else {
-                    "SteamVR 字幕位置已解锁"
-                };
-                let _ = app_handle.emit_all(NOTICE_EVENT, msg.to_string());
-            }
-            Err(e) => {
-                tracing::warn!("切换 VR 位置锁定失败: {e}");
-                let _ = app_handle.emit_all(ERROR_EVENT, format!("切换 VR 位置锁定失败: {e}"));
-            }
+        // 必须把「取反」放进 update_and_persist_config 的锁内：连按两次时若先读后写，
+        // 两个任务会读到同一个旧值，最终状态与两次按键的次数不一致。
+        if let Err(e) = set_steamvr_locked(&app_handle, &state, LockChange::Toggle).await {
+            tracing::warn!("切换 VR 位置锁定失败: {e}");
+            let _ = app_handle.emit_all(ERROR_EVENT, format!("切换 VR 位置锁定失败: {e}"));
         }
     });
+}
+
+/// VR 位置锁定要写入的值：显式设置（浮窗按钮 / VR 内解锁）或取反（快捷键）。
+#[derive(Debug, Clone, Copy)]
+enum LockChange {
+    Set(bool),
+    Toggle,
+}
+
+/// 写回 `output.steamvr.gesture.locked`，并同步 VR 线程 / 前端 / 浮窗提示。
+///
+/// 三条路径共用：浮窗按钮、全局快捷键、VR 内解锁手势。
+async fn set_steamvr_locked(
+    app: &AppHandle,
+    state: &SharedState,
+    change: LockChange,
+) -> Result<(), String> {
+    let config = state
+        .update_and_persist_config(app, |config| {
+            let locked = match change {
+                LockChange::Set(value) => value,
+                LockChange::Toggle => !config.output.steamvr.gesture.locked,
+            };
+            config.output.steamvr.gesture.locked = locked;
+            Ok(vec![("output.steamvr.gesture.locked", locked.into())])
+        })
+        .await?;
+    let locked = config.output.steamvr.gesture.locked;
+    // 立即同步 VR 线程锁定态（取消拖动），再 apply_config 对齐 Shared.config
+    state.outputs.set_steamvr_gesture_locked(locked);
+    state.outputs.apply_config(&config.output).await;
+    emit_config(app, &config);
+    emit_output_status(app, state);
+    let msg = if locked {
+        "SteamVR 字幕位置已锁定"
+    } else {
+        "SteamVR 字幕位置已解锁"
+    };
+    let _ = app.emit_all(NOTICE_EVENT, msg.to_string());
+    Ok(())
 }
 
 /// 松手后的 SteamVR 位姿：先 clamp，再写内存+落盘，最后 apply 回 sink。
@@ -790,6 +809,10 @@ async fn shutdown_once(app: &AppHandle) {
         .is_err()
     {
         tracing::warn!("停止采集超时，继续退出");
+    }
+    // 状态循环会在 shutting_down 后退出，最后一条松手位姿必须在这里补写
+    if let Some(pose) = state.outputs.take_steamvr_pose_update() {
+        persist_steamvr_pose_update(app, &state, pose).await;
     }
     flush_history_before_exit(&state).await;
     state.outputs.shutdown_async().await;
@@ -1060,7 +1083,11 @@ async fn apply_hot_config(app: &AppHandle, state: &SharedState, old: &AppConfig,
     emit_subtitle(app, state).await;
     emit_source_status(app, state).await;
     emit_output_status(app, state);
-    reapply_hotkeys(app, state);
+    // 只在快捷键本身变化时重注册：unregister_all + 全量重装会短暂让所有组合失效，
+    // 保存无关设置时若某组合被别的程序临时抢占，原本可用的快捷键会掉线。
+    if old.hotkeys != new.hotkeys {
+        reapply_hotkeys(app, state);
+    }
 }
 
 // ---------------- 配置档辅助 ----------------
@@ -2030,17 +2057,7 @@ async fn set_steamvr_gesture_lock(
     state: State<'_, Arc<SharedState>>,
     locked: bool,
 ) -> Result<(), String> {
-    let config = state
-        .update_and_persist_config(&app, |config| {
-            config.output.steamvr.gesture.locked = locked;
-            Ok(vec![("output.steamvr.gesture.locked", locked.into())])
-        })
-        .await?;
-    state.outputs.set_steamvr_gesture_locked(locked);
-    state.outputs.apply_config(&config.output).await;
-    emit_config(&app, &config);
-    emit_output_status(&app, &state);
-    Ok(())
+    set_steamvr_locked(&app, state.inner(), LockChange::Set(locked)).await
 }
 
 // ---------------- 设置页保存 ----------------
@@ -3171,6 +3188,17 @@ fn run(args: Args) -> anyhow::Result<()> {
                     }
                     if let Some(pose) = state_for_output.outputs.take_steamvr_pose_update() {
                         persist_steamvr_pose_update(&app_for_output, &state_for_output, pose).await;
+                    }
+                    if state_for_output.outputs.take_steamvr_unlock_request() {
+                        if let Err(e) = set_steamvr_locked(
+                            &app_for_output,
+                            &state_for_output,
+                            LockChange::Set(false),
+                        )
+                        .await
+                        {
+                            tracing::warn!("VR 内解锁写回失败: {e}");
+                        }
                     }
                     emit_output_status(&app_for_output, &state_for_output);
                 }

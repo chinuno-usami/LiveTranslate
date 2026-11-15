@@ -80,6 +80,11 @@ impl SteamVrSink {
         None
     }
 
+    /// 非 Windows / 标准版没有 VR 手势，永远不会请求解锁。
+    pub fn take_unlock_request(&self) -> bool {
+        false
+    }
+
     pub fn set_gesture_locked(&mut self, locked: bool) {
         if self.status.gesture_locked != locked {
             self.status.gesture_locked = locked;

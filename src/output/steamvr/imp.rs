@@ -14,7 +14,7 @@ use super::gesture::{
     self, apply_hmd_delta, apply_world_delta, clamp_hmd_offsets, clamp_world_position,
     controller_forward, drag_world_delta, hit_in_panel_rect, ray_nearly_parallel,
     ray_plane_intersection, GestureFrameInput, GestureState, GestureTransition, GrabChord,
-    HmdOffsets, Mat3x4, MAX_FRAME_DELTA_M, PANEL_HIT_MARGIN_FRAC,
+    HmdOffsets, Mat3x4, UnlockGestureState, MAX_FRAME_DELTA_M, PANEL_HIT_MARGIN_FRAC,
 };
 use super::input::InputBlocker;
 use super::render;
@@ -43,6 +43,8 @@ const POINTER_OVERLAY_KEY: &str = "com.chinuno.livetranslate.subtitle.pointer\0"
 const POINTER_OVERLAY_NAME: &str = "LiveTranslate Pointer\0";
 const POINTER_SORT_ORDER: u32 = 32;
 const POINTER_WIDTH_M: f32 = 0.018;
+/// 光标沿面板法线朝用户前推的距离，避免与面板平面共面导致 z-fighting
+const POINTER_FORWARD_OFFSET_M: f32 = 0.02;
 const POINTER_TEX_SIZE: usize = 32;
 const HAPTIC_PULSE_US: u16 = 1200;
 const FRAME_INTERVAL: Duration = Duration::from_millis(33);
@@ -62,6 +64,8 @@ struct Shared {
     config_epoch: AtomicU64,
     /// 松手后待主线程持久化的位姿；与 content `revision` 分离
     pending_pose: Mutex<Option<SteamVrPoseUpdate>>,
+    /// VR 内解锁手势已触发，待主线程写回 `gesture.locked = false`
+    pending_unlock: AtomicBool,
     last_activity: Mutex<Instant>,
     /// 同一时刻最多允许一个线程持有 OpenVR Context（openvr 全局 INITIALIZED 重入会 panic）
     worker_alive: AtomicBool,
@@ -103,6 +107,7 @@ impl SteamVrSink {
             revision: AtomicU64::new(1),
             config_epoch: AtomicU64::new(1),
             pending_pose: Mutex::new(None),
+            pending_unlock: AtomicBool::new(false),
             last_activity: Mutex::new(Instant::now()),
             worker_alive: AtomicBool::new(false),
             notify,
@@ -209,6 +214,11 @@ impl SteamVrSink {
 
     pub fn take_pose_update(&self) -> Option<SteamVrPoseUpdate> {
         lock(&self.shared.pending_pose).take()
+    }
+
+    /// VR 内解锁手势触发后取走一次性请求（主线程负责写回配置）。
+    pub fn take_unlock_request(&self) -> bool {
+        self.shared.pending_unlock.swap(false, Ordering::SeqCst)
     }
 
     pub fn set_gesture_locked(&self, locked: bool) {
@@ -331,9 +341,16 @@ struct InputBlockController<'a> {
     shared: &'a Shared,
     blocker: Option<InputBlocker>,
     init_error: Option<String>,
+    last_init_attempt: Option<Instant>,
     last_epoch: u64,
     currently_blocked: bool,
 }
+
+/// 3A 初始化失败后的重试间隔：用户在 SteamVR 里打开实验开关后无需保存配置也能重试。
+const INPUT_BLOCK_INIT_RETRY: Duration = Duration::from_secs(5);
+
+/// 松手后等待主线程落盘 + apply_config 的上限；超时则回到共享配置避免永久卡住。
+const POSE_APPLY_TIMEOUT: Duration = Duration::from_secs(3);
 
 impl<'a> InputBlockController<'a> {
     fn new(ctx: &'a Context, shared: &'a Shared) -> Self {
@@ -342,6 +359,7 @@ impl<'a> InputBlockController<'a> {
             shared,
             blocker: None,
             init_error: None,
+            last_init_attempt: None,
             last_epoch: 0,
             currently_blocked: false,
         }
@@ -360,8 +378,16 @@ impl<'a> InputBlockController<'a> {
     fn ensure_blocker(&mut self) -> Result<&mut InputBlocker, String> {
         if self.blocker.is_none() {
             if let Some(err) = &self.init_error {
-                return Err(err.clone());
+                let retry_due = self
+                    .last_init_attempt
+                    .map(|at| at.elapsed() >= INPUT_BLOCK_INIT_RETRY)
+                    .unwrap_or(true);
+                if !retry_due {
+                    return Err(err.clone());
+                }
+                self.init_error = None;
             }
+            self.last_init_attempt = Some(Instant::now());
             let path = lock(&self.shared.active_config_path).clone();
             match InputBlocker::try_init(self.ctx, path.as_deref()) {
                 Ok(blocker) => self.blocker = Some(blocker),
@@ -422,7 +448,15 @@ impl<'a> InputBlockController<'a> {
                 } else {
                     failure_detail(&err)
                 };
-                set_input_block_status(self.shared, false, err, Some(&detail));
+                let lower = err.to_ascii_lowercase();
+                let message = if lower.contains("priority") || lower.contains("invalid") {
+                    format!(
+                        "{err}（可尝试 output.steamvr.application_type = \"overlay\" 后重启应用）"
+                    )
+                } else {
+                    err
+                };
+                set_input_block_status(self.shared, false, message, Some(&detail));
             }
         }
     }
@@ -471,16 +505,14 @@ impl<'a> InputBlockController<'a> {
 }
 
 /// 初始化失败时把可读错误填进明细字段，便于设置页展示。
+/// 只填 manifest 一行，其余保持「未检测」，避免同一段错误在 UI 里出现四次。
 fn failure_detail(err: &str) -> InputBlockStatus {
     let mut detail = InputBlockStatus::not_probed();
     detail.manifest_ok = false;
     detail.manifest_message = err.to_string();
-    detail.app_registered = false;
-    detail.app_register_message = err.to_string();
-    detail.bindings_ok = false;
-    detail.bindings_message = err.to_string();
-    detail.experimental_enabled = None;
-    detail.experimental_message = err.to_string();
+    detail.experimental_message.clear();
+    detail.app_register_message.clear();
+    detail.bindings_message.clear();
     detail
 }
 
@@ -550,12 +582,20 @@ fn run(shared: Arc<Shared>, stop: Arc<AtomicBool>) {
     }
 }
 
-fn init_context() -> Result<openvr::Context, SessionError> {
+/// 配置里的应用类型字符串 → OpenVR 枚举。默认 Background：
+/// 只附着到已运行的 SteamVR，不在桌面场景下主动拉起 vrserver。
+fn application_type(config: &SteamVrConfig) -> ApplicationType {
+    match config.application_type.as_str() {
+        "overlay" => ApplicationType::Overlay,
+        _ => ApplicationType::Background,
+    }
+}
+
+fn init_context(config: &SteamVrConfig) -> Result<openvr::Context, SessionError> {
     if !openvr::is_runtime_installed() {
         return Err(SessionError::Message("未检测到 SteamVR 运行时".to_string()));
     }
-    // 使用 Background 模式：只附着到已运行的 SteamVR，不在桌面场景下主动拉起 vrserver
-    unsafe { openvr::init(ApplicationType::Background) }.map_err(|err| match err {
+    unsafe { openvr::init(application_type(config)) }.map_err(|err| match err {
         InitError::Init_NoServerForBackgroundApp | InitError::Init_ShuttingDown => {
             SessionError::WaitingForRuntime
         }
@@ -653,6 +693,7 @@ fn haptic(system: &openvr::System, device: Option<openvr::TrackedDeviceIndex>, e
 
 struct ControllerSample {
     left_grip: bool,
+    left_trigger: bool,
     right_grip: bool,
     right_trigger: bool,
     right_pose: Option<Mat3x4>,
@@ -661,7 +702,9 @@ struct ControllerSample {
     tracking_ok: bool,
 }
 
-fn poll_controllers(system: &openvr::System) -> ControllerSample {
+/// `require_left` 为 false 时（单手抓取组合）左手 tracking 失效不再视为整体失败，
+/// 否则左手柄充电/待机时 `right_grip` / `right_trigger` 也会拖不动。
+fn poll_controllers(system: &openvr::System, require_left: bool) -> ControllerSample {
     let left_index =
         system.tracked_device_index_for_controller_role(TrackedControllerRole::LeftHand);
     let right_index =
@@ -669,6 +712,7 @@ fn poll_controllers(system: &openvr::System) -> ControllerSample {
 
     let mut sample = ControllerSample {
         left_grip: false,
+        left_trigger: false,
         right_grip: false,
         right_trigger: false,
         right_pose: None,
@@ -682,11 +726,12 @@ fn poll_controllers(system: &openvr::System) -> ControllerSample {
             system.controller_state_with_pose(TrackingUniverseOrigin::Standing, idx)
         {
             sample.left_grip = button_down(&state, BTN_GRIP);
-            if !pose.pose_is_valid() {
+            sample.left_trigger = button_down(&state, BTN_TRIGGER);
+            if !pose.pose_is_valid() && require_left {
                 sample.tracking_ok = false;
             }
-        } else {
-            // Dashboard / 系统菜单时常返回 None：视为输入不可用
+        } else if require_left {
+            // Dashboard / 系统菜单时常返回 None：仅在需要左手时视为输入不可用
             sample.tracking_ok = false;
         }
     }
@@ -740,14 +785,14 @@ fn compute_hit(
     let origin = right_pose.translation();
 
     if config.gesture.mode == "near" {
-        let dist = length3(sub3(origin, center));
-        let on = dist <= config.gesture.near_radius_m.max(0.05);
         // 近场：把手柄位置投影到面板平面作为命中
-        let plane_hit = ray_plane_intersection(origin, scale_neg_normal(normal), center, normal)
-            .or_else(|| {
-                // 若从法线反方向投失败，用点到平面投影
-                project_to_plane(origin, center, normal)
-            });
+        let plane_hit = project_to_plane(origin, center, normal);
+        // 半径按「手柄到投影点」算，而不是到面板中心：面板 1.6m 宽时半宽 0.8m，
+        // 用中心距离会让边缘永远够不到（默认半径 0.35m）。
+        let dist = plane_hit
+            .map(|h| length3(sub3(origin, h)))
+            .unwrap_or(f32::INFINITY);
+        let on = dist <= config.gesture.near_radius_m.max(0.05);
         let on_panel = on
             && plane_hit
                 .map(|h| {
@@ -771,11 +816,6 @@ fn compute_hit(
     (plane_hit, on_panel, move_hit)
 }
 
-fn scale_neg_normal(n: [f32; 3]) -> [f32; 3] {
-    let len = length3(n).max(1e-8);
-    [-n[0] / len, -n[1] / len, -n[2] / len]
-}
-
 fn project_to_plane(point: [f32; 3], plane_point: [f32; 3], normal: [f32; 3]) -> Option<[f32; 3]> {
     let len = length3(normal);
     if len < 1e-8 {
@@ -791,12 +831,22 @@ fn project_to_plane(point: [f32; 3], plane_point: [f32; 3], normal: [f32; 3]) ->
     ])
 }
 
-fn absolute_matrix_at(hit: [f32; 3]) -> Matrix3x4 {
-    // 面向 -Z 的单位朝向小方块，仅用于 pointer 定位
+fn absolute_matrix_at(hit: [f32; 3], normal: [f32; 3]) -> Matrix3x4 {
+    // 面向 -Z 的单位朝向小方块，仅用于 pointer 定位；沿法线朝用户推开一点避免共面闪烁
+    let len = length3(normal);
+    let offset = if len < 1e-8 {
+        [0.0, 0.0, 0.0]
+    } else {
+        [
+            normal[0] / len * POINTER_FORWARD_OFFSET_M,
+            normal[1] / len * POINTER_FORWARD_OFFSET_M,
+            normal[2] / len * POINTER_FORWARD_OFFSET_M,
+        ]
+    };
     Matrix3x4([
-        [1.0, 0.0, 0.0, hit[0]],
-        [0.0, 1.0, 0.0, hit[1]],
-        [0.0, 0.0, 1.0, hit[2]],
+        [1.0, 0.0, 0.0, hit[0] + offset[0]],
+        [0.0, 1.0, 0.0, hit[1] + offset[1]],
+        [0.0, 0.0, 1.0, hit[2] + offset[2]],
     ])
 }
 
@@ -805,7 +855,7 @@ fn session(
     stop: &AtomicBool,
     renderer: &mut render::Renderer,
 ) -> Result<(), SessionError> {
-    let context = init_context()?;
+    let context = init_context(&lock(&shared.config).clone())?;
     if stop.load(Ordering::SeqCst) {
         return Ok(());
     }
@@ -855,6 +905,9 @@ fn session(
     let mut last_tex_h: usize = 512;
     let mut pointer_dragging_tex = false;
     let mut panel_visible = false;
+    let mut unlock_gesture = UnlockGestureState::new();
+    // 松手后等主线程落盘 + apply_config：在此之前不要用旧配置回弹面板
+    let mut pose_apply_epoch: Option<(u64, Instant)> = None;
     // 3A：Drop 时归零 priority，覆盖异常 / 提前 return
     let mut input_block = InputBlockController::new(&context, shared);
 
@@ -895,8 +948,18 @@ fn session(
         let shared_config = lock(&shared.config).clone();
         input_block.note_epoch(config_epoch);
 
-        // 非拖动时同步主线程配置；拖动中保留 live，仅靠 epoch 取消
-        if !gesture.is_dragging() {
+        // 非拖动时同步主线程配置；拖动中保留 live，仅靠 epoch 取消。
+        // 刚松手时位姿还在异步落盘，先用 live 渲染，等 `apply_config` 推进 epoch 再同步，
+        // 否则会看到面板先跳回旧位置再跳回来（或落盘失败时永久卡在旧位置）。
+        let holding_pose = match pose_apply_epoch {
+            Some((epoch, at)) if epoch == config_epoch && at.elapsed() < POSE_APPLY_TIMEOUT => true,
+            Some(_) => {
+                pose_apply_epoch = None;
+                false
+            }
+            None => false,
+        };
+        if !gesture.is_dragging() && !holding_pose {
             live_config = shared_config.clone();
             // 关闭 3A 时确保不残留高优（例如设置页关掉 block_game_input）
             if !live_config.gesture.block_game_input {
@@ -905,11 +968,19 @@ fn session(
         }
 
         let dashboard_open = overlay.is_dashboard_visible();
+        let grab = GrabChord::parse(&live_config.gesture.grab).unwrap_or(GrabChord::BothGrips);
+        let want_unlock = live_config.gesture.enabled
+            && live_config.gesture.locked
+            && live_config.gesture.unlock_via_vr_gesture;
         let controllers = if live_config.gesture.enabled && !live_config.gesture.locked {
-            poll_controllers(&system)
+            poll_controllers(&system, grab.needs_left_hand())
+        } else if want_unlock {
+            // 锁定时唯一允许的手柄读取：仅用于识别解锁组合
+            poll_controllers(&system, false)
         } else {
             ControllerSample {
                 left_grip: false,
+                left_trigger: false,
                 right_grip: false,
                 right_trigger: false,
                 right_pose: None,
@@ -921,6 +992,7 @@ fn session(
 
         let hmd = hmd_pose_mat(&system);
         let mut plane_hit: Option<[f32; 3]> = None;
+        let mut pointer_normal: Option<[f32; 3]> = None;
         let mut pointer_on_panel = false;
         let mut move_hit: Option<[f32; 3]> = None;
 
@@ -930,8 +1002,29 @@ fn session(
             let (ph, on, mh) =
                 compute_hit(&live_config, &panel, right_pose, last_tex_w, last_tex_h);
             plane_hit = ph;
+            pointer_normal = Some(panel.panel_normal());
             pointer_on_panel = on && panel_visible;
             move_hit = if panel_visible { mh } else { None };
+        }
+
+        let now = session_start.elapsed();
+        if want_unlock {
+            if unlock_gesture.update(
+                controllers.left_trigger,
+                controllers.right_trigger,
+                pointer_on_panel,
+                now,
+            ) {
+                shared.pending_unlock.store(true, Ordering::SeqCst);
+                haptic(
+                    &system,
+                    controllers.right_index.or(controllers.left_index),
+                    live_config.gesture.haptics,
+                );
+                shared.notify.notify_one();
+            }
+        } else {
+            unlock_gesture.reset();
         }
 
         // Dashboard / 追踪失效 / 面板隐藏：取消进行中的拖动
@@ -948,12 +1041,11 @@ fn session(
                 set_dragging(shared, false);
             }
             // 取消不写回：丢弃拖动中的 live 偏移；3A 归零
+            pose_apply_epoch = None;
             live_config = shared_config.clone();
             input_block.clear_blocking();
         }
 
-        let grab = GrabChord::parse(&live_config.gesture.grab).unwrap_or(GrabChord::BothGrips);
-        let now = session_start.elapsed();
         let frame_input = GestureFrameInput {
             locked: live_config.gesture.locked || !live_config.gesture.enabled,
             left_grip: controllers.left_grip,
@@ -991,6 +1083,7 @@ fn session(
             GestureTransition::DragReleased => {
                 let pose = pose_update_from_config(&live_config);
                 *lock(&shared.pending_pose) = Some(pose);
+                pose_apply_epoch = Some((config_epoch, Instant::now()));
                 let _ = gesture.take_drag_origins();
                 set_dragging(shared, false);
                 input_block.clear_blocking();
@@ -1005,6 +1098,7 @@ fn session(
             GestureTransition::DragCancelled => {
                 set_dragging(shared, false);
                 input_block.clear_blocking();
+                pose_apply_epoch = None;
                 live_config = shared_config.clone();
             }
             GestureTransition::None => {}
@@ -1065,7 +1159,7 @@ fn session(
                     let _ = overlay.set_transform_absolute(
                         ph,
                         TrackingUniverseOrigin::Standing,
-                        &absolute_matrix_at(hit),
+                        &absolute_matrix_at(hit, pointer_normal.unwrap_or([0.0, 0.0, 1.0])),
                     );
                     let _ = overlay.set_visibility(ph, true);
                 }

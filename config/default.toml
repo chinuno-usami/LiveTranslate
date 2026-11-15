@@ -202,6 +202,10 @@ distance_m = 1.6
 height_offset_m = -0.28
 # hmd 模式：水平偏移（米）；正数向右
 horizontal_offset_m = 0.0
+# OpenVR 应用类型：background（默认，不主动拉起 SteamVR 服务）/ overlay
+# 只有 overlay 才能设置 overlay-global priority（拖动期屏蔽游戏输入，3A）；
+# 输入屏蔽报优先级错误时可改成 overlay 后重启应用
+application_type = "background"
 # world 模式下的坐标（OpenVR 站立坐标系，单位米）
 world_position = [0.0, 1.3, -1.6]
 # world 模式下的旋转（角度，目前应用绕 Y 轴的偏航）
@@ -238,7 +242,7 @@ reconnect_interval_secs = 5
 enabled = false
 # 默认锁定；解锁：设置页 / 浮窗「VR 位置」/ 快捷键 toggle_steamvr_lock（默认桌面侧）
 locked = true
-# VR 内手势解锁（可选，默认关闭）
+# VR 内手势解锁（可选，默认关闭）：右手射线指向可见面板 + 双手 trigger 同时按住 1.5s
 unlock_via_vr_gesture = false
 # 拖拽激活组合：both_grips | right_grip | right_trigger
 grab = "both_grips"

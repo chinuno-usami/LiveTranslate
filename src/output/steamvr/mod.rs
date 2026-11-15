@@ -193,6 +193,14 @@ impl SteamVrSink {
             .set_active_config_path(path);
     }
 
+    /// 取走 VR 内解锁手势的一次性请求（主线程负责写回 `gesture.locked = false`）。
+    pub fn take_unlock_request(&self) -> bool {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take_unlock_request()
+    }
+
     pub fn shutdown(&self) {
         let _lifecycle = self.lifecycle.lock().unwrap_or_else(|e| e.into_inner());
         let handle = {

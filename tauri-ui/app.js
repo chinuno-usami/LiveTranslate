@@ -54,7 +54,7 @@ function formatAcceleratorDisplay(accelerator) {
     .join(' + ');
 }
 
-function renderShortcutHelp(items) {
+function renderShortcutHelp(items, paused) {
   const tbody = document.getElementById('shortcut-list');
   if (!tbody) return;
   const list = Array.isArray(items) ? items : [];
@@ -68,10 +68,14 @@ function renderShortcutHelp(items) {
             .map((part) => `<kbd>${escapeHtmlApp(part)}</kbd>`)
             .join(' + ')
         : `<span class="shortcut-unset">未设置</span>`;
-      const warn =
-        acc && item.registered === false
-          ? ' <span class="shortcut-warn">未生效（可能被其它程序占用）</span>'
-          : '';
+      // 录制期间后端会先 unregister_all，此时 registered=false 不代表失败
+      const warn = !acc
+        ? ''
+        : paused
+          ? ' <span class="shortcut-warn">录制中已暂停</span>'
+          : item.registered === false
+            ? ' <span class="shortcut-warn">未生效（可能被其它程序占用）</span>'
+            : '';
       return `<tr><td>${kbd}${warn}</td><td>${escapeHtmlApp(item.label || item.action || '')}</td></tr>`;
     })
     .join('');
@@ -103,7 +107,7 @@ function escapeHtmlApp(value) {
 async function refreshShortcutHelp() {
   try {
     const payload = await invoke('get_hotkeys');
-    renderShortcutHelp(payload?.items || []);
+    renderShortcutHelp(payload?.items || [], Boolean(payload?.paused));
   } catch (error) {
     console.warn('加载快捷键帮助失败', error);
   }
@@ -1043,7 +1047,7 @@ async function bindEvents() {
   }
 
   await listen('hotkey-status://update', (event) => {
-    renderShortcutHelp(event.payload?.items || []);
+    renderShortcutHelp(event.payload?.items || [], Boolean(event.payload?.paused));
   });
 
   await listen('subtitle://update', (event) => {
