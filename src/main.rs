@@ -35,6 +35,8 @@ use ui::{
 #[derive(Parser, Debug)]
 #[command(name = "LiveTranslate")]
 #[command(about = "实时语音识别 + 翻译 + 透明浮窗字幕")]
+// 支持 --version：排查问题时让用户能直接报出版本号
+#[command(version)]
 struct Args {
     /// Config file path
     #[arg(short, long)]

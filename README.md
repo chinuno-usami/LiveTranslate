@@ -738,6 +738,7 @@ OPTIONS:
         --log-level <LOG_LEVEL>
                                日志级别 (trace/debug/info/warn/error) [default: info]
     -h, --help                 显示帮助信息
+    -V, --version              显示版本号
 ```
 
 ## 体系结构
