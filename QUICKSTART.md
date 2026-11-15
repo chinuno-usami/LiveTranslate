@@ -206,8 +206,15 @@ curl http://127.0.0.1:8765/v1/models
 
 ### SteamVR Overlay（Windows Full 版）
 
-设置页 → **SteamVR Overlay** → 启用。可调跟随头部/世界坐标、距离、高度、宽度、
+设置页 → **SteamVR Overlay** → 启用。可调跟随头部/世界坐标、距离、高度/水平偏移、宽度、
 曲率、透明度、字号与颜色。SteamVR 未启动时会自动重试。
+
+**手柄移动面板（手势 3C，可选）：**
+
+1. 设置页开启 `gesture.enabled`；默认 `locked=true`，需先解锁再拖。
+2. 解锁：设置页 / 浮窗「VR 位置:锁定/可移动」/ 快捷键 `toggle_steamvr_lock`（默认桌面侧解锁；VR 内解锁默认关）。
+3. 默认双手 grip + 射线命中面板才拖动；松手后位置写入配置。
+4. **排错**：Dashboard 打开不可拖；面板隐藏时先出字幕再抓；不支持空手追踪；本期 **不** 屏蔽游戏输入。
 
 ### 标准版 vs Full 版
 

@@ -1,4 +1,4 @@
-use super::SteamVrStatus;
+use super::{SteamVrPoseUpdate, SteamVrStatus};
 use crate::config::SteamVrConfig;
 use crate::subtitle::DisplayLine;
 use std::sync::Arc;
@@ -22,14 +22,32 @@ impl SteamVrSink {
                 enabled: config.enabled,
                 connected: false,
                 message,
+                gesture_locked: config.gesture.locked,
+                dragging: false,
+                // 3C：不屏蔽游戏输入；非 Windows / 标准版无运行时
+                input_blocked: false,
+                input_block_message: String::new(),
             },
             notify,
         }
     }
 
     pub fn apply_config(&mut self, config: &SteamVrConfig) -> Option<JoinHandle<()>> {
+        let mut changed = false;
         if self.status.enabled != config.enabled {
             self.status.enabled = config.enabled;
+            changed = true;
+        }
+        if self.status.gesture_locked != config.gesture.locked {
+            self.status.gesture_locked = config.gesture.locked;
+            changed = true;
+        }
+        // 3C：input_blocked 恒 false
+        if self.status.input_blocked {
+            self.status.input_blocked = false;
+            changed = true;
+        }
+        if changed {
             self.notify.notify_one();
         }
         None
@@ -39,6 +57,18 @@ impl SteamVrSink {
 
     pub fn status(&self) -> SteamVrStatus {
         self.status.clone()
+    }
+
+    pub fn take_pose_update(&self) -> Option<SteamVrPoseUpdate> {
+        None
+    }
+
+    pub fn set_gesture_locked(&mut self, locked: bool) {
+        if self.status.gesture_locked != locked {
+            self.status.gesture_locked = locked;
+            self.status.dragging = false;
+            self.notify.notify_one();
+        }
     }
 
     pub fn shutdown(&mut self) -> Option<JoinHandle<()>> {

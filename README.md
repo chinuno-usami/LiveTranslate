@@ -42,7 +42,7 @@
 - **多配置档**：新建 / 复制 / 重命名 / 删除 / 切换，切换后自动重启采集
 
 ✅ **额外输出通道（Windows Full 版）**
-- **SteamVR Overlay**：头显内深色半透明字幕面板，跟随头部、逐行渐隐
+- **SteamVR Overlay**：头显内深色半透明字幕面板，跟随头部、逐行渐隐；可选手柄射线移动面板（默认锁定，桌面/浮窗/快捷键解锁）
 - **VRChat OSC Chatbox**：多条字幕合并成滚动字幕，超出 144 字符丢弃最早一条，含保守限流与 typing 指示
 
 ✅ **系统集成**
@@ -214,9 +214,13 @@ horizontal_offset_m = 0.0       # hmd 水平偏移（正数向右）
 font_size_px = 34
 line_alphas = [1.0, 0.72, 0.48]
 
-[output.steamvr.gesture]        # 手势移动（后续版本实现行为）
-enabled = false
-locked = true
+[output.steamvr.gesture]        # 手柄移动字幕面板（3C：legacy 轮询，不依赖 Input 2.0）
+enabled = false                 # 默认关；开启后轮询手柄做射线抓取
+locked = true                   # 默认锁定，避免误触；设置页 / 浮窗 / 快捷键解锁
+unlock_via_vr_gesture = false   # VR 内双手解锁可选，默认关
+grab = "both_grips"             # both_grips 须 pointer 命中面板才进入 arming
+pointer = true                  # 首版纳入射线命中光标
+block_game_input = false        # 本期（3C）不屏蔽游戏输入
 
 [hotkeys]                       # 全局快捷键；留空 = 禁用
 show = "CmdOrCtrl+Alt+S"
@@ -252,6 +256,7 @@ send_typing = true
 | 开始 / 停止 | 控制采集 |
 | 穿透: 开/关 | 切换点击穿透（开启后只能用托盘或 `Ctrl/⌘+Alt+T` 关掉） |
 | **快捷键** | 弹窗展示全部快捷键 |
+| **VR 位置:锁定/可移动** | 仅 Windows Full 且已启用 SteamVR Overlay 时显示；切换 `gesture.locked` |
 | 关闭 | 退出程序 |
 
 ### 工具栏自动收起
@@ -305,8 +310,29 @@ send_typing = true
 
 - 在 **设置页 → SteamVR Overlay** 开启，SteamVR 未启动时会后台重试连接。
 - 视觉：深色半透明圆角面板、原文小字 + 译文大字、来源 chip、按行渐隐、跟随头部。
-- 可调：锚点（hmd/world）、距离、高度偏移、宽度、曲率、透明度、字号、颜色、行透明度。
+- 可调：锚点（hmd/world）、距离、高度 / 水平偏移、宽度、曲率、透明度、字号、颜色、行透明度。
 - 使用系统字体渲染 CJK，无需内置字体包；SteamVR 仅支持 Windows。
+
+#### 手柄移动字幕面板（手势 3C）
+
+- 开启 `output.steamvr.gesture.enabled` 后，用 **legacy 手柄轮询**（`GetControllerStateWithPose`）射线抓取移动面板；**不依赖** `actions.json` / SteamVR Input 2.0，`block_game_input=false` 时也可完整拖动。
+- **默认锁定**（`locked = true`）：抓取无效。解锁方式（均写回配置）：
+  1. 设置页 → SteamVR → gesture → 取消锁定
+  2. 浮窗工具栏 **VR 位置:锁定/可移动**（Full + 已启用 Overlay）
+  3. 全局快捷键 `toggle_steamvr_lock`（默认未绑定，需在设置页自行填写）
+  - VR 内双手解锁（`unlock_via_vr_gesture`）为可选，**默认关闭**
+- 默认 `grab = "both_grips"`：**双手 grip 且射线 pointer 命中面板** 才进入 arming；松手后位置 clamp 并写回配置。
+- `horizontal_offset_m`（hmd 水平偏移，右正）旧配置缺省 `0`，与 v0.2 行为一致。
+
+**限制与排错（手势）：**
+
+| 现象 | 说明 |
+|------|------|
+| SteamVR Dashboard 打开时拖不动 | 预期行为：Dashboard 接管输入，此时取消拖动且不写回 |
+| 面板已淡出/隐藏抓不到 | 先产生一条字幕让面板重新显示，再抓取（本期无 VR 内召唤） |
+| 空手 / 无手柄追踪 | 不支持；需要手柄姿态，不做手部追踪 |
+| 拖动时游戏仍收到 grip | 预期：本期 3C **不屏蔽**游戏输入；`block_game_input` 需后续 Input 2.0（3A）才生效 |
+| 解锁后仍拖不动 | 确认 `enabled=true`、已解锁、pointer 命中面板、双手 grip；检查输出状态是否「位置可移动」 |
 
 ### VRChat OSC Chatbox（Windows Full 版 / 源码启用 osc）
 
@@ -797,6 +823,7 @@ OPTIONS:
   并在状态栏 / 日志里带上具体原因。
 - 🟡 **能量 VAD 与背景音乐**：默认的 `energy` VAD 无法区分高能量背景音乐与人声；游戏/视频回环场景建议切换 `vad.backend = "silero"`（需 ONNX Runtime 动态库，Release 包已内置）
 - 🟡 **SteamVR Overlay 平台限制**：`output.steamvr` 依赖 OpenVR 运行时，仅在 Windows Full 版可用
+- 🟡 **SteamVR 手势移动（3C）**：不支持无手柄手追；Dashboard 打开或面板隐藏时不可拖；本期不屏蔽游戏输入（见上文排错表）
 - 🟡 **点击穿透状态下的交互**：开启点击穿透后，浮窗按钮不能再点击，需用托盘菜单或快捷键 `Ctrl/⌘+Alt+T` 操作
 
 ## 下一步计划
@@ -839,6 +866,15 @@ WARN: No input devices found
 - 检查麦克风是否启用
 - 使用 `--list-devices` 列出设备
 - 确认系统音量未静音
+
+### SteamVR 手势拖不动 / 误触
+
+- **默认锁定**：先在设置页、浮窗「VR 位置」按钮或 `toggle_steamvr_lock` 快捷键解锁；默认**不**用 VR 内手势解锁。
+- **Dashboard 打开**：关闭 SteamVR Dashboard 后再拖；打开期间拖动会被取消且不写回。
+- **面板隐藏**：`hide_on_silence_secs` 淡出后无法命中——先说话/出字幕让面板显示。
+- **both_grips**：双手 grip **且**射线命中面板（pointer）才开始拖；只按一边或未瞄准面板无效。
+- **无手追**：需要手柄；Quest 空手追踪等不支持。
+- **游戏仍收到按键**：3C 不屏蔽游戏输入属预期；勿把 `block_game_input` 当成已生效。
 
 ## 贡献
 

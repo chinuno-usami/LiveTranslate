@@ -233,9 +233,10 @@ swap_red_blue = false
 reconnect_interval_secs = 5
 
 [output.steamvr.gesture]
-# 启用手势移动。默认关闭：避免启动即轮询手柄
+# 启用手势移动（3C legacy 轮询）。默认关闭：避免启动即轮询手柄
+# 排错：Dashboard 打开不可拖；面板隐藏时先出字幕；无手追；本期不屏蔽游戏输入
 enabled = false
-# 默认锁定，避免误触发；可用设置页 / 全局快捷键切换
+# 默认锁定；解锁：设置页 / 浮窗「VR 位置」/ 快捷键 toggle_steamvr_lock（默认桌面侧）
 locked = true
 # VR 内手势解锁（可选，默认关闭）
 unlock_via_vr_gesture = false

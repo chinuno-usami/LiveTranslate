@@ -13,7 +13,7 @@ pub mod osc;
 pub mod steamvr;
 
 pub use osc::OscStatus;
-pub use steamvr::SteamVrStatus;
+pub use steamvr::{SteamVrPoseUpdate, SteamVrStatus};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct OutputStatusPayload {
@@ -90,6 +90,16 @@ impl OutputManager {
             steamvr: self.steamvr.status(),
             osc: self.osc.status(),
         }
+    }
+
+    /// 取走 SteamVR 松手后的待持久化位姿（无则 `None`）。
+    pub fn take_steamvr_pose_update(&self) -> Option<SteamVrPoseUpdate> {
+        self.steamvr.take_pose_update()
+    }
+
+    /// 立即同步手势锁定到 VR sink（配置落盘由调用方负责）。
+    pub fn set_steamvr_gesture_locked(&self, locked: bool) {
+        self.steamvr.set_gesture_locked(locked);
     }
 
     pub fn shutdown(&self) {

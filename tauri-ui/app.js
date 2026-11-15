@@ -16,6 +16,7 @@ const els = {
   sourcesClose: document.getElementById('sources-close'),
   addSourceBtn: document.getElementById('add-source-btn'),
   settingsBtn: document.getElementById('settings-btn'),
+  vrLockBtn: document.getElementById('vr-lock-btn'),
   historyBtn: document.getElementById('history-btn'),
   languageSelect: document.getElementById('language-select'),
   fontSlider: document.getElementById('font-slider'),
@@ -115,6 +116,10 @@ let clickThrough = false;
 let isCapturing = false;
 let pointerInside = true;
 let lastOutputSummary = '';
+/** 编译期能力：仅 Windows Full 的 steamvr 为 true */
+let capabilities = { steamvr: false, osc: false };
+/** 最近一次 SteamVR 输出状态（驱动浮窗锁定按钮与状态摘要） */
+let lastSteamVrStatus = null;
 
 /// 应用字号（同步 CSS 变量、滑块、数值显示）
 function applyFontSize(px) {
@@ -246,6 +251,46 @@ function formatSubtitleHtml(text) {
   return escapeHtml(text).replaceAll('\n', '<br />');
 }
 
+
+function formatSteamVrStatus(sv) {
+  if (!sv || !sv.enabled) {
+    return null;
+  }
+  const base = sv.message || (sv.connected ? '已连接' : '等待连接');
+  const parts = [base];
+  if (sv.dragging) {
+    parts.push('拖动中');
+  } else if (sv.gesture_locked) {
+    parts.push('位置已锁定');
+  } else {
+    parts.push('位置可移动');
+  }
+  // 3C 下 input_blocked 恒 false；仅在真屏蔽时才声称，避免误导
+  if (sv.input_blocked) {
+    parts.push('游戏输入已屏蔽');
+  }
+  return `SteamVR: ${parts.join(' · ')}`;
+}
+
+function updateVrLockButton(sv) {
+  const btn = els.vrLockBtn;
+  if (!btn) {
+    return;
+  }
+  const status = sv || lastSteamVrStatus;
+  const show = Boolean(capabilities.steamvr && status && status.enabled);
+  btn.hidden = !show;
+  if (!show) {
+    return;
+  }
+  const locked = status.gesture_locked !== false;
+  btn.textContent = locked ? 'VR 位置:锁定' : 'VR 位置:可移动';
+  btn.title = locked
+    ? '当前位置已锁定；点击后可用手柄移动字幕面板'
+    : '当前位置可移动；点击后锁定，忽略手柄拖动';
+  btn.setAttribute('aria-pressed', locked ? 'true' : 'false');
+}
+
 async function loadInitialConfig() {
   const config = await invoke('get_overlay_config');
   lastConfig = { ...config };
@@ -270,6 +315,54 @@ async function loadInitialConfig() {
 async function loadInitialStatus() {
   const status = await invoke('get_status');
   setStatus(status.running, status.message);
+}
+
+async function loadInitialCapabilities() {
+  try {
+    const caps = await invoke('get_capabilities');
+    capabilities = {
+      steamvr: Boolean(caps?.steamvr),
+      osc: Boolean(caps?.osc),
+    };
+  } catch (error) {
+    console.warn('加载能力标志失败', error);
+    capabilities = { steamvr: false, osc: false };
+  }
+  updateVrLockButton(lastSteamVrStatus);
+}
+
+async function loadInitialOutputStatus() {
+  try {
+    const payload = await invoke('get_output_status');
+    applyOutputStatus(payload || {});
+  } catch (error) {
+    console.warn('加载输出状态失败', error);
+  }
+}
+
+function applyOutputStatus(payload) {
+  const messages = [];
+  if (payload.steamvr) {
+    lastSteamVrStatus = payload.steamvr;
+    updateVrLockButton(payload.steamvr);
+    const steamvrMsg = formatSteamVrStatus(payload.steamvr);
+    if (steamvrMsg) {
+      messages.push(steamvrMsg);
+    }
+  }
+  if (payload.osc && payload.osc.enabled) {
+    messages.push(`OSC: ${payload.osc.message || '已启用'}`);
+  }
+  lastOutputSummary = messages.join(' / ');
+  if (lastOutputSummary) {
+    els.statusText.title = lastOutputSummary;
+  } else if (
+    els.statusText.title === '' ||
+    els.statusText.title.startsWith('SteamVR:') ||
+    els.statusText.title.startsWith('OSC:')
+  ) {
+    els.statusText.removeAttribute('title');
+  }
 }
 
 function updateClickThroughLabel() {
@@ -797,6 +890,26 @@ async function bindActions() {
       showActionError(`打开设置失败: ${error}`);
     }
   });
+  if (els.vrLockBtn) {
+    els.vrLockBtn.addEventListener('click', async () => {
+      const locked = !lastSteamVrStatus || lastSteamVrStatus.gesture_locked !== false;
+      const next = !locked;
+      try {
+        await invoke('set_steamvr_gesture_lock', { locked: next });
+        // 乐观更新；随后 output-status 会校正
+        lastSteamVrStatus = {
+          ...(lastSteamVrStatus || { enabled: true, connected: false, message: '' }),
+          gesture_locked: next,
+          dragging: false,
+          input_blocked: false,
+        };
+        updateVrLockButton(lastSteamVrStatus);
+      } catch (error) {
+        console.error('切换 VR 位置锁定失败', error);
+        showActionError(`切换 VR 位置锁定失败: ${error}`);
+      }
+    });
+  }
   els.settingsBtn.addEventListener('click', async () => {
     try {
       await invoke('open_settings');
@@ -940,20 +1053,7 @@ async function bindEvents() {
   });
 
   await listen('output-status://update', (event) => {
-    const payload = event.payload || {};
-    const messages = [];
-    if (payload.steamvr && payload.steamvr.enabled) {
-      messages.push(`SteamVR: ${payload.steamvr.message || (payload.steamvr.connected ? '已连接' : '等待连接')}`);
-    }
-    if (payload.osc && payload.osc.enabled) {
-      messages.push(`OSC: ${payload.osc.message || '已启用'}`);
-    }
-    lastOutputSummary = messages.join(' / ');
-    if (lastOutputSummary) {
-      els.statusText.title = lastOutputSummary;
-    } else if (els.statusText.title === '' || els.statusText.title.startsWith('SteamVR:') || els.statusText.title.startsWith('OSC:')) {
-      els.statusText.removeAttribute('title');
-    }
+    applyOutputStatus(event.payload || {});
   });
 
   await listen('status://update', (event) => {
@@ -1059,7 +1159,14 @@ window.addEventListener('DOMContentLoaded', async () => {
     console.error('bindEvents 失败', error);
   }
 
-  for (const step of [loadInitialConfig, loadInitialStatus, loadLanguages, refreshShortcutHelp]) {
+  for (const step of [
+    loadInitialConfig,
+    loadInitialStatus,
+    loadInitialCapabilities,
+    loadInitialOutputStatus,
+    loadLanguages,
+    refreshShortcutHelp,
+  ]) {
     try {
       await step();
     } catch (error) {

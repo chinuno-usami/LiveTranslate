@@ -325,7 +325,7 @@ impl Default for VadConfig {
     }
 }
 
-/// SteamVR 手势移动配置（本批仅数据模型；行为在后续里程碑实现）
+/// SteamVR 手势移动配置（3C：legacy 手柄轮询；不依赖 Input 2.0）
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GestureConfig {
     /// 启用手势移动。默认关闭，避免启动即轮询手柄
@@ -426,7 +426,7 @@ pub struct SteamVrConfig {
     pub swap_red_blue: bool,
     #[serde(default = "default_reconnect_interval_secs")]
     pub reconnect_interval_secs: u64,
-    /// 手势移动（本批仅字段；行为后续实现）
+    /// 手势移动（3C 运行时；`block_game_input` 本期不生效）
     #[serde(default)]
     pub gesture: GestureConfig,
 }

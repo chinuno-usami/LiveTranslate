@@ -701,10 +701,13 @@ pub(crate) fn toggle_steamvr_lock_bg(app: &AppHandle) {
             .await
         {
             Ok(config) => {
+                let locked = config.output.steamvr.gesture.locked;
+                // 立即同步 VR 线程锁定态（取消拖动），再 apply_config 对齐 Shared.config
+                state.outputs.set_steamvr_gesture_locked(locked);
                 state.outputs.apply_config(&config.output).await;
                 emit_config(&app_handle, &config);
                 emit_output_status(&app_handle, &state);
-                let msg = if config.output.steamvr.gesture.locked {
+                let msg = if locked {
                     "SteamVR 字幕位置已锁定"
                 } else {
                     "SteamVR 字幕位置已解锁"
@@ -717,6 +720,59 @@ pub(crate) fn toggle_steamvr_lock_bg(app: &AppHandle) {
             }
         }
     });
+}
+
+/// 松手后的 SteamVR 位姿：先 clamp，再写内存+落盘，最后 apply 回 sink。
+///
+/// `update_and_persist_config` 先 `set_config` 再 `persist_or_report`，落盘失败时内存值仍保留。
+async fn persist_steamvr_pose_update(
+    app: &AppHandle,
+    state: &SharedState,
+    pose: output::SteamVrPoseUpdate,
+) {
+    let hmd = output::steamvr::gesture::clamp_hmd_offsets(
+        output::steamvr::gesture::HmdOffsets::from_config_fields(
+            pose.horizontal_offset_m,
+            pose.height_offset_m,
+            pose.distance_m,
+        ),
+    );
+    let world = output::steamvr::gesture::clamp_world_position(pose.world_position);
+
+    match state
+        .update_and_persist_config(app, |config| {
+            config.output.steamvr.distance_m = hmd.distance_m;
+            config.output.steamvr.height_offset_m = hmd.height_offset_m;
+            config.output.steamvr.horizontal_offset_m = hmd.horizontal_offset_m;
+            config.output.steamvr.world_position = world;
+            Ok(vec![
+                (
+                    "output.steamvr.distance_m",
+                    serde_json::json!(hmd.distance_m),
+                ),
+                (
+                    "output.steamvr.height_offset_m",
+                    serde_json::json!(hmd.height_offset_m),
+                ),
+                (
+                    "output.steamvr.horizontal_offset_m",
+                    serde_json::json!(hmd.horizontal_offset_m),
+                ),
+                ("output.steamvr.world_position", serde_json::json!(world)),
+            ])
+        })
+        .await
+    {
+        Ok(config) => {
+            state.outputs.apply_config(&config.output).await;
+            emit_config(app, &config);
+        }
+        Err(e) => {
+            // validate 失败极少见（已 clamp）；仍通知 UI，不让 VR 线程卡住
+            tracing::warn!("SteamVR 位姿写回失败: {e}");
+            let _ = app.emit_all(ERROR_EVENT, format!("SteamVR 位姿写回失败: {e}"));
+        }
+    }
 }
 
 async fn shutdown_once(app: &AppHandle) {
@@ -1965,6 +2021,26 @@ async fn set_output_enabled(
     Ok(())
 }
 
+/// 浮窗 / 设置页：设置 SteamVR 字幕位置锁定，并写回 `gesture.locked`。
+#[tauri::command]
+async fn set_steamvr_gesture_lock(
+    app: AppHandle,
+    state: State<'_, Arc<SharedState>>,
+    locked: bool,
+) -> Result<(), String> {
+    let config = state
+        .update_and_persist_config(&app, |config| {
+            config.output.steamvr.gesture.locked = locked;
+            Ok(vec![("output.steamvr.gesture.locked", locked.into())])
+        })
+        .await?;
+    state.outputs.set_steamvr_gesture_locked(locked);
+    state.outputs.apply_config(&config.output).await;
+    emit_config(&app, &config);
+    emit_output_status(&app, &state);
+    Ok(())
+}
+
 // ---------------- 设置页保存 ----------------
 
 #[derive(Debug, Deserialize)]
@@ -3082,7 +3158,7 @@ fn run(args: Args) -> anyhow::Result<()> {
                 let _ = window.emit(OUTPUT_STATUS_EVENT, state.outputs.status());
             }
 
-            // 后台输出线程（SteamVR 连接重连 / OSC 发送与报错）状态变化时实时推送给前端
+            // 后台输出线程状态变化：推送前端；若有松手位姿则 clamp 后持久化
             let app_for_output = app.handle();
             let state_for_output = state.inner().clone();
             tauri::async_runtime::spawn(async move {
@@ -3090,6 +3166,9 @@ fn run(args: Args) -> anyhow::Result<()> {
                     state_for_output.outputs.status_notified().await;
                     if state_for_output.shutting_down.load(Ordering::SeqCst) {
                         break;
+                    }
+                    if let Some(pose) = state_for_output.outputs.take_steamvr_pose_update() {
+                        persist_steamvr_pose_update(&app_for_output, &state_for_output, pose).await;
                     }
                     emit_output_status(&app_for_output, &state_for_output);
                 }
@@ -3123,6 +3202,7 @@ fn run(args: Args) -> anyhow::Result<()> {
             reorder_sources,
             get_output_status,
             set_output_enabled,
+            set_steamvr_gesture_lock,
             get_capabilities,
             open_settings,
             open_history,

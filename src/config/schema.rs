@@ -529,7 +529,7 @@ pub fn build(config: &AppConfig) -> SettingsSchema {
                     config,
                     "output.steamvr.horizontal_offset_m",
                     "水平偏移（米）",
-                    "hmd 模式；正数向右。",
+                    "hmd 锚点参数；正数向右。旧配置缺省 0，行为与 v0.2 一致。",
                     -2.0,
                     2.0,
                     0.01,
@@ -634,26 +634,26 @@ pub fn build(config: &AppConfig) -> SettingsSchema {
                     config,
                     "output.steamvr.gesture.enabled",
                     "启用手势移动",
-                    "默认关闭；开启后可用手柄移动字幕面板（后续版本实现）。",
+                    "默认关闭；开启后可用手柄抓取并移动字幕面板（legacy 轮询，不依赖 SteamVR Input 2.0）。",
                 ),
                 bool_adv(
                     config,
                     "output.steamvr.gesture.locked",
                     "锁定位置",
-                    "锁定时忽略拖动手势；可用设置或全局快捷键切换。",
+                    "默认锁定；锁定时忽略拖动手势。可用设置、浮窗按钮或全局快捷键切换。",
                 ),
                 bool_adv(
                     config,
                     "output.steamvr.gesture.unlock_via_vr_gesture",
                     "允许 VR 内手势解锁",
-                    "默认关闭；关闭时只能用桌面设置或全局快捷键解锁。",
+                    "默认关闭；关闭时只能用桌面设置、浮窗按钮或全局快捷键解锁。",
                 ),
                 {
                     let mut field = enum_(
                         config,
                         "output.steamvr.gesture.grab",
                         "拖拽激活组合",
-                        "",
+                        "both_grips 须射线/近场命中面板才可进入抓取，以降低双持游戏误触。",
                         vec![
                             ("both_grips", "双手 Grip"),
                             ("right_grip", "右手 Grip"),
@@ -668,7 +668,7 @@ pub fn build(config: &AppConfig) -> SettingsSchema {
                         config,
                         "output.steamvr.gesture.mode",
                         "抓取方式",
-                        "",
+                        "射线需命中面板；近距离在半径内抓取。",
                         vec![("ray", "射线"), ("near", "近距离")],
                     );
                     field.advanced = true;
@@ -682,7 +682,12 @@ pub fn build(config: &AppConfig) -> SettingsSchema {
                     0.2,
                     3.0,
                 ),
-                bool_adv(config, "output.steamvr.gesture.pointer", "显示射线光标", ""),
+                bool_adv(
+                    config,
+                    "output.steamvr.gesture.pointer",
+                    "显示射线光标",
+                    "命中反馈；both_grips 也须 pointer 命中面板才允许抓取。",
+                ),
                 bool_adv(
                     config,
                     "output.steamvr.gesture.haptics",
@@ -701,7 +706,7 @@ pub fn build(config: &AppConfig) -> SettingsSchema {
                     config,
                     "output.steamvr.gesture.block_game_input",
                     "移动时屏蔽游戏输入",
-                    "需要 SteamVR Input 2.0 与实验设置；默认关闭。",
+                    "本期（3C）不生效；需后续 Input 2.0（3A）与 SteamVR 实验设置。即便开启也只屏蔽 grip/trigger，摇杆/菜单仍传给游戏。",
                 ),
             ],
         },
