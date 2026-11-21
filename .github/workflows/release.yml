@@ -170,12 +170,35 @@ jobs:
           }
 
           # 随包附带 ONNX Runtime（silero VAD 用）
+          # 2026-11 起 microsoft/onnxruntime GitHub Releases 曾整体 404；
+          # 与 scripts/fetch-onnxruntime.sh 相同：GitHub → PhotoPrism 镜像回退。
           $ortVersion = "$env:ORT_VERSION"
-          $ortUrl = "https://github.com/microsoft/onnxruntime/releases/download/v$ortVersion/onnxruntime-win-x64-$ortVersion.zip"
+          $ortArchive = "onnxruntime-win-x64-$ortVersion.zip"
+          $ortUrls = @(
+            "https://github.com/microsoft/onnxruntime/releases/download/v$ortVersion/$ortArchive",
+            "https://dl.photoprism.app/onnx/runtime/v$ortVersion/$ortArchive"
+          )
+          if ($env:ORT_DOWNLOAD_URL) {
+            $ortUrls = @($env:ORT_DOWNLOAD_URL)
+          }
           $ortZip = Join-Path $env:RUNNER_TEMP "ort.zip"
           $ortDir = Join-Path $env:RUNNER_TEMP "ort"
-          Write-Host "downloading $ortUrl"
-          Invoke-WebRequest -Uri $ortUrl -OutFile $ortZip
+          $downloaded = $false
+          foreach ($ortUrl in $ortUrls) {
+            Write-Host "downloading $ortUrl"
+            try {
+              Invoke-WebRequest -Uri $ortUrl -OutFile $ortZip
+              Write-Host "  fetched from $ortUrl"
+              $downloaded = $true
+              break
+            } catch {
+              Write-Warning "  download failed: $($_.Exception.Message); trying next mirror if any"
+              Remove-Item -Force -ErrorAction SilentlyContinue $ortZip
+            }
+          }
+          if (-not $downloaded) {
+            throw "所有 onnxruntime 下载源均失败（$ortArchive）。可设 ORT_DOWNLOAD_URL 指向可用归档。"
+          }
 
           # 完整性校验：校验和表与 scripts/fetch-onnxruntime.sh 共用 scripts/ort-checksums.txt，
           # 升级 ORT_VERSION 时只补一处；缺校验和直接失败，不再 warning 放行。

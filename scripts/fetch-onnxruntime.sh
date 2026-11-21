@@ -10,6 +10,11 @@
 # 下载后会校验完整性；也可用 ORT_SHA256 显式指定期望值（覆盖内置表）。
 # 未提供校验和时直接失败：宁可不打包，也不要绕过完整性校验。
 #
+# 下载源（按顺序尝试，成功且校验通过即停）：
+#   1. GitHub Releases（官方；2026-11 起仓库曾 404）
+#   2. PhotoPrism 镜像（同布局归档；SHA-256 与官方包一致）
+# 可用 ORT_DOWNLOAD_URL 强制指定单一 URL，跳过候选列表。
+#
 # 说明: ONNX Runtime 官方只提供动态库（无静态库），
 # 因此这里是「随包附带动态库」，由程序启动时自动发现。
 set -euo pipefail
@@ -75,12 +80,42 @@ extract_archive() {
   esac
 }
 
-URL="https://github.com/microsoft/onnxruntime/releases/download/v${ORT_VERSION}/${ARCHIVE}"
+download_archive() {
+  local dest="$1"
+  local urls=()
+  if [ -n "${ORT_DOWNLOAD_URL:-}" ]; then
+    urls=("${ORT_DOWNLOAD_URL}")
+  else
+    urls=(
+      "https://github.com/microsoft/onnxruntime/releases/download/v${ORT_VERSION}/${ARCHIVE}"
+      "https://dl.photoprism.app/onnx/runtime/v${ORT_VERSION}/${ARCHIVE}"
+    )
+  fi
+
+  local url=""
+  local last_err=""
+  for url in "${urls[@]}"; do
+    echo "downloading ${url}"
+    # -f：HTTP 4xx/5xx 视为失败，好走下一个镜像
+    if curl -fsSL --retry 3 --retry-delay 2 --max-time 600 -o "$dest" "$url"; then
+      echo "  fetched from ${url}"
+      return 0
+    fi
+    last_err="curl failed for ${url}"
+    echo "  ${last_err}; trying next mirror if any" >&2
+    rm -f "$dest"
+  done
+
+  echo "error: 所有 onnxruntime 下载源均失败（${ARCHIVE}）" >&2
+  echo "  last: ${last_err}" >&2
+  echo "  tip: 设置 ORT_DOWNLOAD_URL 指向可用归档，或恢复官方 GitHub Releases" >&2
+  return 1
+}
+
 TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "$TMP_DIR"' EXIT
 
-echo "downloading ${URL}"
-curl -sSL --retry 3 --retry-delay 2 --max-time 600 -o "${TMP_DIR}/${ARCHIVE}" "${URL}"
+download_archive "${TMP_DIR}/${ARCHIVE}"
 
 # 完整性校验：防止上游资产被替换 / 下载被篡改
 if [ -n "$EXPECTED_SHA256" ]; then
