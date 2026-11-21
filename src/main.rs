@@ -761,6 +761,9 @@ async fn persist_steamvr_pose_update(
         ),
     );
     let world = output::steamvr::gesture::clamp_world_position(pose.world_position);
+    // [1] 再归一化一次；[0]/[2] 原样保留（手势不应用）
+    let mut world_rot = pose.world_rotation_deg;
+    world_rot[1] = output::steamvr::gesture::normalize_deg(world_rot[1]);
 
     match state
         .update_and_persist_config(app, |config| {
@@ -768,6 +771,7 @@ async fn persist_steamvr_pose_update(
             config.output.steamvr.height_offset_m = hmd.height_offset_m;
             config.output.steamvr.horizontal_offset_m = hmd.horizontal_offset_m;
             config.output.steamvr.world_position = world;
+            config.output.steamvr.world_rotation_deg = world_rot;
             Ok(vec![
                 (
                     "output.steamvr.distance_m",
@@ -782,6 +786,10 @@ async fn persist_steamvr_pose_update(
                     serde_json::json!(hmd.horizontal_offset_m),
                 ),
                 ("output.steamvr.world_position", serde_json::json!(world)),
+                (
+                    "output.steamvr.world_rotation_deg",
+                    serde_json::json!(world_rot),
+                ),
             ])
         })
         .await

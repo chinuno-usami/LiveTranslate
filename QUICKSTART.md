@@ -208,6 +208,7 @@ curl http://127.0.0.1:8765/v1/models
 
 设置页 → **SteamVR Overlay** → 启用。可调跟随头部/世界坐标、距离、高度/水平偏移、宽度、
 曲率、透明度、字号与颜色。SteamVR 未启动时会自动重试。
+水平偏移非 0 时若觉得斜视，可开高级项 **hmd 面向用户**（只改偏航；默认关，与旧版一致）。
 
 **手柄移动面板（手势 3C，可选）：**
 
@@ -215,10 +216,15 @@ curl http://127.0.0.1:8765/v1/models
 2. 解锁：设置页 / 浮窗「VR 位置:锁定/可移动」/ 快捷键 `toggle_steamvr_lock`；
    可选 VR 内解锁 `unlock_via_vr_gesture = true`（指向已显示的面板 + 双手 trigger 按住 1.5s，默认关）。
 3. 默认双手 grip + 射线命中面板才拖动；松手后位置 clamp 并写入配置。
+   默认 `space=free`（可推拉距离）；若只能平面动，检查是否被设成 `plane`。
+   `free` 拖动中 pointer 会隐藏（避免错位）；触配置边界时最多震一次。
 4. **游戏内输入屏蔽（3A，可选）**：`block_game_input = true` 时仅在拖动期压制游戏 grip/trigger，
    需要 SteamVR → 设置 → 开发者 → *Enable global input from overlays (experimental)*；
    失败会自动降级为仅手势移动，设置页「输入屏蔽状态（只读）」会列出原因。
 5. **排错**：Dashboard 打开不可拖；面板隐藏时先出字幕再抓；不支持空手追踪。
+   深度手感 / 跳变阈值等常量见 `src/output/steamvr/gesture.rs` 顶部（`DEPTH_GAIN` 等）。
+   从 0.3.0 升级后默认 `space=free` 的行为 / 回滚到 `plane`：见 `docs/UPGRADING.md`（0.3.0 → 0.3.1）。
+   真机 A1–A12 / Index·Quest 清单（待验收）：`docs/V0.4_ACCEPTANCE.md`。
 
 ### 标准版 vs Full 版
 
@@ -230,6 +236,8 @@ curl http://127.0.0.1:8765/v1/models
 
 - **PLAN.md** - 完整技术方案（历史设计稿）
 - **README.md** - 详细用户指南
+- **docs/UPGRADING.md** - 版本升级注意（含 0.3.0 → 0.3.1 默认 `space=free`）
+- **docs/V0.4_ACCEPTANCE.md** - 0.3.1 SteamVR 真机验收清单（待验收；文件名保留方案代号）
 - **docs/ARCHITECTURE.md** - 系统架构
 - **docs/BUILD_FLAVORS.md** - 标准版 / Full 版构建说明
 - **IMPLEMENTATION_SUMMARY.md** - 实现总结（历史快照，以 README / ARCHITECTURE 为准）

@@ -1,6 +1,19 @@
-//! SteamVR 手势定位纯函数（3C）：矩阵、射线、增量换算与状态机。
+//! SteamVR 手势定位纯函数（3C / v0.4）：矩阵、射线、增量换算、free 映射与状态机。
 //!
-//! 不依赖 `openvr` 类型，便于非 Windows 单测。权威：docs/V0.3_FEATURE_PLAN.md §4.2–§4.8。
+//! 不依赖 `openvr` 类型，便于非 Windows 单测。
+//! 权威：docs/V0.3_FEATURE_PLAN.md §4.2–§4.8；docs/V0.4_GESTURE_POSE_PLAN.md §3 / §4 / §6.3。
+//!
+//! # 可调常量（本文件顶部，真机调参改这里）
+//!
+//! | 常量 | 用途 |
+//! | --- | --- |
+//! | [`R_MIN`] | free+ray：控制器相对 HMD pivot 距离下限，防方位角退化 |
+//! | [`EL_MAX`] | free+ray：面板仰角绝对值上限（默认 75°） |
+//! | [`DEPTH_GAIN`] | free+ray：深度比例增益（1/米）；实际 `G = DEPTH_GAIN * sensitivity` |
+//! | [`JUMP_M`] | free：手柄单帧位移超此值则丢帧 + rebase |
+//! | [`MAX_FRAME_DELTA_M`] | plane：单帧世界位移上限（free 不用） |
+//!
+//! 拖动轮询提频见 `imp.rs` 的 `FASTER_INTERVAL_WHILE_DRAGGING` / `DRAGGING_FRAME_INTERVAL`。
 
 use std::time::Duration;
 
@@ -14,7 +27,24 @@ pub const UNLOCK_HOLD: Duration = Duration::from_millis(1500);
 pub const UNLOCK_COOLDOWN: Duration = Duration::from_millis(1000);
 
 /// 单帧世界位移上限（米），防止追踪丢失/近平行射线瞬移。
+/// `space = plane` 增量路径使用；`space = free` 改用 [`JUMP_M`] 丢帧 + rebase。
 pub const MAX_FRAME_DELTA_M: f32 = 0.25;
+
+/// free + ray：手贴脸时控制器相对 pivot 距离下限（米），防方位角退化。
+pub const R_MIN: f32 = 0.15;
+
+/// free + ray：面板仰角绝对值上限（弧度，75°），远离极点奇异。
+pub const EL_MAX: f32 = 75.0_f32 * std::f32::consts::PI / 180.0;
+
+/// free + ray：深度比例增益（1/米）。实际 `G = DEPTH_GAIN * sensitivity`。
+/// `sensitivity=1` 时前推 0.3m ≈ ×e^{0.9} ≈ 2.46。
+pub const DEPTH_GAIN: f32 = 3.0;
+
+/// free：手柄单帧位移超过此阈值（米）则丢弃本帧并在下一有效帧 rebase。
+pub const JUMP_M: f32 = 0.3;
+
+/// `controller_yaw`：手柄前向水平投影短于此（米，前向近似单位向量时≈cos 俯仰）则冻结扭转。
+pub const CONTROLLER_YAW_MIN_HORIZ: f32 = 0.2;
 
 /// `|dot(dir, normal)|` 低于此值视为近平行，跳过本帧移动。
 pub const MIN_RAY_PLANE_DOT: f32 = 0.1;
@@ -235,20 +265,431 @@ pub fn apply_world_delta(start: [f32; 3], delta_world: [f32; 3]) -> [f32; 3] {
 
 /// Clamp HMD 偏移到 validate 区间。
 pub fn clamp_hmd_offsets(o: HmdOffsets) -> HmdOffsets {
-    HmdOffsets {
+    clamp_hmd_offsets_checked(o).0
+}
+
+/// Clamp HMD 偏移；`true` 表示至少一维触边界（用于每会话一次 haptic）。
+pub fn clamp_hmd_offsets_checked(o: HmdOffsets) -> (HmdOffsets, bool) {
+    let c = HmdOffsets {
         horizontal_offset_m: clamp_f32(o.horizontal_offset_m, OFFSET_M_RANGE.0, OFFSET_M_RANGE.1),
         height_offset_m: clamp_f32(o.height_offset_m, OFFSET_M_RANGE.0, OFFSET_M_RANGE.1),
         distance_m: clamp_f32(o.distance_m, DISTANCE_M_RANGE.0, DISTANCE_M_RANGE.1),
-    }
+    };
+    let hit = c.horizontal_offset_m != o.horizontal_offset_m
+        || c.height_offset_m != o.height_offset_m
+        || c.distance_m != o.distance_m;
+    (c, hit)
 }
 
 /// Clamp 世界坐标每轴到 validate 区间。
 pub fn clamp_world_position(p: [f32; 3]) -> [f32; 3] {
-    [
+    clamp_world_position_checked(p).0
+}
+
+/// Clamp 世界坐标；`true` 表示至少一轴触边界（用于每会话一次 haptic）。
+pub fn clamp_world_position_checked(p: [f32; 3]) -> ([f32; 3], bool) {
+    let c = [
         clamp_f32(p[0], WORLD_POSITION_RANGE.0, WORLD_POSITION_RANGE.1),
         clamp_f32(p[1], WORLD_POSITION_RANGE.0, WORLD_POSITION_RANGE.1),
         clamp_f32(p[2], WORLD_POSITION_RANGE.0, WORLD_POSITION_RANGE.1),
-    ]
+    ];
+    let hit = c[0] != p[0] || c[1] != p[1] || c[2] != p[2];
+    (c, hit)
+}
+
+/// 将弧度包到 `(-π, π]`。
+pub fn wrap_pi(a: f32) -> f32 {
+    let pi = std::f32::consts::PI;
+    let tau = 2.0 * pi;
+    // rem_euclid → [0, τ)；减 π → [-π, π)；再把 -π 映到 +π。
+    let mut x = (a + pi).rem_euclid(tau) - pi;
+    if x <= -pi {
+        x = pi;
+    }
+    x
+}
+
+/// 将角度（度）归一化到 `(-180, 180]`（写回 `world_rotation_deg[1]` 前使用）。
+pub fn normalize_deg(deg: f32) -> f32 {
+    let mut d = deg % 360.0;
+    if d > 180.0 {
+        d -= 360.0;
+    } else if d <= -180.0 {
+        d += 360.0;
+    }
+    d
+}
+
+/// 向量的方位角 / 仰角（弧度）：`az = atan2(x, z)`，`el = atan2(y, hypot(x,z))`。
+///
+/// 零向量返回 `(fallback_az, fallback_el)`。
+pub fn az_el_of(v: [f32; 3], fallback_az: f32, fallback_el: f32) -> (f32, f32) {
+    let horiz = (v[0] * v[0] + v[2] * v[2]).sqrt();
+    if horiz < 1e-8 && v[1].abs() < 1e-8 {
+        return (fallback_az, fallback_el);
+    }
+    (v[0].atan2(v[2]), v[1].atan2(horiz))
+}
+
+/// 由方位角 / 仰角得到单位方向（Y-up，az=0 朝 +Z）。
+pub fn dir_from_az_el(az: f32, el: f32) -> [f32; 3] {
+    let (sin_el, cos_el) = el.sin_cos();
+    let (sin_az, cos_az) = az.sin_cos();
+    [cos_el * sin_az, sin_el, cos_el * cos_az]
+}
+
+/// 刚体逆：`R^T`，`t' = -R^T t`（假定旋转正交）。
+pub fn mat3x4_inverse_rigid(m: &Mat3x4) -> Mat3x4 {
+    let t = m.translation();
+    let nt = m.rotation_transpose_mul(t);
+    Mat3x4([
+        [m.0[0][0], m.0[1][0], m.0[2][0], -nt[0]],
+        [m.0[0][1], m.0[1][1], m.0[2][1], -nt[1]],
+        [m.0[0][2], m.0[1][2], m.0[2][2], -nt[2]],
+    ])
+}
+
+/// 面板正对 `pivot` 的偏航（弧度）：水平化 `(pivot - p)` 后 `atan2(x, z)`。
+///
+/// 面板可视面朝局部 +Z；与 [`compose_world_rows`] / `world_matrix_rows` 一致。
+pub fn face_user_yaw(pivot: [f32; 3], p: [f32; 3]) -> f32 {
+    let fx = pivot[0] - p[0];
+    let fz = pivot[2] - p[2];
+    if fx.abs() < 1e-8 && fz.abs() < 1e-8 {
+        return 0.0;
+    }
+    // `+ 0.0` 去掉符号零，避免 atan2(-0, -1) = -π 与 +π 抖动
+    wrap_pi((fx + 0.0).atan2(fz + 0.0))
+}
+
+/// 手柄前向在水平面投影的方位角（弧度）。投影过短（近竖直）返回 `None`。
+pub fn controller_yaw(m: &Mat3x4) -> Option<f32> {
+    let f = controller_forward(m);
+    let horiz_len = (f[0] * f[0] + f[2] * f[2]).sqrt();
+    if horiz_len < CONTROLLER_YAW_MIN_HORIZ {
+        None
+    } else {
+        Some(wrap_pi((f[0] + 0.0).atan2(f[2] + 0.0)))
+    }
+}
+
+/// 站立系：仅绕 Y 的偏航矩阵（弧度）+ 平移。与 `imp::world_matrix_rows` 同构。
+pub fn compose_world_rows(pos: [f32; 3], yaw_rad: f32) -> Mat3x4 {
+    let (sin, cos) = yaw_rad.sin_cos();
+    let [x, y, z] = pos;
+    Mat3x4([[cos, 0.0, sin, x], [0.0, 1.0, 0.0, y], [-sin, 0.0, cos, z]])
+}
+
+/// 从仅偏航的世界矩阵提取 yaw（弧度）：`atan2(r02, r00)`。
+pub fn extract_yaw(m: &Mat3x4) -> f32 {
+    m.0[0][2].atan2(m.0[0][0])
+}
+
+/// free + ray 抓取基准（[`map_sphere`] 输入）。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SphereGrab {
+    pub pivot: [f32; 3],
+    pub r0: f32,
+    pub az_c0: f32,
+    pub el_c0: f32,
+    pub d0: f32,
+    pub az_p0: f32,
+    pub el_p0: f32,
+}
+
+impl SphereGrab {
+    /// 抓取瞬间由冻结的 HMD pivot、手柄位置、面板位置初始化。
+    pub fn from_poses(pivot: [f32; 3], controller_pos: [f32; 3], panel_pos: [f32; 3]) -> Self {
+        let v0 = sub3(controller_pos, pivot);
+        let r0 = length3(v0).max(R_MIN);
+        let (az_c0, el_c0) = az_el_of(v0, 0.0, 0.0);
+        let u0 = sub3(panel_pos, pivot);
+        let d0 = length3(u0);
+        let (az_p0, el_p0) = az_el_of(u0, 0.0, 0.0);
+        Self {
+            pivot,
+            r0,
+            az_c0,
+            el_c0,
+            d0,
+            az_p0,
+            el_p0,
+        }
+    }
+}
+
+/// free + ray：以头为中心的球坐标 + 比例深度映射，返回面板世界位置。
+///
+/// `sensitivity` 乘到 [`DEPTH_GAIN`] 上；`d` 在映射内 clamp 到 [`DISTANCE_M_RANGE`]。
+pub fn map_sphere(grab: &SphereGrab, controller_pos: [f32; 3], sensitivity: f32) -> [f32; 3] {
+    let v = sub3(controller_pos, grab.pivot);
+    let r_raw = length3(v);
+    let (az_c, el_c) = az_el_of(v, grab.az_c0, grab.el_c0);
+    let r = r_raw.max(R_MIN);
+    let daz = wrap_pi(az_c - grab.az_c0);
+    let del = el_c - grab.el_c0;
+    let az_p = grab.az_p0 + daz;
+    let el_p = clamp_f32(grab.el_p0 + del, -EL_MAX, EL_MAX);
+    let g = DEPTH_GAIN * sensitivity;
+    let d = clamp_f32(
+        grab.d0 * (g * (r - grab.r0)).exp(),
+        DISTANCE_M_RANGE.0,
+        DISTANCE_M_RANGE.1,
+    );
+    add3(grab.pivot, scale3(dir_from_az_el(az_p, el_p), d))
+}
+
+/// free + near：1:1 位置跟随（`t_attach = P0 - C0`，不用控制器旋转）。
+pub fn map_follow(controller_pos: [f32; 3], t_attach: [f32; 3]) -> [f32; 3] {
+    add3(controller_pos, t_attach)
+}
+
+/// 由当前 HMD 刚体与面板世界位置反推 hmd 锚点偏移（未 clamp）。
+///
+/// `L = inv(H) · p` → `horizontal=L.x`，`height=L.y`，`distance=-L.z`。
+pub fn hmd_offsets_from_world(hmd: &Mat3x4, panel_world: [f32; 3]) -> HmdOffsets {
+    let inv = mat3x4_inverse_rigid(hmd);
+    let local = inv.transform_point(panel_world);
+    HmdOffsets {
+        horizontal_offset_m: local[0],
+        height_offset_m: local[1],
+        distance_m: -local[2],
+    }
+}
+
+/// 用 `src` 的旋转列 + 新平移构造矩阵（hmd 锚点拖动期：当前 HMD 旋转 + 映射位置）。
+pub fn mat_with_translation(src: &Mat3x4, pos: [f32; 3]) -> Mat3x4 {
+    Mat3x4([
+        [src.0[0][0], src.0[0][1], src.0[0][2], pos[0]],
+        [src.0[1][0], src.0[1][1], src.0[1][2], pos[1]],
+        [src.0[2][0], src.0[2][1], src.0[2][2], pos[2]],
+    ])
+}
+
+/// free 拖动映射模式（`gesture.mode`：ray→Sphere，near→Follow）。
+#[derive(Debug, Clone, PartialEq)]
+pub enum FreeDragMode {
+    Sphere {
+        grab: SphereGrab,
+        yaw_ctrl0: f32,
+        yaw_at_grab: f32,
+        /// `controller_yaw`：上一帧有效的手柄扭转偏移；投影过短时沿用。
+        last_yaw_ctrl_delta: f32,
+    },
+    Follow {
+        pivot: [f32; 3],
+        t_attach: [f32; 3],
+        yaw_ctrl0: f32,
+        yaw_at_grab: f32,
+        last_yaw_ctrl_delta: f32,
+    },
+}
+
+/// free 空间拖动会话（`DragStarted` 当帧初始化；imp 持有）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct FreeDragSession {
+    pub mode: FreeDragMode,
+    pub prev_controller: [f32; 3],
+    pub needs_rebase: bool,
+    pub panel: Mat3x4,
+}
+
+impl FreeDragSession {
+    /// `ray_mode=true` → 球坐标；`false` → 1:1 跟随。
+    pub fn start(ray_mode: bool, hmd: &Mat3x4, controller: &Mat3x4, panel: Mat3x4) -> Self {
+        let pivot = hmd.translation();
+        let cpos = controller.translation();
+        let ppos = panel.translation();
+        let yaw_at_grab = extract_yaw(&panel);
+        let yaw_ctrl0 = controller_yaw(controller).unwrap_or(0.0);
+        let mode = if ray_mode {
+            FreeDragMode::Sphere {
+                grab: SphereGrab::from_poses(pivot, cpos, ppos),
+                yaw_ctrl0,
+                yaw_at_grab,
+                last_yaw_ctrl_delta: 0.0,
+            }
+        } else {
+            FreeDragMode::Follow {
+                pivot,
+                t_attach: sub3(ppos, cpos),
+                yaw_ctrl0,
+                yaw_at_grab,
+                last_yaw_ctrl_delta: 0.0,
+            }
+        };
+        Self {
+            mode,
+            prev_controller: cpos,
+            needs_rebase: false,
+            panel,
+        }
+    }
+
+    fn pivot(&self) -> [f32; 3] {
+        match &self.mode {
+            FreeDragMode::Sphere { grab, .. } => grab.pivot,
+            FreeDragMode::Follow { pivot, .. } => *pivot,
+        }
+    }
+
+    fn yaw_at_grab(&self) -> f32 {
+        match &self.mode {
+            FreeDragMode::Sphere { yaw_at_grab, .. } | FreeDragMode::Follow { yaw_at_grab, .. } => {
+                *yaw_at_grab
+            }
+        }
+    }
+
+    fn yaw_ctrl0(&self) -> f32 {
+        match &self.mode {
+            FreeDragMode::Sphere { yaw_ctrl0, .. } | FreeDragMode::Follow { yaw_ctrl0, .. } => {
+                *yaw_ctrl0
+            }
+        }
+    }
+
+    fn last_yaw_ctrl_delta_mut(&mut self) -> &mut f32 {
+        match &mut self.mode {
+            FreeDragMode::Sphere {
+                last_yaw_ctrl_delta,
+                ..
+            }
+            | FreeDragMode::Follow {
+                last_yaw_ctrl_delta,
+                ..
+            } => last_yaw_ctrl_delta,
+        }
+    }
+
+    /// 以当前面板 + 手柄重建抓取基准（毛刺丢帧后的下一有效帧）。pivot 保持冻结。
+    pub fn rebase(&mut self, controller: &Mat3x4) {
+        let cpos = controller.translation();
+        let ppos = self.panel.translation();
+        let yaw_ctrl = controller_yaw(controller).unwrap_or(self.yaw_ctrl0());
+        match &mut self.mode {
+            FreeDragMode::Sphere {
+                grab,
+                yaw_ctrl0,
+                yaw_at_grab,
+                last_yaw_ctrl_delta,
+            } => {
+                let pivot = grab.pivot;
+                *grab = SphereGrab::from_poses(pivot, cpos, ppos);
+                *yaw_ctrl0 = yaw_ctrl;
+                *yaw_at_grab = extract_yaw(&self.panel);
+                *last_yaw_ctrl_delta = 0.0;
+            }
+            FreeDragMode::Follow {
+                t_attach,
+                yaw_ctrl0,
+                yaw_at_grab,
+                last_yaw_ctrl_delta,
+                ..
+            } => {
+                *t_attach = sub3(ppos, cpos);
+                *yaw_ctrl0 = yaw_ctrl;
+                *yaw_at_grab = extract_yaw(&self.panel);
+                *last_yaw_ctrl_delta = 0.0;
+            }
+        }
+        self.prev_controller = cpos;
+        self.needs_rebase = false;
+    }
+
+    /// 计算 world 锚点偏航（弧度）。`orientation`：face_user / keep / controller_yaw。
+    pub fn resolve_yaw(
+        &mut self,
+        orientation: &str,
+        panel_pos: [f32; 3],
+        controller: &Mat3x4,
+    ) -> f32 {
+        let pivot = self.pivot();
+        let yaw_face = face_user_yaw(pivot, panel_pos);
+        match orientation {
+            "keep" => self.yaw_at_grab(),
+            "controller_yaw" => {
+                let delta = if let Some(yaw_c) = controller_yaw(controller) {
+                    let d = wrap_pi(yaw_c - self.yaw_ctrl0());
+                    *self.last_yaw_ctrl_delta_mut() = d;
+                    d
+                } else {
+                    *self.last_yaw_ctrl_delta_mut()
+                };
+                wrap_pi(yaw_face + delta)
+            }
+            _ => yaw_face, // face_user 及未知值
+        }
+    }
+
+    /// 推进一帧。手柄跳变超过 [`JUMP_M`] 时丢帧并标记 rebase，返回 `false`。
+    ///
+    /// `world_anchor`：true 用 orientation 偏航直立矩阵；false 用当前 HMD 旋转 + 映射位置。
+    pub fn tick(
+        &mut self,
+        controller: &Mat3x4,
+        hmd: &Mat3x4,
+        sensitivity: f32,
+        orientation: &str,
+        world_anchor: bool,
+    ) -> bool {
+        let cpos = controller.translation();
+        if length3(sub3(cpos, self.prev_controller)) > JUMP_M {
+            self.needs_rebase = true;
+            self.prev_controller = cpos;
+            return false;
+        }
+        if self.needs_rebase {
+            self.rebase(controller);
+        } else {
+            self.prev_controller = cpos;
+        }
+
+        let p = match &self.mode {
+            FreeDragMode::Sphere { grab, .. } => map_sphere(grab, cpos, sensitivity),
+            FreeDragMode::Follow { t_attach, .. } => map_follow(cpos, *t_attach),
+        };
+
+        if world_anchor {
+            let yaw = self.resolve_yaw(orientation, p, controller);
+            self.panel = compose_world_rows(p, yaw);
+        } else {
+            self.panel = mat_with_translation(hmd, p);
+        }
+        true
+    }
+
+    /// 将当前面板钳到 validate 区间（拖动中触边提示 / 减少松手跳变）。
+    ///
+    /// - world：钳 `world_position` 范围，保留当前偏航。
+    /// - hmd：经 [`hmd_offsets_from_world`] 钳偏移后再映回世界位置（当前 HMD 旋转）。
+    ///
+    /// 返回是否触边界。`world_anchor=false` 且缺 HMD 时不改动，返回 `false`。
+    pub fn clamp_to_validate(&mut self, world_anchor: bool, hmd: Option<&Mat3x4>) -> bool {
+        let p = self.panel.translation();
+        if world_anchor {
+            let (next, hit) = clamp_world_position_checked(p);
+            if hit {
+                let yaw = extract_yaw(&self.panel);
+                self.panel = compose_world_rows(next, yaw);
+            }
+            hit
+        } else if let Some(hmd_pose) = hmd {
+            let (next, hit) = clamp_hmd_offsets_checked(hmd_offsets_from_world(hmd_pose, p));
+            if hit {
+                let local = Mat3x4([
+                    [1.0, 0.0, 0.0, next.horizontal_offset_m],
+                    [0.0, 1.0, 0.0, next.height_offset_m],
+                    [0.0, 0.0, 1.0, -next.distance_m],
+                ]);
+                let clamped_p = hmd_pose.multiply(&local).translation();
+                self.panel = mat_with_translation(hmd_pose, clamped_p);
+            }
+            hit
+        } else {
+            false
+        }
+    }
 }
 
 /// 抓取组合（与配置 `gesture.grab` 对应）。
@@ -275,6 +716,9 @@ impl GrabChord {
     }
 
     /// `both_grips` 必须 pointer 命中才算激活；单手模式只需对应键。
+    ///
+    /// free 拖动中请用 [`chord_pointer_for_space`] 喂入 `pointer_hit`：absolute 面板与
+    /// `live_config` 命中不同步，拖动期若仍要求真实命中会误松手。
     pub fn is_active(
         self,
         left_grip: bool,
@@ -287,6 +731,18 @@ impl GrabChord {
             Self::RightGrip => right_grip,
             Self::RightTrigger => right_trigger,
         }
+    }
+}
+
+/// free 拖动中对 `both_grips` 的 pointer 门闩。
+///
+/// - arming / plane：返回真实 `pointer_on_panel`（进入抓取仍要命中）。
+/// - free + dragging：返回 `true`，只靠握持维持拖动（命中相对抓取前 `live_config` 会假阴性）。
+pub fn chord_pointer_for_space(space: &str, dragging: bool, pointer_on_panel: bool) -> bool {
+    if dragging && space == "free" {
+        true
+    } else {
+        pointer_on_panel
     }
 }
 
@@ -749,6 +1205,30 @@ mod tests {
         assert_eq!(p, [100.0, -100.0, 0.0]);
     }
 
+    #[test]
+    fn clamp_checked_reports_boundary_hit() {
+        let inside = HmdOffsets {
+            horizontal_offset_m: 0.5,
+            height_offset_m: -0.2,
+            distance_m: 1.6,
+        };
+        let (_, hit_in) = clamp_hmd_offsets_checked(inside);
+        assert!(!hit_in);
+
+        let (_, hit_out) = clamp_hmd_offsets_checked(HmdOffsets {
+            horizontal_offset_m: 9.0,
+            height_offset_m: 0.0,
+            distance_m: 1.6,
+        });
+        assert!(hit_out);
+
+        let (_, w_in) = clamp_world_position_checked([1.0, 2.0, 3.0]);
+        assert!(!w_in);
+        let (wp, w_out) = clamp_world_position_checked([200.0, 0.0, 0.0]);
+        assert!(w_out);
+        assert_eq!(wp[0], 100.0);
+    }
+
     fn frame(
         locked: bool,
         left: bool,
@@ -926,5 +1406,328 @@ mod tests {
         assert!(GrabChord::BothGrips.needs_left_hand());
         assert!(!GrabChord::RightGrip.needs_left_hand());
         assert!(!GrabChord::RightTrigger.needs_left_hand());
+    }
+
+    // --- A13: v0.4 free 映射 / 偏航 / 刚体逆 ---
+
+    #[test]
+    fn wrap_pi_and_normalize_deg_ranges() {
+        let pi = std::f32::consts::PI;
+        assert!((wrap_pi(0.0)).abs() < 1e-6);
+        assert!((wrap_pi(pi) - pi).abs() < 1e-5);
+        assert!((wrap_pi(-pi) - pi).abs() < 1e-5); // (-π, π]：-π → π
+        assert!((wrap_pi(1.5 * pi) + 0.5 * pi).abs() < 1e-5);
+        assert!((wrap_pi(-1.5 * pi) - 0.5 * pi).abs() < 1e-5);
+
+        assert!((normalize_deg(0.0) - 0.0).abs() < 1e-5);
+        assert!((normalize_deg(180.0) - 180.0).abs() < 1e-5);
+        assert!((normalize_deg(-180.0) - 180.0).abs() < 1e-5);
+        assert!((normalize_deg(190.0) + 170.0).abs() < 1e-5);
+        assert!((normalize_deg(-190.0) - 170.0).abs() < 1e-5);
+        assert!((normalize_deg(540.0) - 180.0).abs() < 1e-5);
+        assert!((normalize_deg(-540.0) - 180.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn az_el_dir_roundtrip() {
+        let az = 0.7_f32;
+        let el = -0.3_f32;
+        let d = dir_from_az_el(az, el);
+        assert!((length3(d) - 1.0).abs() < 1e-5);
+        let (az2, el2) = az_el_of(d, 0.0, 0.0);
+        assert!((az2 - az).abs() < 1e-5);
+        assert!((el2 - el).abs() < 1e-5);
+        // az=0 → +Z
+        approx_eq3(dir_from_az_el(0.0, 0.0), [0.0, 0.0, 1.0], 1e-5);
+    }
+
+    #[test]
+    fn compose_extract_yaw_inverse() {
+        for &yaw_deg in &[-135.0_f32, -90.0, -45.0, 0.0, 30.0, 90.0, 179.0] {
+            let yaw = yaw_deg.to_radians();
+            let m = compose_world_rows([1.0, 2.0, 3.0], yaw);
+            assert!((extract_yaw(&m) - yaw).abs() < 1e-5);
+            // 与 imp::world_matrix_rows 同构：Z 列 = (sin, 0, cos)
+            let (s, c) = yaw.sin_cos();
+            assert!((m.0[0][2] - s).abs() < 1e-6);
+            assert!((m.0[2][2] - c).abs() < 1e-6);
+            assert_eq!(m.translation(), [1.0, 2.0, 3.0]);
+        }
+    }
+
+    #[test]
+    fn face_user_yaw_faces_pivot() {
+        let pivot = [0.0, 1.6, 0.0];
+        // 面板在 -Z：应朝向 +Z（yaw=0）
+        let yaw0 = face_user_yaw(pivot, [0.0, 1.6, -2.0]);
+        assert!(yaw0.abs() < 1e-5);
+        // 面板在 +X：朝向 -X ⇒ yaw = -π/2（Z 列 = (-1,0,0)）
+        let yaw_neg_x = face_user_yaw(pivot, [2.0, 1.6, 0.0]);
+        assert!((yaw_neg_x + std::f32::consts::FRAC_PI_2).abs() < 1e-5);
+        // 面板在 -X：朝向 +X ⇒ yaw = π/2
+        let yaw_pos_x = face_user_yaw(pivot, [-2.0, 1.6, 0.0]);
+        assert!((yaw_pos_x - std::f32::consts::FRAC_PI_2).abs() < 1e-5);
+        // 高度差不影响偏航
+        let yaw_h = face_user_yaw(pivot, [0.0, 0.0, -2.0]);
+        assert!(yaw_h.abs() < 1e-5);
+    }
+
+    #[test]
+    fn map_sphere_depth_scales_proportionally() {
+        let pivot = [0.0, 1.6, 0.0];
+        // 手柄与面板同向 -Z；面板 1.5m，手柄 0.5m
+        let c0 = [0.0, 1.6, -0.5];
+        let p0 = [0.0, 1.6, -1.5];
+        let grab = SphereGrab::from_poses(pivot, c0, p0);
+        assert!((grab.d0 - 1.5).abs() < 1e-5);
+        assert!((grab.r0 - 0.5).abs() < 1e-5);
+
+        // 前推 0.3m（手柄更远）→ d ≈ 1.5 * exp(3*0.3) ≈ 1.5 * 2.4596 ≈ 3.69
+        let p_fwd = map_sphere(&grab, [0.0, 1.6, -0.8], 1.0);
+        let d_fwd = length3(sub3(p_fwd, pivot));
+        assert!(
+            d_fwd >= 1.5 + 0.8,
+            "A1-like: push 0.3m from 1.5m should grow ≥0.8m, got d={d_fwd}"
+        );
+        assert!((d_fwd - 1.5 * (DEPTH_GAIN * 0.3).exp()).abs() < 1e-3);
+
+        // 面板 3m，前推 0.3m → 增大 ≥ 1.5m（A2）
+        let p0_far = [0.0, 1.6, -3.0];
+        let grab_far = SphereGrab::from_poses(pivot, c0, p0_far);
+        let p_far = map_sphere(&grab_far, [0.0, 1.6, -0.8], 1.0);
+        let d_far = length3(sub3(p_far, pivot));
+        assert!(
+            d_far >= 3.0 + 1.5,
+            "A2-like: from 3m push 0.3m should grow ≥1.5m, got d={d_far}"
+        );
+        assert!(d_far <= DISTANCE_M_RANGE.1 + 1e-5);
+
+        // 后拉回到约 1.5m
+        let p_back = map_sphere(&grab, c0, 1.0);
+        approx_eq3(p_back, p0, 1e-4);
+
+        // clamp 上界
+        let p_max = map_sphere(&grab_far, [0.0, 1.6, -2.0], 3.0);
+        let d_max = length3(sub3(p_max, pivot));
+        assert!((d_max - DISTANCE_M_RANGE.1).abs() < 1e-4);
+    }
+
+    #[test]
+    fn map_sphere_azimuth_follows_controller() {
+        let pivot = [0.0, 1.6, 0.0];
+        let c0 = [0.0, 1.6, -0.5];
+        let p0 = [0.0, 1.6, -2.0];
+        let grab = SphereGrab::from_poses(pivot, c0, p0);
+        // 手柄转到 +X（同距离）
+        let p = map_sphere(&grab, [0.5, 1.6, 0.0], 1.0);
+        // 面板应大致在 +X 方向、距离仍约 2m
+        assert!(p[0] > 1.5, "panel should move toward +X, got {p:?}");
+        assert!(p[2].abs() < 0.5, "panel mostly on +X axis, got {p:?}");
+        let d = length3(sub3(p, pivot));
+        assert!((d - 2.0).abs() < 0.05);
+    }
+
+    #[test]
+    fn map_follow_is_one_to_one_translation() {
+        let t_attach = [0.1, -0.2, 0.3];
+        let c = [1.0, 2.0, 3.0];
+        approx_eq3(map_follow(c, t_attach), [1.1, 1.8, 3.3], 1e-6);
+        // 不用旋转：同一 t_attach 仅随位置平移
+        approx_eq3(map_follow([0.0, 0.0, 0.0], t_attach), t_attach, 1e-6);
+    }
+
+    #[test]
+    fn mat3x4_inverse_rigid_roundtrip() {
+        let yaw = 0.4_f32;
+        let (s, c) = yaw.sin_cos();
+        let m = Mat3x4([[c, 0.0, s, 1.0], [0.0, 1.0, 0.0, 2.0], [-s, 0.0, c, 3.0]]);
+        let inv = mat3x4_inverse_rigid(&m);
+        let p = [4.0, 5.0, 6.0];
+        let back = inv.transform_point(m.transform_point(p));
+        approx_eq3(back, p, 1e-5);
+        let id = m.multiply(&inv);
+        approx_eq3(id.translation(), [0.0, 0.0, 0.0], 1e-5);
+        assert!((id.0[0][0] - 1.0).abs() < 1e-5);
+        assert!((id.0[1][1] - 1.0).abs() < 1e-5);
+        assert!((id.0[2][2] - 1.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn hmd_offsets_from_world_matches_local_layout() {
+        // identity HMD at origin：面板在局部 (0.2, -0.1, -1.5) → distance=1.5
+        let hmd = Mat3x4::IDENTITY;
+        let panel = [0.2, -0.1, -1.5];
+        let o = hmd_offsets_from_world(&hmd, panel);
+        assert!((o.horizontal_offset_m - 0.2).abs() < 1e-5);
+        assert!((o.height_offset_m + 0.1).abs() < 1e-5);
+        assert!((o.distance_m - 1.5).abs() < 1e-5);
+
+        // 旋转 90° 偏航后的 HMD：局部点经 H 变换再反推应还原
+        let yaw = std::f32::consts::FRAC_PI_2;
+        let hmd_r = compose_world_rows([0.0, 1.6, 0.0], yaw);
+        let local = [0.3, 0.1, -2.0];
+        let world = hmd_r.transform_point(local);
+        let o2 = hmd_offsets_from_world(&hmd_r, world);
+        assert!((o2.horizontal_offset_m - 0.3).abs() < 1e-5);
+        assert!((o2.height_offset_m - 0.1).abs() < 1e-5);
+        assert!((o2.distance_m - 2.0).abs() < 1e-5);
+
+        let clamped = clamp_hmd_offsets(HmdOffsets {
+            horizontal_offset_m: 5.0,
+            height_offset_m: -5.0,
+            distance_m: 0.01,
+        });
+        assert_eq!(clamped.horizontal_offset_m, OFFSET_M_RANGE.1);
+        assert_eq!(clamped.height_offset_m, OFFSET_M_RANGE.0);
+        assert_eq!(clamped.distance_m, DISTANCE_M_RANGE.0);
+    }
+
+    #[test]
+    fn controller_yaw_uses_horizontal_forward() {
+        // identity：前向 -Z → yaw = atan2(0,-1) = π
+        let yaw0 = controller_yaw(&Mat3x4::IDENTITY).expect("horiz");
+        assert!((yaw0 - std::f32::consts::PI).abs() < 1e-5);
+
+        // 俯仰过大：前向近竖直 → None
+        // 绕 X 俯仰 ~90°：局部 -Z → 世界 -Y
+        let pitched = Mat3x4([
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [0.0, -1.0, 0.0, 0.0],
+        ]);
+        // forward = -Z_col = (0, -1, 0) after... Z column is [0,1,0], forward = -Z = [0,-1,0]
+        assert!(controller_yaw(&pitched).is_none());
+    }
+
+    #[test]
+    fn free_session_sphere_moves_with_controller() {
+        let hmd = compose_world_rows([0.0, 1.6, 0.0], 0.0);
+        let c0 = compose_world_rows([0.0, 1.6, -0.5], 0.0);
+        let panel0 = compose_world_rows([0.0, 1.6, -2.0], 0.0);
+        let mut session = FreeDragSession::start(true, &hmd, &c0, panel0);
+        let c1 = compose_world_rows([0.3, 1.6, -0.5], 0.0);
+        assert!(session.tick(&c1, &hmd, 1.0, "face_user", true));
+        let p = session.panel.translation();
+        assert!(
+            p[0] > 0.05,
+            "azimuth should follow controller +X, got {p:?}"
+        );
+        // face_user：面板朝向 pivot
+        let yaw = extract_yaw(&session.panel);
+        let expect = face_user_yaw(hmd.translation(), p);
+        assert!((yaw - expect).abs() < 1e-4);
+    }
+
+    #[test]
+    fn free_session_jump_skips_and_rebases() {
+        let hmd = compose_world_rows([0.0, 1.6, 0.0], 0.0);
+        let c0 = compose_world_rows([0.0, 1.6, -0.5], 0.0);
+        let panel0 = compose_world_rows([0.0, 1.6, -2.0], 0.0);
+        let mut session = FreeDragSession::start(true, &hmd, &c0, panel0);
+        let before = session.panel.translation();
+        // 跳变超过 JUMP_M
+        let c_jump = compose_world_rows([0.0, 1.6, -0.5 + JUMP_M + 0.05], 0.0);
+        assert!(!session.tick(&c_jump, &hmd, 1.0, "keep", true));
+        assert!(session.needs_rebase);
+        // 不变量 6 / A12：丢帧后 panel 不变；imp 须继续 absolute(panel)，禁止回落 apply_transform。
+        approx_eq3(session.panel.translation(), before, 1e-5);
+        // 下一帧小幅移动：rebase 后继续
+        let c2 = compose_world_rows([0.05, 1.6, -0.5 + JUMP_M + 0.05], 0.0);
+        assert!(session.tick(&c2, &hmd, 1.0, "keep", true));
+        assert!(!session.needs_rebase);
+    }
+
+    #[test]
+    fn free_session_keep_preserves_yaw() {
+        let yaw0 = 0.7f32;
+        let hmd = compose_world_rows([0.0, 1.6, 0.0], 0.0);
+        let c0 = compose_world_rows([0.0, 1.6, -0.5], 0.0);
+        let panel0 = compose_world_rows([0.0, 1.6, -2.0], yaw0);
+        let mut session = FreeDragSession::start(true, &hmd, &c0, panel0);
+        let c1 = compose_world_rows([0.15, 1.6, -0.45], 0.0);
+        assert!(session.tick(&c1, &hmd, 1.0, "keep", true));
+        assert!((extract_yaw(&session.panel) - yaw0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn free_session_follow_is_one_to_one() {
+        let hmd = compose_world_rows([0.0, 1.6, 0.0], 0.0);
+        let c0 = compose_world_rows([0.2, 1.5, -0.3], 0.0);
+        let panel0 = compose_world_rows([0.5, 1.4, -1.0], 0.2);
+        let mut session = FreeDragSession::start(false, &hmd, &c0, panel0);
+        let c1 = compose_world_rows([0.3, 1.55, -0.35], 0.0);
+        assert!(session.tick(&c1, &hmd, 1.0, "face_user", true));
+        let expect = map_follow(
+            c1.translation(),
+            sub3(panel0.translation(), c0.translation()),
+        );
+        approx_eq3(session.panel.translation(), expect, 1e-5);
+    }
+
+    #[test]
+    fn free_session_controller_yaw_adds_twist() {
+        let hmd = compose_world_rows([0.0, 1.6, 0.0], 0.0);
+        // 手柄初始朝 -Z（yaw=π 或 按 forward=-Z → atan2(0,-1)=π）
+        let c0 = compose_world_rows([0.0, 1.6, -0.5], 0.0);
+        let panel0 = compose_world_rows([0.0, 1.6, -2.0], 0.0);
+        let mut session = FreeDragSession::start(true, &hmd, &c0, panel0);
+        // 绕 Y 转 45°：前向水平投影方位变化
+        let yaw_twist = 45.0_f32.to_radians();
+        let c1 = compose_world_rows([0.0, 1.6, -0.5], yaw_twist);
+        assert!(session.tick(&c1, &hmd, 1.0, "controller_yaw", true));
+        let yaw = extract_yaw(&session.panel);
+        let face = face_user_yaw(hmd.translation(), session.panel.translation());
+        // 叠加扭转后应明显偏离纯 face_user
+        assert!(
+            (yaw - face).abs() > 0.2,
+            "expected controller twist on top of face_user, yaw={yaw} face={face}"
+        );
+    }
+
+    #[test]
+    fn jump_m_constant_is_above_plane_frame_cap() {
+        // 文档：free 用 JUMP_M 丢帧；plane 保留 MAX_FRAME_DELTA_M
+        const {
+            assert!(JUMP_M > MAX_FRAME_DELTA_M);
+        }
+        assert!((R_MIN - 0.15).abs() < 1e-6);
+        assert!((DEPTH_GAIN - 3.0).abs() < 1e-6);
+        assert!((EL_MAX - 75.0_f32.to_radians()).abs() < 1e-5);
+    }
+
+    #[test]
+    fn chord_pointer_for_space_relaxes_only_while_free_dragging() {
+        assert!(!chord_pointer_for_space("free", false, false));
+        assert!(chord_pointer_for_space("free", false, true));
+        assert!(chord_pointer_for_space("free", true, false));
+        assert!(chord_pointer_for_space("free", true, true));
+        // plane：始终透传真实命中（拖动中离开面板仍可松手）
+        assert!(!chord_pointer_for_space("plane", true, false));
+        assert!(chord_pointer_for_space("plane", true, true));
+    }
+
+    #[test]
+    fn free_session_clamp_to_validate_world_and_hmd() {
+        let hmd = compose_world_rows([0.0, 1.6, 0.0], 0.0);
+        let c0 = compose_world_rows([0.0, 1.6, -0.5], 0.0);
+        let yaw0 = 0.4_f32;
+        let mut session =
+            FreeDragSession::start(true, &hmd, &c0, compose_world_rows([150.0, 0.0, 0.0], yaw0));
+        assert!(session.clamp_to_validate(true, None));
+        approx_eq3(session.panel.translation(), [100.0, 0.0, 0.0], 1e-5);
+        assert!((extract_yaw(&session.panel) - yaw0).abs() < 1e-5);
+
+        // hmd：超大偏移钳回 OFFSET / DISTANCE 后映回世界点
+        let mut session_hmd =
+            FreeDragSession::start(false, &hmd, &c0, compose_world_rows([9.0, 1.6, -1.0], 0.0));
+        assert!(session_hmd.clamp_to_validate(false, Some(&hmd)));
+        let o = hmd_offsets_from_world(&hmd, session_hmd.panel.translation());
+        assert_eq!(o.horizontal_offset_m, OFFSET_M_RANGE.1);
+        assert!((o.height_offset_m - 0.0).abs() < 1e-4);
+        assert!((o.distance_m - 1.0).abs() < 1e-4);
+        // 缺 HMD 不改
+        let before = session_hmd.panel.translation();
+        assert!(!session_hmd.clamp_to_validate(false, None));
+        approx_eq3(session_hmd.panel.translation(), before, 1e-5);
     }
 }

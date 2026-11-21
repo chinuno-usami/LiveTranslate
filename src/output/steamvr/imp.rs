@@ -1,7 +1,8 @@
 //! Windows + steamvr feature 的真实实现。
 //!
-//! 线程模型：tokio 侧只更新共享快照并递增 revision；VR 线程各 33ms 检查一次，
+//! 线程模型：tokio 侧只更新共享快照并递增 revision；VR 线程默认各 ~33ms 检查一次，
 //! 内容变化才重新渲染/上传，因此字幕事件不会跨线程拷贝两次纹理。
+//! 可选：Dragging 期把轮询提到 ~11ms（见 [`FASTER_INTERVAL_WHILE_DRAGGING`]），纹理节奏不变。
 //!
 //! 3C 手势：legacy `GetControllerStateWithPose` + `gesture::GestureState`；
 //! `config_epoch` 与内容 `revision` 分离；松手经 `pending_pose` 通知主线程持久化。
@@ -9,12 +10,17 @@
 //! 3A 输入屏蔽：仅当 `gesture.block_game_input` 且进入拖动时懒初始化
 //! [`super::input::InputBlocker`]，以 overlay-global `nPriority` 提交；
 //! 松手 / cancel / Dashboard / 断开 / 异常路径显式归零；失败降级 3C。
+//!
+//! free 拖动期 pointer 隐藏（面板 absolute，与基于 live_config 的 plane_hit 不同步）；
+//! free + both_grips 拖动中不再要求真实 pointer 命中（见 [`gesture::chord_pointer_for_space`]）；
+//! plane 仍跟命中点并换色。clamp 触边界每拖动会话至多一次 haptic。
 
 use super::gesture::{
-    self, apply_hmd_delta, apply_world_delta, clamp_hmd_offsets, clamp_world_position,
-    controller_forward, drag_world_delta, hit_in_panel_rect, ray_nearly_parallel,
-    ray_plane_intersection, GestureFrameInput, GestureState, GestureTransition, GrabChord,
-    HmdOffsets, Mat3x4, UnlockGestureState, MAX_FRAME_DELTA_M, PANEL_HIT_MARGIN_FRAC,
+    self, apply_hmd_delta, apply_world_delta, chord_pointer_for_space, clamp_hmd_offsets_checked,
+    clamp_world_position_checked, compose_world_rows, controller_forward, drag_world_delta,
+    extract_yaw, hit_in_panel_rect, hmd_offsets_from_world, normalize_deg, ray_nearly_parallel,
+    ray_plane_intersection, FreeDragSession, GestureFrameInput, GestureState, GestureTransition,
+    GrabChord, HmdOffsets, Mat3x4, UnlockGestureState, MAX_FRAME_DELTA_M, PANEL_HIT_MARGIN_FRAC,
 };
 use super::input::InputBlocker;
 use super::render;
@@ -47,7 +53,13 @@ const POINTER_WIDTH_M: f32 = 0.018;
 const POINTER_FORWARD_OFFSET_M: f32 = 0.02;
 const POINTER_TEX_SIZE: usize = 32;
 const HAPTIC_PULSE_US: u16 = 1200;
+/// 非拖动期 / 纹理友好默认轮询间隔。
 const FRAME_INTERVAL: Duration = Duration::from_millis(33);
+/// Dragging 期位姿轮询间隔（仅当 [`FASTER_INTERVAL_WHILE_DRAGGING`] 为 true）。
+/// 纹理上传仍跟 content `revision`，不因本开关提速——换跟手度、略增 CPU。
+const DRAGGING_FRAME_INTERVAL: Duration = Duration::from_millis(11);
+/// 拖动时是否改用 [`DRAGGING_FRAME_INTERVAL`]。关=始终 ~33ms（更省）。
+const FASTER_INTERVAL_WHILE_DRAGGING: bool = true;
 /// OpenVR `ButtonMaskFromId`：`1 << EVRButtonId`
 const BTN_GRIP: u64 = 1u64 << (button_id::GRIP as u32);
 const BTN_TRIGGER: u64 = 1u64 << (button_id::STEAM_VR_TRIGGER as u32);
@@ -679,6 +691,7 @@ fn pose_update_from_config(config: &SteamVrConfig) -> SteamVrPoseUpdate {
         height_offset_m: config.height_offset_m,
         horizontal_offset_m: config.horizontal_offset_m,
         world_position: config.world_position,
+        world_rotation_deg: config.world_rotation_deg,
     }
 }
 
@@ -910,6 +923,12 @@ fn session(
     let mut pose_apply_epoch: Option<(u64, Instant)> = None;
     // 3A：Drop 时归零 priority，覆盖异常 / 提前 return
     let mut input_block = InputBlockController::new(&context, shared);
+    // v0.4 free 空间拖动会话（DragStarted 当帧初始化；plane 路径为 None）
+    let mut free_session: Option<FreeDragSession> = None;
+    // 取消 / 松手后需立即 apply_transform（尤其 hmd 锚点曾用 absolute）
+    let mut force_apply_transform = false;
+    // clamp 触边界 haptic：每个拖动会话至多一次（DragStarted 清零）
+    let mut clamp_haptic_sent = false;
 
     loop {
         if stop.load(Ordering::SeqCst) {
@@ -1040,18 +1059,28 @@ fn session(
             if tr == GestureTransition::DragCancelled {
                 set_dragging(shared, false);
             }
-            // 取消不写回：丢弃拖动中的 live 偏移；3A 归零
+            // 取消不写回：丢弃拖动中的 live 偏移；3A 归零；立即恢复原锚点变换
             pose_apply_epoch = None;
             live_config = shared_config.clone();
+            free_session = None;
+            clamp_haptic_sent = false;
+            force_apply_transform = true;
             input_block.clear_blocking();
         }
 
+        // free 拖动：absolute 面板与 live_config 命中不同步；both_grips 若仍要求真实
+        // pointer 会在左右挥/near 跟手时误松手。arming / plane 仍用真实命中。
+        let pointer_for_chord = chord_pointer_for_space(
+            &live_config.gesture.space,
+            gesture.is_dragging(),
+            pointer_on_panel,
+        );
         let frame_input = GestureFrameInput {
             locked: live_config.gesture.locked || !live_config.gesture.enabled,
             left_grip: controllers.left_grip,
             right_grip: controllers.right_grip,
             right_trigger: controllers.right_trigger,
-            pointer_on_panel,
+            pointer_on_panel: pointer_for_chord,
             config_epoch,
             now,
         };
@@ -1070,6 +1099,19 @@ fn session(
         match transition {
             GestureTransition::DragStarted => {
                 set_dragging(shared, true);
+                free_session = None;
+                clamp_haptic_sent = false;
+                if live_config.gesture.space == "free" {
+                    if let (Some(hmd_pose), Some(right_pose)) =
+                        (hmd.as_ref(), controllers.right_pose.as_ref())
+                    {
+                        let panel = panel_world_matrix(&live_config, hmd_pose);
+                        let ray_mode = live_config.gesture.mode != "near";
+                        free_session = Some(FreeDragSession::start(
+                            ray_mode, hmd_pose, right_pose, panel,
+                        ));
+                    }
+                }
                 if live_config.gesture.block_game_input {
                     input_block.apply_blocking();
                 }
@@ -1081,12 +1123,23 @@ fn session(
                 *lock(&shared.last_activity) = Instant::now();
             }
             GestureTransition::DragReleased => {
+                let mut release_clamped = false;
+                if let Some(session) = free_session.take() {
+                    release_clamped =
+                        apply_free_session_to_config(&mut live_config, &session, hmd.as_ref());
+                    force_apply_transform = true;
+                }
                 let pose = pose_update_from_config(&live_config);
                 *lock(&shared.pending_pose) = Some(pose);
                 pose_apply_epoch = Some((config_epoch, Instant::now()));
                 let _ = gesture.take_drag_origins();
                 set_dragging(shared, false);
                 input_block.clear_blocking();
+                // 松手必震一次；若本帧才触 clamp 且本会话未发过触边震，不额外叠加
+                // （松手震已覆盖提示）。拖动中已发过触边震则 flag 已 true。
+                if release_clamped {
+                    clamp_haptic_sent = true;
+                }
                 haptic(
                     &system,
                     controllers.right_index.or(controllers.left_index),
@@ -1100,6 +1153,9 @@ fn session(
                 input_block.clear_blocking();
                 pose_apply_epoch = None;
                 live_config = shared_config.clone();
+                free_session = None;
+                clamp_haptic_sent = false;
+                force_apply_transform = true;
             }
             GestureTransition::None => {}
         }
@@ -1109,9 +1165,32 @@ fn session(
             input_block.apply_blocking();
         }
 
-        // 拖动中：每帧用命中增量更新 live_config（不写 Shared.config）
+        // 拖动中：free → absolute 映射；plane → v0.3 平面增量（不写 Shared.config）
+        let mut free_absolute: Option<Mat3x4> = None;
+        let mut clamp_hit_this_frame = false;
         if gesture.is_dragging() {
-            if let Some(hmd_pose) = hmd.as_ref() {
+            if live_config.gesture.space == "free" {
+                if let Some(session) = free_session.as_mut() {
+                    let world_anchor = live_config.anchor == "world";
+                    if let (Some(hmd_pose), Some(right_pose)) =
+                        (hmd.as_ref(), controllers.right_pose.as_ref())
+                    {
+                        // tick==false（JUMP 丢帧）时 panel 保持上一有效位姿；仍须 absolute。
+                        let _ = session.tick(
+                            right_pose,
+                            hmd_pose,
+                            live_config.gesture.sensitivity,
+                            &live_config.gesture.orientation,
+                            world_anchor,
+                        );
+                    }
+                    // 拖动中钳 validate，复用每会话一次触边 haptic；减少松手才 clamp 的跳变。
+                    clamp_hit_this_frame |= session.clamp_to_validate(world_anchor, hmd.as_ref());
+                    // 会话存活期间始终 absolute（含毛刺丢帧）：禁止回落
+                    // apply_transform(live_config)（抓取前配置 → 瞬移 / hmd 锚点切换）。
+                    free_absolute = Some(session.panel);
+                }
+            } else if let Some(hmd_pose) = hmd.as_ref() {
                 if let Some(delta) = drag_world_delta(
                     move_hit,
                     gesture.prev_hit_mut(),
@@ -1119,34 +1198,48 @@ fn session(
                     MAX_FRAME_DELTA_M,
                 ) {
                     if live_config.anchor == "world" {
-                        live_config.world_position = clamp_world_position(apply_world_delta(
+                        let (next, hit) = clamp_world_position_checked(apply_world_delta(
                             live_config.world_position,
                             delta,
                         ));
+                        live_config.world_position = next;
+                        clamp_hit_this_frame |= hit;
                     } else {
                         let cur = HmdOffsets::from_config_fields(
                             live_config.horizontal_offset_m,
                             live_config.height_offset_m,
                             live_config.distance_m,
                         );
-                        let next = clamp_hmd_offsets(apply_hmd_delta(cur, hmd_pose, delta));
+                        let (next, hit) =
+                            clamp_hmd_offsets_checked(apply_hmd_delta(cur, hmd_pose, delta));
                         live_config.horizontal_offset_m = next.horizontal_offset_m;
                         live_config.height_offset_m = next.height_offset_m;
                         live_config.distance_m = next.distance_m;
+                        clamp_hit_this_frame |= hit;
                     }
                 }
             }
             *lock(&shared.last_activity) = Instant::now();
         }
+        if clamp_hit_this_frame && !clamp_haptic_sent {
+            haptic(
+                &system,
+                controllers.right_index.or(controllers.left_index),
+                live_config.gesture.haptics,
+            );
+            clamp_haptic_sent = true;
+        }
 
-        // pointer overlay：命中点跟随；拖动时换色
+        // pointer：plane 跟命中点、拖动换色；free 拖动中隐藏（absolute 面板与 plane_hit 不同步）
         if let Some(ph) = pointer_handle {
+            let free_dragging = gesture.is_dragging() && live_config.gesture.space == "free";
             let show = live_config.gesture.enabled
                 && live_config.gesture.pointer
                 && !live_config.gesture.locked
                 && !dashboard_open
                 && panel_visible
-                && plane_hit.is_some();
+                && plane_hit.is_some()
+                && !free_dragging;
             if show {
                 if let Some(hit) = plane_hit {
                     let dragging = gesture.is_dragging();
@@ -1174,8 +1267,24 @@ fn session(
                 .map(|t| t.elapsed() >= Duration::from_millis(500))
                 .unwrap_or(true);
 
-        // 拖动期间每帧 apply_transform；非拖动仍按 revision 节流
-        if dragging_now || retry_due {
+        // free 拖动：绝对变换（含 JUMP 丢帧）；plane / 非拖动：原 apply_transform。
+        // free 会话存活时绝不可用 live_config 走 apply_transform（不变量 6 / A12）。
+        if let Some(panel) = free_absolute {
+            if let Err(e) = overlay.set_transform_absolute(
+                handle,
+                TrackingUniverseOrigin::Standing,
+                &Matrix3x4(panel.0),
+            ) {
+                if is_fatal_overlay_error(e) {
+                    return Err(SessionError::Message(format!(
+                        "设置 Overlay 坐标失败: {e:?}"
+                    )));
+                }
+                tracing::warn!("设置 Overlay 坐标失败: {e:?}");
+            }
+        } else if free_session.is_none() && (dragging_now || retry_due || force_apply_transform) {
+            // free_session.is_some() 时即使缺 pose / JUMP 丢帧也不进此支，避免回落配置变换。
+            force_apply_transform = false;
             if let Err(e) = apply_transform(&mut overlay, handle, &live_config) {
                 if is_fatal_overlay_error(e) {
                     return Err(SessionError::Message(format!(
@@ -1309,7 +1418,38 @@ fn session(
 
         panel_visible = current_opacity > 0.05 && target_opacity > 0.0;
 
-        std::thread::sleep(FRAME_INTERVAL);
+        let sleep_for = if FASTER_INTERVAL_WHILE_DRAGGING && gesture.is_dragging() {
+            DRAGGING_FRAME_INTERVAL
+        } else {
+            FRAME_INTERVAL
+        };
+        std::thread::sleep(sleep_for);
+    }
+}
+
+/// 松手分解 free 会话到位姿字段并 clamp。返回是否触 validate 边界。
+fn apply_free_session_to_config(
+    config: &mut SteamVrConfig,
+    session: &FreeDragSession,
+    hmd: Option<&Mat3x4>,
+) -> bool {
+    let p = session.panel.translation();
+    if config.anchor == "world" {
+        let (next, hit) = clamp_world_position_checked(p);
+        config.world_position = next;
+        if config.gesture.orientation != "keep" {
+            let yaw_deg = normalize_deg(extract_yaw(&session.panel).to_degrees());
+            config.world_rotation_deg[1] = yaw_deg;
+        }
+        hit
+    } else if let Some(hmd_pose) = hmd {
+        let (next, hit) = clamp_hmd_offsets_checked(hmd_offsets_from_world(hmd_pose, p));
+        config.horizontal_offset_m = next.horizontal_offset_m;
+        config.height_offset_m = next.height_offset_m;
+        config.distance_m = next.distance_m;
+        hit
+    } else {
+        false
     }
 }
 
@@ -1328,15 +1468,17 @@ fn apply_transform(
 }
 
 /// HMD 局部坐标：+X 右、+Y 上、-Z 前；`horizontal_offset_m` 右正。
+/// `hmd_face_user` 开启时旋转由 [`super::hmd_local_matrix`] 按偏移偏航面向原点。
 fn hmd_matrix(config: &SteamVrConfig) -> Matrix3x4 {
     Matrix3x4(super::hmd_local_matrix(config))
 }
 
 fn world_matrix_rows(config: &SteamVrConfig) -> [[f32; 4]; 3] {
-    let yaw = config.world_rotation_deg[1].to_radians();
-    let (sin, cos) = yaw.sin_cos();
-    let [x, y, z] = config.world_position;
-    [[cos, 0.0, sin, x], [0.0, 1.0, 0.0, y], [-sin, 0.0, cos, z]]
+    compose_world_rows(
+        config.world_position,
+        config.world_rotation_deg[1].to_radians(),
+    )
+    .0
 }
 
 /// 站立坐标系：只应用绕 Y 轴的偏航（符合字幕面板的常见用法）

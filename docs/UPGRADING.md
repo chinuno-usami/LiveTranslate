@@ -3,6 +3,57 @@
 > 本文件会被拼进 GitHub Release 说明（`docs/BUILD_FLAVORS.md` 之后、git-cliff 生成的更新日志之前）。
 > 写「升级时需要人工做什么」，不写逐条改动——逐条改动由 git-cliff 生成。
 
+## 0.3.0 → 0.3.1
+
+### 一句话
+
+**配置文件一般不用改**；0.3.1 新增的 `gesture.space` / `gesture.orientation` / `hmd_face_user` 都有默认值。
+若旧配置**没有**写 `space`，升级后按 serde 缺省变成 **`space = "free"`**（可推拉距离），不再是 v0.3 的纯平面平移。
+手势默认仍是 `enabled = false` 且 `locked = true`，未开手势则体感不变。
+
+想继续只用平面微调：在 `[output.steamvr.gesture]` 显式写 `space = "plane"`（见下方「回滚到平面」）。
+
+### 行为变化（可能被人注意到）
+
+| 变化 | 说明 |
+| --- | --- |
+| 缺省 `space = free` | 旧 TOML 未写 `space` 时，解锁拖动可推拉距离（ray=头中心球坐标+比例深度；near=1:1 跟随） |
+| 缺省 `orientation = face_user` | 仅 `space=free` 且 **world** 锚点：拖动中面板偏航正对用户；松手写回 `world_rotation_deg[1]`（归一化到 `(-180, 180]`）；`[0]`/`[2]` 原样保留、不应用 |
+| `space = plane` | 与 v0.3 一致，只沿面板平面移动 |
+| free 拖动中 pointer 隐藏 | 面板走 absolute，避免与基于配置的命中点错位；松手后恢复 |
+| clamp 触边 haptic | 开启 `haptics` 时，**每个拖动会话**触 validate 边界至多震一次 |
+| `hmd_face_user`（默认 `false`） | hmd **渲染**是否按偏移自动偏航正对眼睛；与 `gesture.orientation`（拖动期、首版仅 world）无关 |
+
+### 回滚到平面（保留 v0.3 手感）
+
+```toml
+[output.steamvr.gesture]
+space = "plane"
+# 可选：不想自动改偏航时（仅 free+world 有意义）
+# orientation = "keep"
+```
+
+不需要删其它字段；`orientation` / `hmd_face_user` 对 `plane` 拖动无影响。
+
+### 可选：朝向与 hmd 正视
+
+- `orientation = "keep"`：free+world 拖动不改偏航（接近 v0.3）。
+- `orientation = "controller_yaw"`：在 face_user 上叠加手柄绕竖直轴的扭转；俯仰/滚转不影响。
+- `hmd_face_user = true`：hmd 锚点且 `horizontal_offset_m ≠ 0` 时，渲染只改偏航正对眼睛，减轻斜视（默认关，与 0.3 渲染一致）。
+
+细节与排错见 `README.md`（手势表 /「只能平面 → 查 space」）与 `QUICKSTART.md`。
+
+### 已知限制（0.3.1）
+
+- **未在 Windows 真机 / SteamVR 运行时验收**：A1–A12 与 Index / Quest 矩阵见 `docs/V0.4_ACCEPTANCE.md`（全部标待验收）。开发机 macOS 上的单测与 stub / `cargo xwin clippy` **不代表**真机完成。
+- hmd 锚点松手反推偏移时，若 `horizontal_offset_m` 等触 `[-2, 2]` 等 validate 边界，松手可能有一次跳变（触边会 haptic 一次）。
+- `world_rotation_deg[0]` / `[2]` 仍忽略且原样保留；本期只持久化偏航 `[1]`。
+- 不做空手追踪 / 俯仰滚转手势 / VR 内数值 HUD；Dashboard 打开、断追、锁定、epoch 取消语义与 0.3 相同。
+
+### 回滚软件版本
+
+0.3.1 写回的新字段对 0.3.0 多为未知键：降回 0.3.0 一般仍可启动（设置页可能提示未识别项），手势按 0.3.0 平面逻辑；若曾以 `free` 写回较远的 `distance_m` / `world_position` / 偏航，平面模式下这些值仍生效。
+
 ## 0.2.x → 0.3.0
 
 ### 一句话

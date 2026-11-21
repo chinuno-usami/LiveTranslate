@@ -343,7 +343,13 @@ pub struct GestureConfig {
     /// 抓取方式：ray | near
     #[serde(default = "default_gesture_mode")]
     pub mode: String,
-    /// 位移灵敏度
+    /// 拖动空间：plane | free（free：射线=头中心推拉，近距离=1:1 跟随）
+    #[serde(default = "default_gesture_space")]
+    pub space: String,
+    /// 拖动时朝向：face_user | keep | controller_yaw（仅 free；首版仅 world 锚点生效）
+    #[serde(default = "default_gesture_orientation")]
+    pub orientation: String,
+    /// 位移灵敏度（plane：平面位移倍率；free：推拉深度增益倍率）
     #[serde(default = "default_gesture_sensitivity")]
     pub sensitivity: f32,
     /// 显示射线命中光标
@@ -368,6 +374,8 @@ impl Default for GestureConfig {
             unlock_via_vr_gesture: false,
             grab: default_gesture_grab(),
             mode: default_gesture_mode(),
+            space: default_gesture_space(),
+            orientation: default_gesture_orientation(),
             sensitivity: default_gesture_sensitivity(),
             pointer: true,
             haptics: true,
@@ -394,6 +402,11 @@ pub struct SteamVrConfig {
     /// hmd 模式水平偏移（米）；正数向右。旧配置缺省 0.0
     #[serde(default)]
     pub horizontal_offset_m: f32,
+    /// hmd 锚点下面板是否偏航正对头显原点（`yaw = atan2(-x, d)`）。
+    /// 默认关闭以保持 v0.2/`horizontal_offset_m≠0` 时旋转仍为单位阵；开启后侧向偏移不再斜视。
+    /// 不新增 `hmd_rotation_deg`；与 `gesture.orientation`（拖动期、首版仅 world）独立。
+    #[serde(default)]
+    pub hmd_face_user: bool,
     /// OpenVR 应用类型：`background`（默认）或 `overlay`。
     ///
     /// overlay-global action set priority（3A 输入屏蔽）按 Valve 注释只对 Overlay 应用生效，
@@ -477,6 +490,7 @@ impl Default for SteamVrConfig {
             distance_m: default_distance_m(),
             height_offset_m: default_height_offset_m(),
             horizontal_offset_m: 0.0,
+            hmd_face_user: false,
             application_type: default_application_type(),
             world_position: default_world_position(),
             world_rotation_deg: [0.0, 0.0, 0.0],
@@ -537,6 +551,12 @@ fn default_gesture_grab() -> String {
 }
 fn default_gesture_mode() -> String {
     "ray".to_string()
+}
+fn default_gesture_space() -> String {
+    "free".to_string()
+}
+fn default_gesture_orientation() -> String {
+    "face_user".to_string()
 }
 fn default_gesture_sensitivity() -> f32 {
     1.0
@@ -1434,6 +1454,18 @@ impl AppConfig {
         if !matches!(gesture.mode.as_str(), "ray" | "near") {
             errors.push("output.steamvr.gesture.mode 只能是 ray 或 near".to_string());
         }
+        if !matches!(gesture.space.as_str(), "plane" | "free") {
+            errors.push("output.steamvr.gesture.space 只能是 plane 或 free".to_string());
+        }
+        if !matches!(
+            gesture.orientation.as_str(),
+            "face_user" | "keep" | "controller_yaw"
+        ) {
+            errors.push(
+                "output.steamvr.gesture.orientation 只能是 face_user / keep / controller_yaw"
+                    .to_string(),
+            );
+        }
         check_range(
             &mut errors,
             "output.steamvr.gesture.sensitivity",
@@ -1898,6 +1930,7 @@ mod tests {
         assert!(!cfg.output.osc.enabled);
         assert!(!cfg.output.steamvr.enabled);
         assert_eq!(cfg.output.steamvr.horizontal_offset_m, 0.0);
+        assert!(!cfg.output.steamvr.hmd_face_user);
         assert_eq!(cfg.output.steamvr.gesture, GestureConfig::default());
         assert_eq!(cfg.hotkeys, HotkeyConfig::default());
         assert_eq!(cfg.subtitle.label_sources, LabelMode::Auto);
@@ -2150,6 +2183,8 @@ enabled = true
         cfg.output.steamvr.application_type = "scene".into();
         cfg.output.steamvr.gesture.grab = "left_grip".into();
         cfg.output.steamvr.gesture.mode = "teleport".into();
+        cfg.output.steamvr.gesture.space = "teleport".into();
+        cfg.output.steamvr.gesture.orientation = "spin".into();
         cfg.output.steamvr.gesture.sensitivity = 9.0;
         cfg.hotkeys.start = "CmdOrCtrl+Alt+S".into(); // 与 show 冲突
         cfg.hotkeys.toggle_capture = "A".into(); // 裸键
@@ -2158,6 +2193,8 @@ enabled = true
         assert!(err.contains("application_type"), "{err}");
         assert!(err.contains("gesture.grab"), "{err}");
         assert!(err.contains("gesture.mode"), "{err}");
+        assert!(err.contains("gesture.space"), "{err}");
+        assert!(err.contains("gesture.orientation"), "{err}");
         assert!(err.contains("gesture.sensitivity"), "{err}");
         assert!(
             err.contains("冲突") || err.contains("hotkeys.start"),
@@ -2174,10 +2211,22 @@ enabled = true
         assert!(cfg.audio.sources[0].osc);
         assert!(cfg.audio.sources[0].steamvr);
         assert_eq!(cfg.output.steamvr.horizontal_offset_m, 0.0);
+        assert!(!cfg.output.steamvr.hmd_face_user);
         assert_eq!(cfg.output.steamvr.application_type, "background");
         assert!(!cfg.output.steamvr.gesture.enabled);
         assert!(cfg.output.steamvr.gesture.locked);
+        assert_eq!(cfg.output.steamvr.gesture.space, "free");
+        assert_eq!(cfg.output.steamvr.gesture.orientation, "face_user");
         assert_eq!(cfg.hotkeys.show, "CmdOrCtrl+Alt+S");
         assert_eq!(cfg.hotkeys.quit, "CmdOrCtrl+Alt+Q");
+    }
+
+    #[test]
+    fn gesture_space_orientation_default_when_missing() {
+        // 旧配置缺 space/orientation 时走 serde default（free / face_user）
+        let g: GestureConfig = toml::from_str("enabled = false").unwrap();
+        assert_eq!(g.space, "free");
+        assert_eq!(g.orientation, "face_user");
+        assert_eq!(g, GestureConfig::default());
     }
 }

@@ -201,7 +201,10 @@ distance_m = 1.6
 # hmd 模式：相对视线的高度偏移（负数 = 偏下）
 height_offset_m = -0.28
 # hmd 模式：水平偏移（米）；正数向右
+# 非 0 且 hmd_face_user=false 时面板仍跟头显朝向（侧向斜视）；true 时仅偏航正对眼睛
 horizontal_offset_m = 0.0
+# hmd 锚点渲染：是否按偏移自动偏航面向用户（默认 false，保持 v0.2 旋转为单位阵）
+hmd_face_user = false
 # OpenVR 应用类型：background（默认，不主动拉起 SteamVR 服务）/ overlay
 # 只有 overlay 才能设置 overlay-global priority（拖动期屏蔽游戏输入，3A）；
 # 输入屏蔽报优先级错误时可改成 overlay 后重启应用
@@ -248,11 +251,16 @@ unlock_via_vr_gesture = false
 grab = "both_grips"
 # 抓取方式：ray | near
 mode = "ray"
-# 位移灵敏度
+# 拖动空间：plane | free（free：射线=头中心推拉，近距离=1:1 跟随；默认 free）
+# 排错：只能平面移动 → 检查 space 是否为 plane
+space = "free"
+# 拖动时朝向：face_user | keep | controller_yaw（仅 free；首版仅 world 锚点生效）
+orientation = "face_user"
+# 位移灵敏度（plane：平面位移倍率；free：推拉深度增益倍率）
 sensitivity = 1.0
-# 显示射线命中光标
+# 显示射线命中光标（plane：跟命中点；free 拖动中隐藏，避免与 absolute 面板错位）
 pointer = true
-# 抓取/松手/锁定切换时震动
+# 抓取/松手/锁定切换时震动；clamp 触边界每拖动会话至多再震一次
 haptics = true
 # near 模式的抓取半径（米）
 near_radius_m = 0.35

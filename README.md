@@ -211,6 +211,7 @@ width_m = 1.6
 distance_m = 1.6
 height_offset_m = -0.28
 horizontal_offset_m = 0.0       # hmd 水平偏移（正数向右）
+hmd_face_user = false           # hmd 侧向偏移时是否偏航正对眼睛（默认关=v0.2）
 application_type = "background"  # background / overlay（后者才能设 overlay-global priority）
 font_size_px = 34
 line_alphas = [1.0, 0.72, 0.48]
@@ -220,7 +221,9 @@ enabled = false                 # 默认关；开启后轮询手柄做射线抓�
 locked = true                   # 默认锁定，避免误触；设置页 / 浮窗 / 快捷键解锁
 unlock_via_vr_gesture = false   # VR 内解锁：指向面板 + 双手 trigger 按住 1.5s，默认关
 grab = "both_grips"             # both_grips 须 pointer 命中面板才进入 arming
-pointer = true                  # 射线命中光标
+space = "free"                  # plane=仅平面（v0.3）；free=可推拉距离（默认）
+orientation = "face_user"       # 仅 free+world：face_user / keep / controller_yaw
+pointer = true                  # 射线命中光标（free 拖动中隐藏，避免与 absolute 面板错位）
 block_game_input = false        # 拖动期屏蔽游戏 grip/trigger（需 SteamVR 实验设置）
 
 [hotkeys]                       # 全局快捷键；留空 = 禁用
@@ -325,15 +328,24 @@ send_typing = true
 - 默认 `grab = "both_grips"`：**双手 grip 且射线 pointer 命中面板** 才进入 arming；松手后位置 clamp 并写回配置。
 - `grab = "right_grip"` / `"right_trigger"` 为单手模式，不要求左手柄参与（左手柄充电/待机时仍可用）。
 - `mode = "near"` 时按「手柄到面板平面的投影点」判半径，适合面板在手臂范围内。
+- `space`（默认 `free`）：`free` 可推拉距离（ray=头中心球坐标+比例深度；near=1:1 跟随）；`plane` 仅沿面板平面移动（与 v0.3 一致）。旧配置缺省字段时按 `free`。
+- `orientation`（默认 `face_user`，仅 `space=free` 且 **world** 锚点）：`face_user` / `keep` / `controller_yaw`；只改偏航、面板保持直立。hmd 锚点拖动朝向跟当前 HMD 旋转。
+- pointer：`plane` 拖动跟命中点并换色；**`free` 拖动中隐藏**（面板走 absolute，与基于配置的命中点不同步，避免错位光标）。
+- 松手 / 拖动触 validate 边界时：触边 haptic **每会话至多一次**（`haptics=true`）。
 - `horizontal_offset_m`（hmd 水平偏移，右正）旧配置缺省 `0`，与 v0.2 行为一致。
+- `hmd_face_user`（默认 `false`）：hmd 锚点渲染是否按偏移自动偏航正对眼睛。`horizontal_offset_m ≠ 0` 且关闭时面板跟头显朝向会斜视；开启只改偏航、不新增 `hmd_rotation_deg`。与 `gesture.orientation`（拖动期、首版仅 world）无关。
+
+**可调常量（源码，真机调参）：** 集中在 `src/output/steamvr/gesture.rs` 顶部——`R_MIN` / `EL_MAX` / `DEPTH_GAIN` / `JUMP_M`（free）与 `MAX_FRAME_DELTA_M`（plane）。拖动期轮询提频（默认 ~11ms，纹理仍按内容 revision）见 `imp.rs` 的 `FASTER_INTERVAL_WHILE_DRAGGING`。
 
 **限制与排错（手势）：**
 
 | 现象 | 说明 |
 |------|------|
+| 只能平面移动、推拉不了距离 | 检查 `gesture.space`：应为 `free`（默认）；若为 `plane` 则与 v0.3 一样只沿平面 |
 | SteamVR Dashboard 打开时拖不动 | 预期行为：Dashboard 接管输入，此时取消拖动且不写回 |
 | 面板已淡出/隐藏抓不到 | 先产生一条字幕让面板重新显示，再抓取（本期无 VR 内召唤） |
 | 空手 / 无手柄追踪 | 不支持；需要手柄姿态，不做手部追踪 |
+| free 拖动时 pointer 消失 | 预期：避免 absolute 面板与命中点错位；松手后恢复 |
 | 拖动时游戏仍收到 grip | 未开启 `block_game_input` 时的预期行为；开启后见下方「拖动期屏蔽游戏输入（3A）」 |
 | 解锁后仍拖不动 | 确认 `enabled=true`、已解锁、pointer 命中面板、grab 组合对应的键按下；检查输出状态是否「位置可移动」 |
 
@@ -892,12 +904,14 @@ WARN: No input devices found
 
 ### SteamVR 手势拖不动 / 误触
 
+- **只能平面、推拉不了距离**：检查 `gesture.space`——应为 `free`（默认）；若为 `plane` 则与 v0.3 一样只沿平面。0.3.0→0.3.1 升级说明与回滚见 `docs/UPGRADING.md`。
 - **默认锁定**：先在设置页、浮窗「VR 位置」按钮或 `toggle_steamvr_lock` 快捷键解锁；默认**不**用 VR 内手势解锁。
 - **Dashboard 打开**：关闭 SteamVR Dashboard 后再拖；打开期间拖动会被取消且不写回。
 - **面板隐藏**：`hide_on_silence_secs` 淡出后无法命中——先说话/出字幕让面板显示。
 - **both_grips**：双手 grip **且**射线命中面板（pointer）才开始拖；只按一边或未瞄准面板无效。
 - **无手追**：需要手柄；Quest 空手追踪等不支持。
 - **游戏仍收到按键**：确认已开 `block_game_input`、SteamVR 实验开关已打开，并看设置页「输入屏蔽状态（只读）」里四项是否都为「正常」；失败会自动降级为仅手势移动。
+- **真机验收**：A1–A12 / Index·Quest 清单见 `docs/V0.4_ACCEPTANCE.md`（待 Windows + SteamVR 人工勾选）。
 
 ## 贡献
 

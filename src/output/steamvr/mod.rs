@@ -40,6 +40,8 @@ pub struct SteamVrPoseUpdate {
     pub height_offset_m: f32,
     pub horizontal_offset_m: f32,
     pub world_position: [f32; 3],
+    /// 松手写回；`[1]` 已归一化到 `(-180, 180]`；`[0]`/`[2]` 原样保留不应用。
+    pub world_rotation_deg: [f32; 3],
 }
 
 /// 3A 输入屏蔽诊断（只读提示；绝不写入 SteamVR 全局设置）。
@@ -229,20 +231,28 @@ pub mod input;
 /// HMD 局部坐标系下的面板 3×4 变换（行主序，与 OpenVR Matrix3x4 一致）。
 ///
 /// 轴向约定：+X 右、+Y 上、-Z 前。`horizontal_offset_m` 右正；
-/// 为 0 时与 v0.2 硬编码 `x = 0.0` 的矩阵完全一致。
+/// 为 0 且 `hmd_face_user=false` 时与 v0.2 硬编码 `x = 0.0` 的矩阵完全一致。
+///
+/// `hmd_face_user=true` 时仅改偏航（直立）：`yaw = atan2(-x, d)`，使可视面朝头显原点，
+/// 避免 `horizontal_offset_m ≠ 0` 时斜视；不写入 `hmd_rotation_deg`。
 ///
 /// 非 Windows 构建没有真实 `imp`，仅单测引用；允许 dead_code。
 #[cfg_attr(not(all(feature = "steamvr", target_os = "windows")), allow(dead_code))]
 pub(crate) fn hmd_local_matrix(config: &SteamVrConfig) -> [[f32; 4]; 3] {
-    [
-        [1.0, 0.0, 0.0, config.horizontal_offset_m],
-        [0.0, 1.0, 0.0, config.height_offset_m],
-        [0.0, 0.0, 1.0, -config.distance_m],
-    ]
+    let x = config.horizontal_offset_m;
+    let y = config.height_offset_m;
+    let z = -config.distance_m;
+    if !config.hmd_face_user {
+        return [[1.0, 0.0, 0.0, x], [0.0, 1.0, 0.0, y], [0.0, 0.0, 1.0, z]];
+    }
+    // 与文档 §3.4 / face_user_yaw(HMD原点, 面板局部点) 一致：atan2(-x, d)
+    let yaw = gesture::face_user_yaw([0.0, 0.0, 0.0], [x, y, z]);
+    gesture::compose_world_rows([x, y, z], yaw).0
 }
 
 #[cfg(test)]
 mod hmd_matrix_tests {
+    use super::gesture::{compose_world_rows, extract_yaw, face_user_yaw};
     use super::hmd_local_matrix;
     use crate::config::SteamVrConfig;
 
@@ -259,6 +269,7 @@ mod hmd_matrix_tests {
     fn horizontal_offset_default_zero_matches_v02() {
         let config = SteamVrConfig::default();
         assert_eq!(config.horizontal_offset_m, 0.0);
+        assert!(!config.hmd_face_user);
         assert_eq!(hmd_local_matrix(&config), v02_hmd_matrix(&config));
     }
 
@@ -274,7 +285,7 @@ mod hmd_matrix_tests {
         assert_eq!(m[0][3], 0.35);
         assert_eq!(m[1][3], -0.1);
         assert_eq!(m[2][3], -2.0);
-        // 旋转部分仍为单位矩阵
+        // 默认关闭面向用户：旋转部分仍为单位矩阵（v0.2/v0.3 等价）
         assert_eq!(m[0][..3], [1.0, 0.0, 0.0]);
         assert_eq!(m[1][..3], [0.0, 1.0, 0.0]);
         assert_eq!(m[2][..3], [0.0, 0.0, 1.0]);
@@ -289,7 +300,46 @@ mod hmd_matrix_tests {
         )
         .expect("parse");
         assert_eq!(config.horizontal_offset_m, 0.0);
+        assert!(!config.hmd_face_user);
         assert_eq!(hmd_local_matrix(&config), v02_hmd_matrix(&config));
+    }
+
+    #[test]
+    fn hmd_face_user_zero_offset_still_matches_v02() {
+        let config = SteamVrConfig {
+            hmd_face_user: true,
+            ..SteamVrConfig::default()
+        };
+        assert_eq!(config.horizontal_offset_m, 0.0);
+        assert_eq!(hmd_local_matrix(&config), v02_hmd_matrix(&config));
+    }
+
+    #[test]
+    fn hmd_face_user_yaws_toward_origin_for_side_offset() {
+        let config = SteamVrConfig {
+            horizontal_offset_m: 0.35,
+            height_offset_m: -0.1,
+            distance_m: 2.0,
+            hmd_face_user: true,
+            ..SteamVrConfig::default()
+        };
+        let m = hmd_local_matrix(&config);
+        let pos = [0.35, -0.1, -2.0];
+        let expected_yaw = face_user_yaw([0.0, 0.0, 0.0], pos);
+        // 文档：yaw = atan2(-x, d)
+        assert!((expected_yaw - (-0.35f32).atan2(2.0)).abs() < 1e-5);
+        let expected = compose_world_rows(pos, expected_yaw).0;
+        assert_eq!(m, expected);
+        assert!((extract_yaw(&super::gesture::Mat3x4(m)) - expected_yaw).abs() < 1e-5);
+        // Z 列水平指向原点（面板可视面朝用户）
+        let z_col = [m[0][2], m[2][2]];
+        let to_origin = [-pos[0], -pos[2]];
+        let dot = z_col[0] * to_origin[0] + z_col[1] * to_origin[1];
+        let zn = (z_col[0] * z_col[0] + z_col[1] * z_col[1]).sqrt();
+        let on = (to_origin[0] * to_origin[0] + to_origin[1] * to_origin[1]).sqrt();
+        assert!((dot / (zn * on) - 1.0).abs() < 1e-4);
+        // 高度偏移不进入俯仰：中间行仍为 [0,1,0,y]
+        assert_eq!(m[1][..3], [0.0, 1.0, 0.0]);
     }
 }
 
@@ -327,6 +377,7 @@ mod status_api_tests {
             height_offset_m: -0.1,
             horizontal_offset_m: 0.2,
             world_position: [1.0, 1.5, -2.0],
+            world_rotation_deg: [0.0, 15.0, 0.0],
         };
         assert_eq!(pose.distance_m, 1.5);
         let defaults = SteamVrStatus::default();

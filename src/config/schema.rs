@@ -540,10 +540,16 @@ pub fn build(config: &AppConfig) -> SettingsSchema {
                     config,
                     "output.steamvr.horizontal_offset_m",
                     "水平偏移（米）",
-                    "hmd 锚点参数；正数向右。旧配置缺省 0，行为与 v0.2 一致。",
+                    "hmd 锚点参数；正数向右。旧配置缺省 0，行为与 v0.2 一致。非 0 且未开「面向用户」时面板仍跟头显朝向，侧向会斜视；开启下方开关后只改偏航正对眼睛。",
                     -2.0,
                     2.0,
                     0.01,
+                ),
+                bool_adv(
+                    config,
+                    "output.steamvr.hmd_face_user",
+                    "hmd 面向用户",
+                    "仅 hmd 锚点渲染：按水平偏移/距离自动偏航（yaw=atan2(-x,d)），避免侧向斜视。默认关（与 v0.2 旋转为单位阵一致）。与手势 orientation（拖动期、首版仅 world）无关；不新增 hmd_rotation_deg。",
                 ),
                 int(
                     config,
@@ -685,11 +691,40 @@ pub fn build(config: &AppConfig) -> SettingsSchema {
                     field.advanced = true;
                     field
                 },
+                {
+                    let mut field = enum_(
+                        config,
+                        "output.steamvr.gesture.space",
+                        "拖动空间",
+                        "plane=仅沿面板平面移动（v0.3）；free=可推拉距离（默认）。推荐：近距离+free 手抓摆放；射线+free 远距离摆放。只能平面动时检查本项是否为 plane。",
+                        vec![
+                            ("free", "自由（可推拉）"),
+                            ("plane", "仅平面"),
+                        ],
+                    );
+                    field.advanced = true;
+                    field
+                },
+                {
+                    let mut field = enum_(
+                        config,
+                        "output.steamvr.gesture.orientation",
+                        "拖动时朝向",
+                        "仅 space=free 且 world 锚点生效。face_user=始终正对用户（只改偏航）；keep=保持抓取时偏航；controller_yaw=在 face_user 上叠加手柄水平扭转。",
+                        vec![
+                            ("face_user", "面向用户"),
+                            ("keep", "保持抓取朝向"),
+                            ("controller_yaw", "手柄扭转偏航"),
+                        ],
+                    );
+                    field.advanced = true;
+                    field
+                },
                 float_adv(
                     config,
                     "output.steamvr.gesture.sensitivity",
                     "位移灵敏度",
-                    "",
+                    "plane：平面位移倍率；free：推拉深度增益倍率（越大推拉越灵敏）。范围 0.2–3。",
                     0.2,
                     3.0,
                 ),
@@ -1341,6 +1376,7 @@ mod tests {
         assert!(!is_restart_required("hotkeys.show"));
         assert!(!is_restart_required("hotkeys.quit"));
         assert!(!is_restart_required("output.steamvr.horizontal_offset_m"));
+        assert!(!is_restart_required("output.steamvr.hmd_face_user"));
         assert!(!is_restart_required("output.steamvr.gesture.locked"));
         assert!(!is_restart_required("output.steamvr.gesture.enabled"));
         // vad/asr 冷字段语义保持
